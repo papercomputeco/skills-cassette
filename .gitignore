@@ -1,0 +1,11 @@
+/.direnv/
+/build/
+/tmp/
+/skills-cassette
+.DS_Store
+
+# JetBrains IDEs
+.idea/
+
+# Claude Code
+.claude/
