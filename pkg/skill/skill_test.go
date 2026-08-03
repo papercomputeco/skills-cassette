@@ -2,7 +2,7 @@ package skill_test
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"strings"
 	"time"
 
@@ -20,10 +20,11 @@ type fakeQuerier struct {
 func (f fakeQuerier) TraceSummaries(context.Context, string) ([]skill.TraceSummary, error) {
 	return f.summaries, nil
 }
+
 func (f fakeQuerier) Trace(_ context.Context, id string) (*skill.Trace, error) {
 	trace, ok := f.traces[id]
 	if !ok {
-		return nil, fmt.Errorf("missing trace")
+		return nil, errors.New("missing trace")
 	}
 	return trace, nil
 }

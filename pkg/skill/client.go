@@ -22,6 +22,17 @@ const (
 	maxErrorResponseBytes = 64 << 10
 )
 
+// ErrNotFound marks a trace-API resource the core answered 404 for — most
+// importantly a source session the caller cannot see. It survives the
+// transcript builder's %w-wrapping, so the generate handler can map it to a
+// 404 rather than a 500.
+var ErrNotFound = errors.New("not found")
+
+// ErrNoTurns marks a session whose transcript is empty after filtering: the
+// session either does not exist on the core or carried nothing the generator
+// could use. Mapped to a 422 by the generate handler.
+var ErrNoTurns = errors.New("no turns in session after applying filters")
+
 // Querier is the read surface skill generation needs from the tapes
 // trace API: turn summaries for a session, and span payloads for one
 // turn. The HTTP client below implements it; tests substitute a fake.
@@ -227,7 +238,7 @@ func (c *APIClient) getJSON(ctx context.Context, rawURL string, out any) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
-		return errors.New("not found")
+		return ErrNotFound
 	}
 	if resp.StatusCode != http.StatusOK {
 		body, readErr := readBounded(resp.Body, maxErrorResponseBytes)

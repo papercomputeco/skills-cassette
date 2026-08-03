@@ -1,49 +1,86 @@
 # skills-cassette
 
-!!! Warning - in flight transition from `tapes` core. Still needed:
+`skills-cassette` is the Tapes cassette that generates, stores, versions, and
+serves reusable `SKILL.md` skills extracted from Tapes trace data.
 
-**Prerequisites**
+It is an independently deployed HTTP service speaking the `cassette/v1alpha1`
+contract: Tapes core fetches its OpenAPI document from `/openapi`, admits the
+`x-tapes-cassette` manifest embedded there, and republishes the API served
+under `/api/skills` at `/v1/cassettes/skills`. The authored twin of that
+manifest lives in [`cassette.toml`](./cassette.toml) for registries and
+orchestrators; the two encode one schema and produce the same canonical
+manifest digest.
 
-- [ ] Land gateway-owned tenancy/auth and remove `org_id` from the final skills schema and keys.
-- [ ] Consume the Track 4 cassette manifest, discovery, API conventions, role grants, and router contracts once published; do not invent a local manifest format.
-- [ ] Publish an authoritative core OpenAPI contract for the trace endpoints and replace the pinned JSON compatibility fixtures with generated contract fixtures.
-- [ ] Provision cassette roles, secrets, configuration, NetworkPolicies, and HTTPRoutes through TKO.
+## Surface
 
-**Cassette implementation**
+Every route the pre-cutover Tapes core served under `/v1/skills` exists here
+1:1 under the cassette prefix:
 
-- [ ] Add configured OpenAI, Anthropic, and Ollama adapters without importing Tapes credential state.
-- [ ] Re-home the four historical migration steps as the final two physical tables (`skills` and `skill_versions`), without core foreign keys.
-- [ ] Port storage and the production skills API only after the prerequisite contracts land.
-- [ ] Support `GET /v1/skills?session_id=` and define compatibility for legacy `GET /v1/sessions/:id/skills` callers.
-- [ ] Publish the skills OpenAPI operations and generated clients after route ownership is settled.
-- [ ] Validate generated name, description, and content; decide hard transcript and provenance limits.
-- [ ] Validate the configured core URL and require TLS for non-loopback targets.
-- [ ] Keep generation request-driven; skills has no worker.
+| Cassette-local route | Public route (through core) | Purpose |
+| --- | --- | --- |
+| `GET /api/skills` | `GET /v1/cassettes/skills` | Keyset-paginated list with search (`q`), scopes (`scope=all\|mine\|team`), sort (`sort=downloads`), and per-tab counts |
+| `GET /api/skills?session_id=` | `GET /v1/cassettes/skills?session_id=` | Provenance reverse lookup, replacing legacy `GET /v1/sessions/:id/skills` |
+| `POST /api/skills` | `POST /v1/cassettes/skills` | Create an authored-from-scratch skill |
+| `POST /api/skills/generate` | `POST /v1/cassettes/skills/generate` | LLM generation from nominated source sessions |
+| `GET /api/skills/{id}` | `GET /v1/cassettes/skills/{id}` | Point read by opaque id |
+| `PUT /api/skills/{id}` | `PUT /v1/cassettes/skills/{id}` | Partial update of the editable head |
+| `DELETE /api/skills/{id}` | `DELETE /v1/cassettes/skills/{id}` | Creator-gated delete, history included |
+| `GET /api/skills/{id}/skill.md` | `GET /v1/cassettes/skills/{id}/skill.md` | Drop-in SKILL.md download (counts a download) |
+| `GET /api/skills/{id}/versions` | `GET /v1/cassettes/skills/{id}/versions` | Full published history |
+| `POST /api/skills/{id}/versions` | `POST /v1/cassettes/skills/{id}/versions` | Publish an immutable version snapshot |
+| `POST /api/skills/{id}/duplicate` | `POST /v1/cassettes/skills/{id}/duplicate` | Fork under a fresh id |
 
-**Cutover**
+`/ping` and `/openapi` are the process anchors core probes and fetches; they
+are not part of the proxied API.
 
-- [ ] Migrate existing skills, versions, authorship, provenance, and download counts with rollback coverage.
-- [ ] Route legacy `/v1/skills*` traffic to this cassette before deleting the implementation from Tapes core.
-- [ ] Verify local-router and Envoy route precedence, subject-header trust, fresh installs, upgrades, and rollback.
-- [ ] Complete operator, migration, API, and release documentation.
+The cassette owns two tables, `skills` and `skill_versions`, in its own
+Postgres schema (named after the installed cassette name), and runs its own
+migrations at startup. There is no `org_id`: tenancy is gateway-owned, and
+attribution rides the gateway-trusted `x-paper-auth-subject` header.
 
----
+Source transcripts for generation are read from the configured Tapes core over
+its trace API (`GET /v1/traces?session_id=` and `GET /v1/traces/{id}`); the
+cassette holds no core database credential and reads no contract views.
 
-`skills-cassette` extracts reusable `SKILL.md` content from Tapes trace data.
-
-This repository is **pre-cutover**. The current milestone owns the portable
-skill-generation kernel, a focused HTTP boundary to Tapes core
-(`GET /v1/traces?session_id=` and `GET /v1/traces/:id`), and a dark health
-server. It does not yet expose production skill routes, own a database schema,
-or run a worker.
-
-## Run the health server
+## Run
 
 ```bash
 make build-local
-./build/skills-cassette serve --listen 127.0.0.1:8080
-curl http://127.0.0.1:8080/ping
+CASSETTE_CORE_URL=http://127.0.0.1:8081 \
+  ./build/skills-cassette serve --listen 127.0.0.1:9999
+curl http://127.0.0.1:9999/ping
+curl http://127.0.0.1:9999/openapi
+curl http://127.0.0.1:9999/api/skills
 ```
+
+Then register it with a core:
+
+```bash
+tapes serve --cassettes=http://127.0.0.1:9999/openapi
+curl http://localhost:8081/v1/cassettes/skills
+```
+
+Configuration arrives entirely through the environment supplied by the
+deployment, following the manifest's config schema:
+
+| Variable | Meaning |
+| --- | --- |
+| `CASSETTE_NAME` | Installed cassette name (default `skills`); drives the route prefix and schema |
+| `CASSETTE_CORE_URL` | Tapes core API origin for reading trace transcripts. `https` is required for non-loopback targets; unset disables generation (501) |
+| `CASSETTE_LLM_PROVIDER` | `openai` (default), `anthropic`, or `ollama` |
+| `CASSETTE_LLM_MODEL` | Model override; each provider has a sensible default |
+| `CASSETTE_LLM_API_KEY` | Provider API key (falls back to `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`) |
+| `CASSETTE_LLM_BASE_URL` | Provider base URL override |
+| `TAPES_DATABASE_URL` | Postgres DSN. Without one the cassette runs on a non-durable in-memory store |
+
+## Remaining cutover work
+
+- [ ] Migrate existing skills, versions, authorship, provenance, and download counts from Tapes core with rollback coverage.
+- [ ] Route legacy `/v1/skills*` traffic to this cassette before deleting the implementation from Tapes core.
+- [ ] Provision the cassette role, secrets, configuration, NetworkPolicies, and HTTPRoutes through TKO.
+- [ ] Verify local-router and Envoy route precedence, subject-header trust, fresh installs, upgrades, and rollback.
+- [ ] Replace the pinned trace-wire compatibility fixtures with fixtures generated from the core's published OpenAPI contract.
+- [ ] Decide hard transcript and provenance limits for generation.
 
 ## Install a released build
 
