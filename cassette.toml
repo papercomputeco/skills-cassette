@@ -1,0 +1,84 @@
+# The skills cassette's publishable manifest.
+#
+# This is the authored form of the metadata this cassette serves at `/openapi`
+# under the `x-tapes-cassette` extension. It is the artifact a registry or an
+# orchestrator reads *before* anything is running: which contract of Tapes it
+# needs, what tables it owns, and what a deployment has to supply to it.
+#
+# This is not a second schema — the field names below are the JSON field names
+# of `cassette/v1alpha1`, and this file must stay in sync with the extension
+# built in internal/server/openapi.go for the same installation identity.
+#
+# The Tapes API server reads none of this. Core discovers and aggregates a
+# cassette purely from the OpenAPI document it fetches over HTTP; this file is
+# for whoever has to start the thing in the first place.
+
+kind = "cassette/v1alpha1"
+
+# Who this cassette is. `name` is the identity everything else derives from:
+# the public route (/v1/cassettes/skills), the local prefix (/api/skills),
+# the Postgres schema ("skills"), and the role ("cassette_skills").
+[cassette]
+name = "skills"
+version = "0.1.0"
+display_name = "Skills"
+description = "Generates, stores, versions, and serves reusable SKILL.md skills extracted from Tapes sessions."
+homepage = "https://github.com/papercomputeco/skills-cassette"
+
+# What this cassette needs from Tapes. It reads no contract views: source
+# transcripts come from the core's own trace API over HTTP
+# (GET /v1/traces?session_id= and GET /v1/traces/{id}), so the cassette never
+# holds a core database credential.
+[depends]
+core = "v1"
+views = []
+
+# Where the things core needs live on this cassette's own listener. The API is
+# served under /api/skills and core republishes it under /v1/cassettes/skills.
+[api]
+health = "/ping"
+openapi = "/openapi"
+prefix_path = "api"
+
+# Tables this cassette owns in its own schema. The declaration is for whoever
+# provisions the database — core neither creates the schema nor grants access
+# to it. The cassette runs its own migrations for these tables at startup.
+[[tables]]
+name = "skills"
+
+[[tables]]
+name = "skill_versions"
+
+# Configuration this cassette accepts, published as schema so a deployment can
+# render a form or validate values. Tapes never supplies these; the deployment
+# does, through the CASSETTE_* environment. The database DSN arrives separately
+# as TAPES_DATABASE_URL; without one the cassette runs on a non-durable
+# in-memory store.
+[[config]]
+key = "core.url"
+type = "string"
+required = true
+description = "Tapes core API origin the generator reads trace transcripts from."
+
+[[config]]
+key = "llm.provider"
+type = "string"
+default = "openai"
+enum = ["openai", "anthropic", "ollama"]
+description = "LLM provider used to extract skills."
+
+[[config]]
+key = "llm.model"
+type = "string"
+description = "Model override; each provider has a sensible default."
+
+[[config]]
+key = "llm.api_key"
+type = "string"
+secret = true
+description = "Provider API key. Not required for ollama."
+
+[[config]]
+key = "llm.base_url"
+type = "string"
+description = "Provider base URL override for proxies and self-hosted endpoints."

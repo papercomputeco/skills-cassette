@@ -97,7 +97,7 @@ func SessionTurns(ctx context.Context, query Querier, sessionID string, opts ...
 	}
 
 	if len(turns) == 0 {
-		return nil, fmt.Errorf("no turns in session %s after applying filters", sessionID)
+		return nil, fmt.Errorf("%w: session %s", ErrNoTurns, sessionID)
 	}
 	return turns, nil
 }
