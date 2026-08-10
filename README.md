@@ -82,15 +82,6 @@ deployment, following the manifest's config schema:
 - [ ] Replace the pinned trace-wire compatibility fixtures with fixtures generated from the core's published OpenAPI contract.
 - [ ] Decide hard transcript and provenance limits for generation.
 
-## Install a released build
-
-```bash
-curl -sSfL https://download.tapes.dev/skills-cassette/install | bash
-```
-
-Set `SKILLS_CASSETTE_VERSION` to select a release or nightly build and
-`SKILLS_CASSETTE_INSTALL_DIR` to override `/usr/local/bin`.
-
 ## Develop
 
 Use the pinned Nix/Dagger environment when available:

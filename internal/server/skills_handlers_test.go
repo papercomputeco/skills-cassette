@@ -51,7 +51,7 @@ func doJSON(srv *server.Server, method, path, body, author string) (map[string]a
 	if body != "" {
 		rdr = bytes.NewBufferString(body)
 	}
-	req := httptest.NewRequest(method, path, rdr)
+	req := httptest.NewRequestWithContext(context.Background(), method, path, rdr)
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
 	}

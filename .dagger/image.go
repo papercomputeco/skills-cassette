@@ -2,11 +2,19 @@ package main
 
 import (
 	"context"
+	"fmt"
 
 	"dagger/skills-cassette/internal/dagger"
 )
 
 const imageName = "skills-cassette"
+
+func releaseLDFlags(version string) string {
+	return fmt.Sprintf(
+		"-s -w -X github.com/papercomputeco/skills-cassette/cmd/skills-cassette.Version=%s",
+		version,
+	)
+}
 
 func (t *SkillsCassette) image(version string) *dagger.Dockerimage {
 	if version == "" {

@@ -11,12 +11,13 @@ permissions:
 
 jobs:
   check:
+    if: github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main'
     runs-on: depot-ubuntu-24.04
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
-
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -46,9 +47,9 @@ jobs:
     needs: check
     if: needs.check.outputs.should_build == 'true'
     runs-on: depot-ubuntu-24.04
-
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@d96678350ffd6a456235832eb11e1c491589b7bb # v3.21.8
@@ -57,13 +58,13 @@ jobs:
         uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d # v14
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: us-east-1
 
       - name: Login to ECR Public
-        uses: aws-actions/amazon-ecr-login@v2
+        uses: aws-actions/amazon-ecr-login@d539f0932e70871a027e9d5a9d8fc38589180a64 # v2.1.6
         with:
           registry-type: public
 
@@ -82,25 +83,8 @@ jobs:
         env:
           DAGGER_CLOUD_TOKEN: ${{ secrets.DAGGER_CLOUD_TOKEN }}
 
-      - name: Build and upload nightly artifacts
-        run: |
-          nix develop --command dagger call \
-            nightly \
-              --endpoint=env://BUCKET_ENDPOINT \
-              --bucket=env://BUCKET_NAME \
-              --access-key-id=env://BUCKET_ACCESS_KEY_ID \
-              --secret-access-key=env://BUCKET_SECRET_ACCESS_KEY \
-            export \
-              --path=./build
-        env:
-          BUCKET_ENDPOINT: ${{ secrets.BUCKET_ENDPOINT }}
-          BUCKET_NAME: ${{ secrets.BUCKET_NAME }}
-          BUCKET_ACCESS_KEY_ID: ${{ secrets.BUCKET_ACCESS_KEY_ID }}
-          BUCKET_SECRET_ACCESS_KEY: ${{ secrets.BUCKET_SECRET_ACCESS_KEY }}
-          DAGGER_CLOUD_TOKEN: ${{ secrets.DAGGER_CLOUD_TOKEN }}
-
       - name: Update nightly GitHub release
-        uses: ncipollo/release-action@v1
+        uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd # v1.21.0
         with:
           tag: nightly
           name: "Nightly Build & Release"
@@ -110,39 +94,8 @@ jobs:
             This is an unstable development build off the tip of `main`.
 
             Commit: ${{ github.sha }}
-
-            **Download:**
-            - Linux AMD64: `curl -LO https://download.tapes.dev/skills-cassette/nightly/linux/amd64/skills-cassette`
-            - Linux ARM64: `curl -LO https://download.tapes.dev/skills-cassette/nightly/linux/arm64/skills-cassette`
-            - macOS AMD64: `curl -LO https://download.tapes.dev/skills-cassette/nightly/darwin/amd64/skills-cassette`
-            - macOS ARM64: `curl -LO https://download.tapes.dev/skills-cassette/nightly/darwin/arm64/skills-cassette`
+            Image: `${{ vars.REGISTRY }}/skills-cassette:nightly`
           prerelease: true
           allowUpdates: true
-          removeArtifacts: true
           makeLatest: false
           token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload artifacts to GitHub release
-        run: |
-          mkdir -p dist
-          for file in $(find build -type f); do
-            rel_path="${file#build/}"
-            os=$(dirname "$rel_path" | cut -d'/' -f1)
-            arch=$(dirname "$rel_path" | cut -d'/' -f2)
-            filename=$(basename "$file")
-
-            if [[ "$filename" == *.sha256 ]]; then
-              base="${filename%.sha256}"
-              binary_name="${base}-${os}-${arch}"
-              new_name="${binary_name}.sha256"
-              checksum=$(cut -d' ' -f1 "$file")
-              printf '%s  %s\n' "$checksum" "$binary_name" > "dist/$new_name"
-            else
-              new_name="${filename}-${os}-${arch}"
-              cp "$file" "dist/$new_name"
-            fi
-          done
-
-          gh release upload nightly dist/*
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -20,7 +20,7 @@ check: ## Runs all Dagger checks. Auto-fixes are not automatically applied.
 .PHONY: format
 format: ## Runs golangci-lint linters and formatters with auto-fixes applied.
 	$(call print-target)
-	dagger call fix-lint export --path .
+	dagger call golangcilint lint export --path .
 
 .PHONY: build-local
 build-local: ## Builds local artifacts with the local Go toolchain.
@@ -36,11 +36,6 @@ install: build-local ## Builds and installs skills-cassette to GOBIN.
 	# executable replacement issues on macOS.
 	install -m 0755 ./build/skills-cassette $(GOBIN)/skills-cassette
 
-.PHONY: build
-build: ## Builds all cross-platform release artifacts.
-	$(call print-target)
-	dagger call build-release export --path ./build
-
 .PHONY: image
 image: ## Builds and loads the cassette container image via Dagger.
 	$(call print-target)
@@ -50,34 +45,6 @@ image: ## Builds and loads the cassette container image via Dagger.
 check-image: ## Builds the cassette container image without loading it.
 	$(call print-target)
 	dagger call build-image --version=$(VERSION) sync
-
-.PHONY: nightly
-nightly: ## Builds and uploads nightly skills-cassette artifacts.
-	dagger call \
-		nightly \
-			--endpoint=env://BUCKET_ENDPOINT \
-			--bucket=env://BUCKET_NAME \
-			--access-key-id=env://BUCKET_ACCESS_KEY_ID \
-			--secret-access-key=env://BUCKET_SECRET_ACCESS_KEY
-
-.PHONY: upload-install-script
-upload-install-script: ## Uploads the skills-cassette install script.
-	dagger call \
-		upload-install-sh \
-			--endpoint=env://BUCKET_ENDPOINT \
-			--bucket=env://BUCKET_NAME \
-			--access-key-id=env://BUCKET_ACCESS_KEY_ID \
-			--secret-access-key=env://BUCKET_SECRET_ACCESS_KEY
-
-.PHONY: release
-release: ## Builds and uploads skills-cassette release artifacts.
-	dagger call \
-		release-latest \
-			--version=$(VERSION) \
-			--endpoint=env://BUCKET_ENDPOINT \
-			--bucket=env://BUCKET_NAME \
-			--access-key-id=env://BUCKET_ACCESS_KEY_ID \
-			--secret-access-key=env://BUCKET_SECRET_ACCESS_KEY
 
 .PHONY: clean
 clean: ## Removes built artifacts.

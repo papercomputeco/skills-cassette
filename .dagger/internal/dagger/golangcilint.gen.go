@@ -10,7 +10,7 @@ import (
 )
 
 // Retrieve the binding value, as type Golangcilint
-func (r *Binding) AsGolangcilint() *Golangcilint { // golangcilint (https://github.com/papercomputeco/daggerverse/tree/8646f8127d0bb464437e12f0a5d83d72edc211d8/golangcilint/main.go#L19)
+func (r *Binding) AsGolangcilint() *Golangcilint { // golangcilint (https://github.com/papercomputeco/daggerverse/tree/7413a24209aa3a27d8598f15a20f99f749dfc0ae/golangcilint/main.go#L19)
 	q := r.query.Select("asGolangcilint")
 
 	return &Golangcilint{
@@ -19,7 +19,7 @@ func (r *Binding) AsGolangcilint() *Golangcilint { // golangcilint (https://gith
 }
 
 // Create or update a binding of type Golangcilint in the environment
-func (r *Env) WithGolangcilintInput(name string, value *Golangcilint, description string) *Env { // golangcilint (https://github.com/papercomputeco/daggerverse/tree/8646f8127d0bb464437e12f0a5d83d72edc211d8/golangcilint/main.go#L19)
+func (r *Env) WithGolangcilintInput(name string, value *Golangcilint, description string) *Env { // golangcilint (https://github.com/papercomputeco/daggerverse/tree/7413a24209aa3a27d8598f15a20f99f749dfc0ae/golangcilint/main.go#L19)
 	assertNotNil("value", value)
 	q := r.query.Select("withGolangcilintInput")
 	q = q.Arg("name", name)
@@ -32,7 +32,7 @@ func (r *Env) WithGolangcilintInput(name string, value *Golangcilint, descriptio
 }
 
 // Declare a desired Golangcilint output to be assigned in the environment
-func (r *Env) WithGolangcilintOutput(name string, description string) *Env { // golangcilint (https://github.com/papercomputeco/daggerverse/tree/8646f8127d0bb464437e12f0a5d83d72edc211d8/golangcilint/main.go#L19)
+func (r *Env) WithGolangcilintOutput(name string, description string) *Env { // golangcilint (https://github.com/papercomputeco/daggerverse/tree/7413a24209aa3a27d8598f15a20f99f749dfc0ae/golangcilint/main.go#L19)
 	q := r.query.Select("withGolangcilintOutput")
 	q = q.Arg("name", name)
 	q = q.Arg("description", description)
@@ -42,7 +42,7 @@ func (r *Env) WithGolangcilintOutput(name string, description string) *Env { // 
 	}
 }
 
-type Golangcilint struct { // golangcilint (https://github.com/papercomputeco/daggerverse/tree/8646f8127d0bb464437e12f0a5d83d72edc211d8/golangcilint/main.go#L19)
+type Golangcilint struct { // golangcilint (https://github.com/papercomputeco/daggerverse/tree/7413a24209aa3a27d8598f15a20f99f749dfc0ae/golangcilint/main.go#L19)
 	query *querybuilder.Selection
 
 	check *string
@@ -58,7 +58,7 @@ func (r *Golangcilint) WithGraphQLQuery(q *querybuilder.Selection) *Golangcilint
 // Check runs golangci-lint on the source directory without applying fixes.
 // It returns the linter output as a string. If there are lint violations the
 // Dagger pipeline will fail, making this suitable for CI checks.
-func (r *Golangcilint) Check(ctx context.Context) (string, error) { // golangcilint (https://github.com/papercomputeco/daggerverse/tree/8646f8127d0bb464437e12f0a5d83d72edc211d8/golangcilint/main.go#L94)
+func (r *Golangcilint) Check(ctx context.Context) (string, error) { // golangcilint (https://github.com/papercomputeco/daggerverse/tree/7413a24209aa3a27d8598f15a20f99f749dfc0ae/golangcilint/main.go#L97)
 	if r.check != nil {
 		return *r.check, nil
 	}
@@ -121,7 +121,7 @@ func (r *Golangcilint) UnmarshalJSON(bs []byte) error {
 
 // Lint runs golangci-lint on the source directory with --fix, applying
 // auto-fixes where possible, and returns the directory with fixes applied.
-func (r *Golangcilint) Lint() *Directory { // golangcilint (https://github.com/papercomputeco/daggerverse/tree/8646f8127d0bb464437e12f0a5d83d72edc211d8/golangcilint/main.go#L80)
+func (r *Golangcilint) Lint() *Directory { // golangcilint (https://github.com/papercomputeco/daggerverse/tree/7413a24209aa3a27d8598f15a20f99f749dfc0ae/golangcilint/main.go#L81)
 	q := r.query.Select("lint")
 
 	return &Directory{
@@ -140,29 +140,38 @@ func (r *Golangcilint) AsNode() Node {
 // GolangcilintOpts contains options for Query.Golangcilint
 type GolangcilintOpts struct {
 	//
+	// The Go source directory to lint.
+	//
+	Source *Directory // golangcilint (https://github.com/papercomputeco/daggerverse/tree/7413a24209aa3a27d8598f15a20f99f749dfc0ae/golangcilint/main.go#L52)
+	//
 	// An optional golangci-lint configuration file (.golangci.yml) that
 	// replaces the built-in opinionated defaults.
 	//
-	Config *File // golangcilint (https://github.com/papercomputeco/daggerverse/tree/8646f8127d0bb464437e12f0a5d83d72edc211d8/golangcilint/main.go#L56)
+	Config *File // golangcilint (https://github.com/papercomputeco/daggerverse/tree/7413a24209aa3a27d8598f15a20f99f749dfc0ae/golangcilint/main.go#L57)
 	//
 	// Optional environment variables to set in the lint container.
 	// Each entry must be in "KEY=VALUE" format (e.g. "GOEXPERIMENT=rangefunc").
 	//
-	EnvVars []string // golangcilint (https://github.com/papercomputeco/daggerverse/tree/8646f8127d0bb464437e12f0a5d83d72edc211d8/golangcilint/main.go#L61)
+	//
+	// Default: ["GOEXPERIMENT=jsonv2"]
+	EnvVars []string // golangcilint (https://github.com/papercomputeco/daggerverse/tree/7413a24209aa3a27d8598f15a20f99f749dfc0ae/golangcilint/main.go#L62)
 	//
 	// Optional base container with golangci-lint already installed.
 	// When provided it replaces the default golangci-lint image, allowing
 	// callers to supply extra system libraries or tooling (e.g. sqlite-dev).
 	// The container must have golangci-lint on PATH.
 	//
-	BaseCtr *Container // golangcilint (https://github.com/papercomputeco/daggerverse/tree/8646f8127d0bb464437e12f0a5d83d72edc211d8/golangcilint/main.go#L68)
+	BaseCtr *Container // golangcilint (https://github.com/papercomputeco/daggerverse/tree/7413a24209aa3a27d8598f15a20f99f749dfc0ae/golangcilint/main.go#L69)
 }
 
 // New creates a new Golangcilint module instance.
-func (r *Query) Golangcilint(source *Directory, opts ...GolangcilintOpts) *Golangcilint { // golangcilint (https://github.com/papercomputeco/daggerverse/tree/8646f8127d0bb464437e12f0a5d83d72edc211d8/golangcilint/main.go#L49)
-	assertNotNil("source", source)
+func (r *Query) Golangcilint(opts ...GolangcilintOpts) *Golangcilint { // golangcilint (https://github.com/papercomputeco/daggerverse/tree/7413a24209aa3a27d8598f15a20f99f749dfc0ae/golangcilint/main.go#L49)
 	q := r.query.Select("golangcilint")
 	for i := len(opts) - 1; i >= 0; i-- {
+		// `source` optional argument
+		if !querybuilder.IsZeroValue(opts[i].Source) {
+			q = q.Arg("source", opts[i].Source)
+		}
 		// `config` optional argument
 		if !querybuilder.IsZeroValue(opts[i].Config) {
 			q = q.Arg("config", opts[i].Config)
@@ -176,7 +185,6 @@ func (r *Query) Golangcilint(source *Directory, opts ...GolangcilintOpts) *Golan
 			q = q.Arg("baseCtr", opts[i].BaseCtr)
 		}
 	}
-	q = q.Arg("source", source)
 
 	return &Golangcilint{
 		query: q,

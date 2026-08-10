@@ -245,6 +245,9 @@ type GitRefID string
 type GitRepositoryID string
 
 // A unique identifier for an object.
+type GoID string
+
+// A unique identifier for an object.
 type GolangcilintID string
 
 // A unique identifier for an object.
@@ -13101,6 +13104,16 @@ func (r *Query) LoadGitRepositoryFromID(id GitRepositoryID) *GitRepository {
 	q = q.Arg("id", id)
 
 	return &GitRepository{
+		query: q,
+	}
+}
+
+// Load a Go from its ID.
+func (r *Query) LoadGoFromID(id GoID) *Go {
+	q := r.query.Select("loadGoFromID")
+	q = q.Arg("id", id)
+
+	return &Go{
 		query: q,
 	}
 }

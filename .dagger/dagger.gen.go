@@ -198,20 +198,6 @@ func invoke(ctx context.Context, parentJSON []byte, parentName string, fnName st
 	switch parentName {
 	case "SkillsCassette":
 		switch fnName {
-		case "Build":
-			var parent SkillsCassette
-			err = json.Unmarshal(parentJSON, &parent)
-			if err != nil {
-				panic(fmt.Errorf("%s: %w", "failed to unmarshal parent object", err))
-			}
-			var ldflags string
-			if inputArgs["ldflags"] != nil {
-				err = json.Unmarshal([]byte(inputArgs["ldflags"]), &ldflags)
-				if err != nil {
-					panic(fmt.Errorf("%s: %w", "failed to unmarshal input arg ldflags", err))
-				}
-			}
-			return (*SkillsCassette).Build(&parent, ctx, ldflags), nil
 		case "BuildImage":
 			var parent SkillsCassette
 			err = json.Unmarshal(parentJSON, &parent)
@@ -254,111 +240,6 @@ func invoke(ctx context.Context, parentJSON []byte, parentName string, fnName st
 				}
 			}
 			return (*SkillsCassette).BuildPushImage(&parent, ctx, registry, tags, version)
-		case "BuildRelease":
-			var parent SkillsCassette
-			err = json.Unmarshal(parentJSON, &parent)
-			if err != nil {
-				panic(fmt.Errorf("%s: %w", "failed to unmarshal parent object", err))
-			}
-			return (*SkillsCassette).BuildRelease(&parent, ctx), nil
-		case "CheckGoModTidy":
-			var parent SkillsCassette
-			err = json.Unmarshal(parentJSON, &parent)
-			if err != nil {
-				panic(fmt.Errorf("%s: %w", "failed to unmarshal parent object", err))
-			}
-			return (*SkillsCassette).CheckGoModTidy(&parent, ctx)
-		case "CheckLint":
-			var parent SkillsCassette
-			err = json.Unmarshal(parentJSON, &parent)
-			if err != nil {
-				panic(fmt.Errorf("%s: %w", "failed to unmarshal parent object", err))
-			}
-			return (*SkillsCassette).CheckLint(&parent, ctx)
-		case "FixLint":
-			var parent SkillsCassette
-			err = json.Unmarshal(parentJSON, &parent)
-			if err != nil {
-				panic(fmt.Errorf("%s: %w", "failed to unmarshal parent object", err))
-			}
-			return (*SkillsCassette).FixLint(&parent, ctx), nil
-		case "Nightly":
-			var parent SkillsCassette
-			err = json.Unmarshal(parentJSON, &parent)
-			if err != nil {
-				panic(fmt.Errorf("%s: %w", "failed to unmarshal parent object", err))
-			}
-			var endpoint *dagger.Secret
-			if inputArgs["endpoint"] != nil {
-				err = json.Unmarshal([]byte(inputArgs["endpoint"]), &endpoint)
-				if err != nil {
-					panic(fmt.Errorf("%s: %w", "failed to unmarshal input arg endpoint", err))
-				}
-			}
-			var bucket *dagger.Secret
-			if inputArgs["bucket"] != nil {
-				err = json.Unmarshal([]byte(inputArgs["bucket"]), &bucket)
-				if err != nil {
-					panic(fmt.Errorf("%s: %w", "failed to unmarshal input arg bucket", err))
-				}
-			}
-			var accessKeyId *dagger.Secret
-			if inputArgs["accessKeyID"] != nil {
-				err = json.Unmarshal([]byte(inputArgs["accessKeyID"]), &accessKeyId)
-				if err != nil {
-					panic(fmt.Errorf("%s: %w", "failed to unmarshal input arg accessKeyID", err))
-				}
-			}
-			var secretAccessKey *dagger.Secret
-			if inputArgs["secretAccessKey"] != nil {
-				err = json.Unmarshal([]byte(inputArgs["secretAccessKey"]), &secretAccessKey)
-				if err != nil {
-					panic(fmt.Errorf("%s: %w", "failed to unmarshal input arg secretAccessKey", err))
-				}
-			}
-			return (*SkillsCassette).Nightly(&parent, ctx, endpoint, bucket, accessKeyId, secretAccessKey)
-		case "ReleaseLatest":
-			var parent SkillsCassette
-			err = json.Unmarshal(parentJSON, &parent)
-			if err != nil {
-				panic(fmt.Errorf("%s: %w", "failed to unmarshal parent object", err))
-			}
-			var version string
-			if inputArgs["version"] != nil {
-				err = json.Unmarshal([]byte(inputArgs["version"]), &version)
-				if err != nil {
-					panic(fmt.Errorf("%s: %w", "failed to unmarshal input arg version", err))
-				}
-			}
-			var endpoint *dagger.Secret
-			if inputArgs["endpoint"] != nil {
-				err = json.Unmarshal([]byte(inputArgs["endpoint"]), &endpoint)
-				if err != nil {
-					panic(fmt.Errorf("%s: %w", "failed to unmarshal input arg endpoint", err))
-				}
-			}
-			var bucket *dagger.Secret
-			if inputArgs["bucket"] != nil {
-				err = json.Unmarshal([]byte(inputArgs["bucket"]), &bucket)
-				if err != nil {
-					panic(fmt.Errorf("%s: %w", "failed to unmarshal input arg bucket", err))
-				}
-			}
-			var accessKeyId *dagger.Secret
-			if inputArgs["accessKeyID"] != nil {
-				err = json.Unmarshal([]byte(inputArgs["accessKeyID"]), &accessKeyId)
-				if err != nil {
-					panic(fmt.Errorf("%s: %w", "failed to unmarshal input arg accessKeyID", err))
-				}
-			}
-			var secretAccessKey *dagger.Secret
-			if inputArgs["secretAccessKey"] != nil {
-				err = json.Unmarshal([]byte(inputArgs["secretAccessKey"]), &secretAccessKey)
-				if err != nil {
-					panic(fmt.Errorf("%s: %w", "failed to unmarshal input arg secretAccessKey", err))
-				}
-			}
-			return (*SkillsCassette).ReleaseLatest(&parent, ctx, version, endpoint, bucket, accessKeyId, secretAccessKey)
 		case "Test":
 			var parent SkillsCassette
 			err = json.Unmarshal(parentJSON, &parent)
@@ -366,41 +247,6 @@ func invoke(ctx context.Context, parentJSON []byte, parentName string, fnName st
 				panic(fmt.Errorf("%s: %w", "failed to unmarshal parent object", err))
 			}
 			return (*SkillsCassette).Test(&parent, ctx)
-		case "UploadInstallSh":
-			var parent SkillsCassette
-			err = json.Unmarshal(parentJSON, &parent)
-			if err != nil {
-				panic(fmt.Errorf("%s: %w", "failed to unmarshal parent object", err))
-			}
-			var endpoint *dagger.Secret
-			if inputArgs["endpoint"] != nil {
-				err = json.Unmarshal([]byte(inputArgs["endpoint"]), &endpoint)
-				if err != nil {
-					panic(fmt.Errorf("%s: %w", "failed to unmarshal input arg endpoint", err))
-				}
-			}
-			var bucket *dagger.Secret
-			if inputArgs["bucket"] != nil {
-				err = json.Unmarshal([]byte(inputArgs["bucket"]), &bucket)
-				if err != nil {
-					panic(fmt.Errorf("%s: %w", "failed to unmarshal input arg bucket", err))
-				}
-			}
-			var accessKeyId *dagger.Secret
-			if inputArgs["accessKeyID"] != nil {
-				err = json.Unmarshal([]byte(inputArgs["accessKeyID"]), &accessKeyId)
-				if err != nil {
-					panic(fmt.Errorf("%s: %w", "failed to unmarshal input arg accessKeyID", err))
-				}
-			}
-			var secretAccessKey *dagger.Secret
-			if inputArgs["secretAccessKey"] != nil {
-				err = json.Unmarshal([]byte(inputArgs["secretAccessKey"]), &secretAccessKey)
-				if err != nil {
-					panic(fmt.Errorf("%s: %w", "failed to unmarshal input arg secretAccessKey", err))
-				}
-			}
-			return nil, (*SkillsCassette).UploadInstallSh(&parent, ctx, endpoint, bucket, accessKeyId, secretAccessKey)
 		case "":
 			var parent SkillsCassette
 			err = json.Unmarshal(parentJSON, &parent)
