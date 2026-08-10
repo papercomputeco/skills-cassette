@@ -7,9 +7,7 @@ on:
 
 permissions:
   contents: write
-
-env:
-  DAGGER_VERSION: "0.21.7"
+  id-token: write
 
 jobs:
   check:
@@ -52,19 +50,41 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Dagger
-        uses: dagger/dagger-for-github@v8.2.0
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@d96678350ffd6a456235832eb11e1c491589b7bb # v3.21.8
+
+      - name: Cache Nix store
+        uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d # v14
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          version: ${{ env.DAGGER_VERSION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Login to ECR Public
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registry-type: public
 
       - name: Move nightly tag up to HEAD
         run: |
           git tag -f nightly
           git push -f origin nightly
 
+      - name: Push nightly image
+        run: |
+          nix develop --command dagger call \
+            build-push-image \
+              --registry=${{ vars.REGISTRY }} \
+              --tags="nightly" \
+              --version="nightly"
+        env:
+          DAGGER_CLOUD_TOKEN: ${{ secrets.DAGGER_CLOUD_TOKEN }}
+
       - name: Build and upload nightly artifacts
         run: |
-          dagger call \
+          nix develop --command dagger call \
             nightly \
               --endpoint=env://BUCKET_ENDPOINT \
               --bucket=env://BUCKET_NAME \

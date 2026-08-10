@@ -6,6 +6,11 @@
   },
   "dependencies": [
     {
+      "name": "dockerimage",
+      "source": "github.com/papercomputeco/daggerverse/dockerimage@main",
+      "pin": "822a736da394c1be12607134387efc760a71857e"
+    },
+    {
       "name": "golangcilint",
       "source": "github.com/papercomputeco/daggerverse/golangcilint@main",
       "pin": "8646f8127d0bb464437e12f0a5d83d72edc211d8"

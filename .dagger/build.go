@@ -54,12 +54,15 @@ func (t *SkillsCassette) BuildRelease(ctx context.Context) *dagger.Directory {
 	return t.buildVersionedRelease(ctx, "dev")
 }
 
-func (t *SkillsCassette) buildVersionedRelease(ctx context.Context, version string) *dagger.Directory {
-	ldflags := fmt.Sprintf(
+func releaseLDFlags(version string) string {
+	return fmt.Sprintf(
 		"-s -w -X github.com/papercomputeco/skills-cassette/cmd/skills-cassette.Version=%s",
 		version,
 	)
-	return t.checksum(t.Build(ctx, ldflags))
+}
+
+func (t *SkillsCassette) buildVersionedRelease(ctx context.Context, version string) *dagger.Directory {
+	return t.checksum(t.Build(ctx, releaseLDFlags(version)))
 }
 
 // checksum generates a SHA256 sidecar for every artifact.

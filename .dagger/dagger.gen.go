@@ -212,6 +212,48 @@ func invoke(ctx context.Context, parentJSON []byte, parentName string, fnName st
 				}
 			}
 			return (*SkillsCassette).Build(&parent, ctx, ldflags), nil
+		case "BuildImage":
+			var parent SkillsCassette
+			err = json.Unmarshal(parentJSON, &parent)
+			if err != nil {
+				panic(fmt.Errorf("%s: %w", "failed to unmarshal parent object", err))
+			}
+			var version string
+			if inputArgs["version"] != nil {
+				err = json.Unmarshal([]byte(inputArgs["version"]), &version)
+				if err != nil {
+					panic(fmt.Errorf("%s: %w", "failed to unmarshal input arg version", err))
+				}
+			}
+			return (*SkillsCassette).BuildImage(&parent, version), nil
+		case "BuildPushImage":
+			var parent SkillsCassette
+			err = json.Unmarshal(parentJSON, &parent)
+			if err != nil {
+				panic(fmt.Errorf("%s: %w", "failed to unmarshal parent object", err))
+			}
+			var registry string
+			if inputArgs["registry"] != nil {
+				err = json.Unmarshal([]byte(inputArgs["registry"]), &registry)
+				if err != nil {
+					panic(fmt.Errorf("%s: %w", "failed to unmarshal input arg registry", err))
+				}
+			}
+			var tags []string
+			if inputArgs["tags"] != nil {
+				err = json.Unmarshal([]byte(inputArgs["tags"]), &tags)
+				if err != nil {
+					panic(fmt.Errorf("%s: %w", "failed to unmarshal input arg tags", err))
+				}
+			}
+			var version string
+			if inputArgs["version"] != nil {
+				err = json.Unmarshal([]byte(inputArgs["version"]), &version)
+				if err != nil {
+					panic(fmt.Errorf("%s: %w", "failed to unmarshal input arg version", err))
+				}
+			}
+			return (*SkillsCassette).BuildPushImage(&parent, ctx, registry, tags, version)
 		case "BuildRelease":
 			var parent SkillsCassette
 			err = json.Unmarshal(parentJSON, &parent)

@@ -10,6 +10,7 @@ endif
 
 VERSION_PACKAGE := github.com/papercomputeco/skills-cassette/cmd/skills-cassette
 LDFLAGS := -s -w -X $(VERSION_PACKAGE).Version=$(VERSION)
+IMAGE ?= skills-cassette:dev
 
 .PHONY: check
 check: ## Runs all Dagger checks. Auto-fixes are not automatically applied.
@@ -39,6 +40,16 @@ install: build-local ## Builds and installs skills-cassette to GOBIN.
 build: ## Builds all cross-platform release artifacts.
 	$(call print-target)
 	dagger call build-release export --path ./build
+
+.PHONY: image
+image: ## Builds and loads the cassette container image via Dagger.
+	$(call print-target)
+	dagger call build-image --version=$(VERSION) export-image --name=$(IMAGE)
+
+.PHONY: check-image
+check-image: ## Builds the cassette container image without loading it.
+	$(call print-target)
+	dagger call build-image --version=$(VERSION) sync
 
 .PHONY: nightly
 nightly: ## Builds and uploads nightly skills-cassette artifacts.
