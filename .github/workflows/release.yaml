@@ -4,78 +4,41 @@ on:
   release:
     types: [published]
 
-env:
-  DAGGER_VERSION: "0.21.7"
-
 jobs:
   release:
     runs-on: depot-ubuntu-24.04
     permissions:
-      contents: write
+      contents: read
+      id-token: write
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install Dagger
-        uses: dagger/dagger-for-github@v8.2.0
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@d96678350ffd6a456235832eb11e1c491589b7bb # v3.21.8
+
+      - name: Cache Nix store
+        uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d # v14
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
         with:
-          version: ${{ env.DAGGER_VERSION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
 
-      - name: Build and upload release artifacts
+      - name: Login to ECR Public
+        uses: aws-actions/amazon-ecr-login@d539f0932e70871a027e9d5a9d8fc38589180a64 # v2.1.6
+        with:
+          registry-type: public
+
+      - name: Push image
         run: |
-          dagger call \
-            release-latest \
-              --version="${{ github.event.release.tag_name }}" \
-              --endpoint=env://BUCKET_ENDPOINT \
-              --bucket=env://BUCKET_NAME \
-              --access-key-id=env://BUCKET_ACCESS_KEY_ID \
-              --secret-access-key=env://BUCKET_SECRET_ACCESS_KEY \
-            export \
-              --path=./build
+          nix develop --command dagger call \
+            build-push-image \
+              --registry=${{ vars.REGISTRY }} \
+              --tags="${{ github.event.release.tag_name }}" \
+              --tags="latest" \
+              --version="${{ github.event.release.tag_name }}"
         env:
-          BUCKET_ENDPOINT: ${{ secrets.BUCKET_ENDPOINT }}
-          BUCKET_NAME: ${{ secrets.BUCKET_NAME }}
-          BUCKET_ACCESS_KEY_ID: ${{ secrets.BUCKET_ACCESS_KEY_ID }}
-          BUCKET_SECRET_ACCESS_KEY: ${{ secrets.BUCKET_SECRET_ACCESS_KEY }}
           DAGGER_CLOUD_TOKEN: ${{ secrets.DAGGER_CLOUD_TOKEN }}
-
-      - name: Upload install script
-        run: |
-          dagger call \
-            upload-install-sh \
-              --endpoint=env://BUCKET_ENDPOINT \
-              --bucket=env://BUCKET_NAME \
-              --access-key-id=env://BUCKET_ACCESS_KEY_ID \
-              --secret-access-key=env://BUCKET_SECRET_ACCESS_KEY
-        env:
-          BUCKET_ENDPOINT: ${{ secrets.BUCKET_ENDPOINT }}
-          BUCKET_NAME: ${{ secrets.BUCKET_NAME }}
-          BUCKET_ACCESS_KEY_ID: ${{ secrets.BUCKET_ACCESS_KEY_ID }}
-          BUCKET_SECRET_ACCESS_KEY: ${{ secrets.BUCKET_SECRET_ACCESS_KEY }}
-          DAGGER_CLOUD_TOKEN: ${{ secrets.DAGGER_CLOUD_TOKEN }}
-
-      - name: Upload artifacts to GitHub release
-        run: |
-          mkdir -p dist
-          for file in $(find build -type f); do
-            rel_path="${file#build/}"
-            os=$(dirname "$rel_path" | cut -d'/' -f1)
-            arch=$(dirname "$rel_path" | cut -d'/' -f2)
-            filename=$(basename "$file")
-
-            if [[ "$filename" == *.sha256 ]]; then
-              base="${filename%.sha256}"
-              binary_name="${base}-${os}-${arch}"
-              new_name="${binary_name}.sha256"
-              checksum=$(cut -d' ' -f1 "$file")
-              printf '%s  %s\n' "$checksum" "$binary_name" > "dist/$new_name"
-            else
-              new_name="${filename}-${os}-${arch}"
-              cp "$file" "dist/$new_name"
-            fi
-          done
-
-          gh release upload "${{ github.event.release.tag_name }}" dist/*
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

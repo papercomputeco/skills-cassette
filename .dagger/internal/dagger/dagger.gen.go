@@ -185,6 +185,9 @@ type DiffStatID string
 type DirectoryID string
 
 // A unique identifier for an object.
+type DockerimageID string
+
+// A unique identifier for an object.
 type EnumTypeDefID string
 
 // A unique identifier for an object.
@@ -240,6 +243,9 @@ type GitRefID string
 
 // A unique identifier for an object.
 type GitRepositoryID string
+
+// A unique identifier for an object.
+type GoID string
 
 // A unique identifier for an object.
 type GolangcilintID string
@@ -12903,6 +12909,16 @@ func (r *Query) LoadDirectoryFromID(id DirectoryID) *Directory {
 	}
 }
 
+// Load a Dockerimage from its ID.
+func (r *Query) LoadDockerimageFromID(id DockerimageID) *Dockerimage {
+	q := r.query.Select("loadDockerimageFromID")
+	q = q.Arg("id", id)
+
+	return &Dockerimage{
+		query: q,
+	}
+}
+
 // Load a EnumTypeDef from its ID.
 func (r *Query) LoadEnumTypeDefFromID(id EnumTypeDefID) *EnumTypeDef {
 	q := r.query.Select("loadEnumTypeDefFromID")
@@ -13088,6 +13104,16 @@ func (r *Query) LoadGitRepositoryFromID(id GitRepositoryID) *GitRepository {
 	q = q.Arg("id", id)
 
 	return &GitRepository{
+		query: q,
+	}
+}
+
+// Load a Go from its ID.
+func (r *Query) LoadGoFromID(id GoID) *Go {
+	q := r.query.Select("loadGoFromID")
+	q = q.Arg("id", id)
+
+	return &Go{
 		query: q,
 	}
 }

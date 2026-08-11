@@ -22,7 +22,7 @@ func New(
 	// Project source directory.
 	//
 	// +defaultPath="/"
-	// +ignore=[".git", ".direnv", "build", "tmp"]
+	// +ignore=[".git", ".dagger", ".direnv", "build", "tmp"]
 	source *dagger.Directory,
 ) *SkillsCassette {
 	return &SkillsCassette{Source: source}

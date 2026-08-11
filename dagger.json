@@ -4,11 +4,35 @@
   "sdk": {
     "source": "go"
   },
-  "dependencies": [
+  "toolchains": [
+    {
+      "name": "go",
+      "source": "github.com/papercomputeco/daggerverse/go@main",
+      "pin": "7413a24209aa3a27d8598f15a20f99f749dfc0ae",
+      "customizations": [
+        {
+          "argument": "envVars",
+          "default": "GOEXPERIMENT=jsonv2"
+        }
+      ]
+    },
     {
       "name": "golangcilint",
       "source": "github.com/papercomputeco/daggerverse/golangcilint@main",
-      "pin": "8646f8127d0bb464437e12f0a5d83d72edc211d8"
+      "pin": "7413a24209aa3a27d8598f15a20f99f749dfc0ae",
+      "customizations": [
+        {
+          "argument": "envVars",
+          "default": "GOEXPERIMENT=jsonv2"
+        }
+      ]
+    }
+  ],
+  "dependencies": [
+    {
+      "name": "dockerimage",
+      "source": "github.com/papercomputeco/daggerverse/dockerimage@main",
+      "pin": "822a736da394c1be12607134387efc760a71857e"
     }
   ],
   "source": ".dagger"
