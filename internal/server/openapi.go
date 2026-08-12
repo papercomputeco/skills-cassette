@@ -192,7 +192,10 @@ func manifest(name string) map[string]any {
 			"version":      Version,
 			"display_name": "Skills",
 			"description":  "Generates, stores, versions, and serves reusable SKILL.md skills extracted from Tapes sessions.",
+			"license":      "MIT OR Apache-2.0",
 			"homepage":     "https://github.com/papercomputeco/skills-cassette",
+			"image":        "public.ecr.aws/g4e5l3z3/papercomputeco/skills-cassette:v" + Version,
+			"port":         9998,
 		},
 		"depends": map[string]any{
 			"core":  "v1",
