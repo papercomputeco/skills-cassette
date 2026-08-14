@@ -48,8 +48,8 @@ func ConfigFromEnv() Config {
 // allowed — generation then answers 501 rather than the process refusing to
 // start — but a configured value must be a full http(s) URL with a host and
 // no userinfo, query, or fragment, and must use TLS unless it points at a
-// loopback address (a plaintext core URL crossing a network would leak every
-// transcript it reads).
+// loopback address or a Kubernetes cluster-local Service name (a plaintext
+// core URL crossing a real network would leak every transcript it reads).
 func ValidateCoreURL(raw string) error {
 	if raw == "" {
 		return nil
@@ -63,21 +63,27 @@ func ValidateCoreURL(raw string) error {
 		parsed.RawQuery != "" || parsed.Fragment != "" {
 		return fmt.Errorf("core url %q must be a full http(s) URL with a host and no userinfo, query, or fragment", raw)
 	}
-	if parsed.Scheme == "http" && !isLoopbackHost(parsed.Hostname()) {
+	if parsed.Scheme == "http" && !isPlaintextSafeHost(parsed.Hostname()) {
 		return fmt.Errorf("core url %q must use https for non-loopback targets", raw)
 	}
 	return nil
 }
 
-// isLoopbackHost reports whether host names the local machine.
-func isLoopbackHost(host string) bool {
+// isPlaintextSafeHost reports whether host may be spoken to over plain http:
+// the local machine, or a Kubernetes cluster-local Service DNS name. Service
+// names (`<svc>.<ns>.svc` and `<svc>.<ns>.svc.cluster.local`) resolve only
+// inside a cluster, where pod-to-pod traffic never crosses the cluster
+// boundary and no in-cluster TLS exists to require — this is the URL shape a
+// deployment orchestrator hands the cassette for its tenant-local core.
+func isPlaintextSafeHost(host string) bool {
 	if strings.EqualFold(host, "localhost") {
 		return true
 	}
 	if ip := net.ParseIP(host); ip != nil {
 		return ip.IsLoopback()
 	}
-	return false
+	lower := strings.ToLower(strings.TrimSuffix(host, "."))
+	return strings.HasSuffix(lower, ".svc") || strings.HasSuffix(lower, ".svc.cluster.local")
 }
 
 func envOrDefault(key, fallback string) string {

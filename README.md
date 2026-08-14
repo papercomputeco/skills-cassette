@@ -66,7 +66,7 @@ deployment, following the manifest's config schema:
 | Variable | Meaning |
 | --- | --- |
 | `CASSETTE_NAME` | Installed cassette name (default `skills`); drives the route prefix and schema |
-| `CASSETTE_CORE_URL` | Tapes core API origin for reading trace transcripts. `https` is required for non-loopback targets; unset disables generation (501) |
+| `CASSETTE_CORE_URL` | Tapes core API origin for reading trace transcripts. `https` is required except for loopback and cluster-local Service targets (`*.svc`, `*.svc.cluster.local`); unset disables generation (501) |
 | `CASSETTE_LLM_PROVIDER` | `openai` (default), `anthropic`, or `ollama` |
 | `CASSETTE_LLM_MODEL` | Model override; each provider has a sensible default |
 | `CASSETTE_LLM_API_KEY` | Provider API key (falls back to `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`) |

@@ -48,7 +48,8 @@ Configuration arrives through the environment supplied by the deployment:
 
   CASSETTE_NAME          installed cassette name (default "skills")
   CASSETTE_CORE_URL      Tapes core API origin for reading trace transcripts;
-                         https is required for non-loopback targets
+                         https is required except for loopback and
+                         cluster-local Service targets
   CASSETTE_LLM_PROVIDER  openai (default), anthropic, or ollama
   CASSETTE_LLM_MODEL     model override
   CASSETTE_LLM_API_KEY   provider API key (falls back to OPENAI_API_KEY /
