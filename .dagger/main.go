@@ -31,7 +31,7 @@ func New(
 // goContainer returns the shared Go container used by tests, builds, and linting.
 func (t *SkillsCassette) goContainer() *dagger.Container {
 	return dag.Container().
-		From("golang:1.25-bookworm").
+		From("golang:1.26-bookworm").
 		WithEnvVariable("CGO_ENABLED", "0").
 		WithEnvVariable("PATH", "/go/bin:$PATH", dagger.ContainerWithEnvVariableOpts{Expand: true}).
 		WithMountedCache("/go/pkg/mod", dag.CacheVolume("go-mod")).

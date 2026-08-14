@@ -23,6 +23,18 @@ var _ = Describe("core url validation", func() {
 		Expect(server.ValidateCoreURL("https://tapes.internal:8081")).To(Succeed())
 	})
 
+	It("allows plaintext http for cluster-local Service names", func() {
+		Expect(server.ValidateCoreURL("http://gw-api.tenant-abc123.svc.cluster.local:8091")).To(Succeed())
+		Expect(server.ValidateCoreURL("http://gw-api.tenant-abc123.svc:8091")).To(Succeed())
+		Expect(server.ValidateCoreURL("http://gw-api.tenant-abc123.svc.cluster.local.:8091")).To(Succeed())
+	})
+
+	It("does not mistake lookalike hosts for cluster-local names", func() {
+		Expect(server.ValidateCoreURL("http://evil-svc.example.com:8091")).NotTo(Succeed())
+		Expect(server.ValidateCoreURL("http://svc.cluster.local.example.com:8091")).NotTo(Succeed())
+		Expect(server.ValidateCoreURL("http://cluster.local:8091")).NotTo(Succeed())
+	})
+
 	It("refuses urls that are not clean http(s) origins", func() {
 		Expect(server.ValidateCoreURL("ftp://tapes.internal")).NotTo(Succeed())
 		Expect(server.ValidateCoreURL("https://user:pass@tapes.internal")).NotTo(Succeed())
