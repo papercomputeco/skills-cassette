@@ -7,7 +7,7 @@ import (
 
 // Version is the cassette release identity published in the manifest and the
 // OpenAPI info block. Keep it in sync with cassette.toml.
-const Version = "0.2.0"
+const Version = "0.3.0"
 
 // openAPIDocument renders this cassette's OpenAPI document.
 //
