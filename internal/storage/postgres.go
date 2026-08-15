@@ -65,6 +65,7 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 			type                       TEXT NOT NULL DEFAULT 'workflow',
 			version                    TEXT NOT NULL DEFAULT '0.1.0',
 			visibility                 TEXT NOT NULL DEFAULT 'private',
+			status                     TEXT NOT NULL DEFAULT 'draft',
 			tags                       TEXT[] NOT NULL DEFAULT '{}',
 			content                    TEXT NOT NULL DEFAULT '',
 			is_ai_generated            BOOLEAN NOT NULL DEFAULT FALSE,
@@ -77,6 +78,11 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 
 			CONSTRAINT skills_pkey PRIMARY KEY (id)
 		)`, schema),
+		// Existing pre-lifecycle rows were all presented as ordinary skills, so
+		// backfill them as published. New rows explicitly start as drafts.
+		fmt.Sprintf(`ALTER TABLE %s.skills
+			ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'published'`, schema),
+		fmt.Sprintf(`ALTER TABLE %s.skills ALTER COLUMN status SET DEFAULT 'draft'`, schema),
 		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS skills_updated_idx
 			ON %s.skills (updated_at DESC, id DESC)`, schema),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s.skill_versions (
@@ -103,7 +109,7 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 
 // skillColumns is the SELECT list every skill read shares. UUIDs are projected
 // as text (parent_id coalesced to ”) so rows scan into plain strings.
-const skillColumns = `id::text, slug, name, description, type, version, visibility, tags, content,
+const skillColumns = `id::text, slug, name, description, type, version, visibility, status, tags, content,
 	is_ai_generated, generated_from_session_ids, COALESCE(parent_id::text, ''), author_subject,
 	download_count, created_at, updated_at`
 
@@ -126,10 +132,10 @@ func (s *PostgresStore) UpsertSkill(ctx context.Context, rec SkillRecord) (*Skil
 		return nil, fmt.Errorf("upsert skill: invalid parent id %q", rec.ParentID)
 	}
 	query := fmt.Sprintf(`INSERT INTO %s.skills (
-			id, slug, name, description, type, version, visibility, tags, content,
+			id, slug, name, description, type, version, visibility, status, tags, content,
 			is_ai_generated, generated_from_session_ids, parent_id, author_subject,
 			created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NULLIF($12, '')::uuid, $13, $14, $15)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NULLIF($13, '')::uuid, $14, $15, $16)
 		ON CONFLICT (id) DO UPDATE
 		SET slug                       = EXCLUDED.slug,
 		    name                       = EXCLUDED.name,
@@ -137,6 +143,7 @@ func (s *PostgresStore) UpsertSkill(ctx context.Context, rec SkillRecord) (*Skil
 		    type                       = EXCLUDED.type,
 		    version                    = EXCLUDED.version,
 		    visibility                 = EXCLUDED.visibility,
+		    status                     = EXCLUDED.status,
 		    tags                       = EXCLUDED.tags,
 		    content                    = EXCLUDED.content,
 		    is_ai_generated            = EXCLUDED.is_ai_generated,
@@ -146,7 +153,7 @@ func (s *PostgresStore) UpsertSkill(ctx context.Context, rec SkillRecord) (*Skil
 		RETURNING `+skillColumns, quoteIdentifier(s.schema))
 	row := s.pool.QueryRow(ctx, query,
 		rec.ID, rec.Slug, rec.Name, rec.Description, rec.Type, rec.Version, rec.Visibility,
-		nonNilStrings(rec.Tags), rec.Content, rec.IsAIGenerated,
+		rec.Status, nonNilStrings(rec.Tags), rec.Content, rec.IsAIGenerated,
 		nonNilStrings(rec.GeneratedFromSessionIDs), rec.ParentID, rec.AuthorSubject,
 		rec.CreatedAt, rec.UpdatedAt)
 	out, err := scanSkill(row)
@@ -226,29 +233,31 @@ func (s *PostgresStore) ListSkills(ctx context.Context, opts SkillListOpts) ([]S
 		query := selectHead + searchPredicate + `
 			  AND ($2::text IS NULL OR author_subject = $2::text)
 			  AND ($3::text IS NULL OR author_subject <> $3::text)
+			  AND ($4::text IS NULL OR status = $4::text)
 			  AND (
-			    $4::bigint IS NULL
-			    OR download_count < $4::bigint
-			    OR (download_count = $4::bigint AND id < $5::uuid)
+			    $5::bigint IS NULL
+			    OR download_count < $5::bigint
+			    OR (download_count = $5::bigint AND id < $6::uuid)
 			  )
 			ORDER BY download_count DESC, id DESC
-			LIMIT $6`
+			LIMIT $7`
 		rows, err = s.pool.Query(ctx, query,
-			nullText(opts.Query), nullText(opts.Author), nullText(opts.NotAuthor),
+			nullText(opts.Query), nullText(opts.Author), nullText(opts.NotAuthor), nullText(opts.Status),
 			opts.CursorDownloads, nullText(opts.CursorID), limit)
 	} else {
 		query := selectHead + searchPredicate + `
 			  AND ($2::text IS NULL OR author_subject = $2::text)
 			  AND ($3::text IS NULL OR author_subject <> $3::text)
+			  AND ($4::text IS NULL OR status = $4::text)
 			  AND (
-			    $4::timestamptz IS NULL
-			    OR updated_at < $4::timestamptz
-			    OR (updated_at = $4::timestamptz AND id < $5::uuid)
+			    $5::timestamptz IS NULL
+			    OR updated_at < $5::timestamptz
+			    OR (updated_at = $5::timestamptz AND id < $6::uuid)
 			  )
 			ORDER BY updated_at DESC, id DESC
-			LIMIT $6`
+			LIMIT $7`
 		rows, err = s.pool.Query(ctx, query,
-			nullText(opts.Query), nullText(opts.Author), nullText(opts.NotAuthor),
+			nullText(opts.Query), nullText(opts.Author), nullText(opts.NotAuthor), nullText(opts.Status),
 			opts.CursorTs, nullText(opts.CursorID), limit)
 	}
 	if err != nil {
@@ -277,12 +286,13 @@ func (s *PostgresStore) ListSkillsBySession(ctx context.Context, sessionID strin
 func (s *PostgresStore) CountSkills(ctx context.Context, query, author string) (SkillCounts, error) {
 	statement := fmt.Sprintf(`SELECT
 			COUNT(*)::bigint AS total,
-			COUNT(*) FILTER (WHERE author_subject = $2)::bigint AS mine
+			COUNT(*) FILTER (WHERE author_subject = $2)::bigint AS mine,
+			COUNT(*) FILTER (WHERE status = 'draft')::bigint AS drafts
 		FROM %s.skills
 		WHERE `, quoteIdentifier(s.schema)) + searchPredicate
 	var counts SkillCounts
 	if err := s.pool.QueryRow(ctx, statement, nullText(query), author).
-		Scan(&counts.Total, &counts.Mine); err != nil {
+		Scan(&counts.Total, &counts.Mine, &counts.Drafts); err != nil {
 		return SkillCounts{}, fmt.Errorf("count skills: %w", err)
 	}
 	return counts, nil
@@ -344,7 +354,7 @@ func (s *PostgresStore) PublishSkillVersion(ctx context.Context, rec SkillVersio
 	}
 
 	bump := fmt.Sprintf(`UPDATE %s.skills
-		SET version = $1, content = $2, updated_at = $3
+		SET version = $1, content = $2, status = 'published', visibility = 'team', updated_at = $3
 		WHERE id = $4
 		  AND NOT EXISTS (
 		    SELECT 1 FROM %s.skill_versions
@@ -404,7 +414,7 @@ func (s *PostgresStore) IncrementSkillDownloads(ctx context.Context, id string) 
 func scanSkill(row pgx.Row) (SkillRecord, error) {
 	var rec SkillRecord
 	err := row.Scan(&rec.ID, &rec.Slug, &rec.Name, &rec.Description, &rec.Type, &rec.Version,
-		&rec.Visibility, &rec.Tags, &rec.Content, &rec.IsAIGenerated,
+		&rec.Visibility, &rec.Status, &rec.Tags, &rec.Content, &rec.IsAIGenerated,
 		&rec.GeneratedFromSessionIDs, &rec.ParentID, &rec.AuthorSubject,
 		&rec.DownloadCount, &rec.CreatedAt, &rec.UpdatedAt)
 	return rec, err

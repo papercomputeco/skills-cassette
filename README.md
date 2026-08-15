@@ -13,21 +13,22 @@ manifest digest.
 
 ## Surface
 
-Every route the pre-cutover Tapes core served under `/v1/skills` exists here
-1:1 under the cassette prefix:
+The former Tapes skills routes and the cassette's draft-generation operations
+live under one cassette prefix:
 
 | Cassette-local route | Public route (through core) | Purpose |
 | --- | --- | --- |
-| `GET /api/skills` | `GET /v1/cassettes/skills` | Keyset-paginated list with search (`q`), scopes (`scope=all\|mine\|team`), sort (`sort=downloads`), and per-tab counts |
+| `GET /api/skills` | `GET /v1/cassettes/skills` | Keyset-paginated list with search (`q`), attribution scopes, lifecycle status, sort, and per-tab counts |
 | `GET /api/skills?session_id=` | `GET /v1/cassettes/skills?session_id=` | Provenance reverse lookup, replacing legacy `GET /v1/sessions/:id/skills` |
-| `POST /api/skills` | `POST /v1/cassettes/skills` | Create an authored-from-scratch skill |
-| `POST /api/skills/generate` | `POST /v1/cassettes/skills/generate` | LLM generation from nominated source sessions |
+| `POST /api/skills` | `POST /v1/cassettes/skills` | Persist an authored or generated draft with provenance |
+| `POST /api/skills/generate` | `POST /v1/cassettes/skills/generate` | Ephemeral LLM generation from sessions, a brief, or both |
+| `POST /api/skills/revise` | `POST /v1/cassettes/skills/revise` | Ephemeral rewrite of working markdown from an instruction |
 | `GET /api/skills/{id}` | `GET /v1/cassettes/skills/{id}` | Point read by opaque id |
 | `PUT /api/skills/{id}` | `PUT /v1/cassettes/skills/{id}` | Partial update of the editable head |
 | `DELETE /api/skills/{id}` | `DELETE /v1/cassettes/skills/{id}` | Creator-gated delete, history included |
 | `GET /api/skills/{id}/skill.md` | `GET /v1/cassettes/skills/{id}/skill.md` | Drop-in SKILL.md download (counts a download) |
 | `GET /api/skills/{id}/versions` | `GET /v1/cassettes/skills/{id}/versions` | Full published history |
-| `POST /api/skills/{id}/versions` | `POST /v1/cassettes/skills/{id}/versions` | Publish an immutable version snapshot |
+| `POST /api/skills/{id}/versions` | `POST /v1/cassettes/skills/{id}/versions` | Atomically publish an immutable snapshot and transition lifecycle |
 | `POST /api/skills/{id}/duplicate` | `POST /v1/cassettes/skills/{id}/duplicate` | Fork under a fresh id |
 
 `/ping` and `/openapi` are the process anchors core probes and fetches; they
@@ -80,7 +81,7 @@ deployment, following the manifest's config schema:
 - [ ] Provision the cassette role, secrets, configuration, NetworkPolicies, and HTTPRoutes through TKO.
 - [ ] Verify local-router and Envoy route precedence, subject-header trust, fresh installs, upgrades, and rollback.
 - [ ] Replace the pinned trace-wire compatibility fixtures with fixtures generated from the core's published OpenAPI contract.
-- [ ] Decide hard transcript and provenance limits for generation.
+- [ ] Decide whether a single oversized source transcript should be truncated; multi-session generation already stops at the 30,000-byte boundary.
 
 ## Develop
 

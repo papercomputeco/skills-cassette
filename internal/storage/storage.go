@@ -39,6 +39,7 @@ type SkillRecord struct {
 	Type                    string // "workflow" | "domain-knowledge" | "prompt-template"
 	Version                 string // semver, e.g. "0.1.0"
 	Visibility              string // "private" | "team"
+	Status                  string // "draft" | "published"
 	Tags                    []string
 	Content                 string // markdown body
 	IsAIGenerated           bool
@@ -74,6 +75,7 @@ type SkillListOpts struct {
 	Query     string // name/description/tag search (empty = no filter)
 	Author    string // only skills authored by this subject ("mine")
 	NotAuthor string // exclude this subject ("team")
+	Status    string // only this lifecycle status (empty = both)
 	// Sort selects the ordering and which cursor column applies:
 	// "downloads" orders by download_count DESC (keyset on CursorDownloads);
 	// anything else orders by updated_at DESC (keyset on CursorTs). Both
@@ -88,11 +90,18 @@ type SkillListOpts struct {
 // SkillSortDownloads is the SkillListOpts.Sort value for most-downloaded order.
 const SkillSortDownloads = "downloads"
 
-// SkillCounts are the per-tab totals for a search: every matching skill, and
-// how many the caller authored. "team" is derived as Total - Mine.
+const (
+	SkillStatusDraft     = "draft"
+	SkillStatusPublished = "published"
+)
+
+// SkillCounts are the per-tab totals for a search: every matching skill, how
+// many the caller authored, and how many remain unpublished. "team" is derived
+// as Total - Mine.
 type SkillCounts struct {
-	Total int64
-	Mine  int64
+	Total  int64
+	Mine   int64
+	Drafts int64
 }
 
 // Store is the capability surface the skills API needs from persistence.
@@ -108,8 +117,8 @@ type Store interface {
 	CountSkills(ctx context.Context, query, author string) (SkillCounts, error)
 	NextSkillVersionNumber(ctx context.Context, skillID string) (int, error)
 	// PublishSkillVersion appends the immutable snapshot and advances the
-	// skill's head (version, content, updated_at) in one atomic step. The head
-	// only moves when rec.VersionNumber is the highest published number, so of
+	// skill's head (version, content, updated_at, status, visibility) in one
+	// atomic step. The head only moves when rec.VersionNumber is the highest published number, so of
 	// two overlapping publishes the older one can never regress the head the
 	// newer one already set. A duplicate (skill_id, version_number) returns
 	// ErrSkillVersionConflict for the caller's recompute-and-retry loop.

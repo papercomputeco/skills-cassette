@@ -68,9 +68,11 @@ var _ = Describe("skill generation boundary", func() {
 				return "not-json", nil
 			}
 			Expect(prompt).To(ContainSubstring("Return ONLY valid JSON"))
-			return `{"description":"Use when doing it","tags":["workflow"],"content":"## Steps\\n\\n1. Do it"}`, nil
+			Expect(prompt).To(ContainSubstring("Author brief:\nMake this reusable"))
+			Expect(prompt).To(ContainSubstring("1. Add verification"))
+			return `{"name":"do-it","description":"Use when doing it","tags":["workflow"],"content":"## Steps\\n\\n1. Do it"}`, nil
 		})
-		generated, err := gen.Generate(context.Background(), []string{"session"}, "do-it", "workflow", nil)
+		generated, err := gen.Generate(context.Background(), []string{"session"}, "Make this reusable", []string{"Add verification"}, "workflow", nil)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(calls).To(Equal(2))
 		markdown := skill.RenderSkillMD(generated)
@@ -96,11 +98,31 @@ var _ = Describe("skill generation boundary", func() {
 		Expect(markdown).To(ContainSubstring(`sessions: ["session:one"]`))
 	})
 
+	It("generates from a brief without sessions", func() {
+		gen := skill.NewGenerator(nil, func(_ context.Context, prompt string) (string, error) {
+			Expect(prompt).To(ContainSubstring("Author brief:\nDocument the release process"))
+			return `{"name":"Release process","description":"Use when releasing.","content":"## Steps\\n1. Release."}`, nil
+		})
+		generated, err := gen.Generate(context.Background(), nil, "Document the release process", nil, "workflow", nil)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(generated.Sessions).To(BeEmpty())
+	})
+
+	It("revises content without persistence", func() {
+		gen := skill.NewGenerator(nil, func(_ context.Context, prompt string) (string, error) {
+			Expect(prompt).To(ContainSubstring("Add verification"))
+			return `{"content":"## Steps\\n1. Do it.\\n\\n## Verification\\nCheck it."}`, nil
+		})
+		content, err := gen.Revise(context.Background(), "## Steps\n1. Do it.", "Add verification")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(content).To(ContainSubstring("## Verification"))
+	})
+
 	It("rejects invalid input", func() {
 		gen := skill.NewGenerator(fakeQuerier{}, func(context.Context, string) (string, error) { return "", nil })
-		_, err := gen.Generate(context.Background(), nil, "x", "workflow", nil)
-		Expect(err).To(MatchError(ContainSubstring("at least one session")))
-		_, err = gen.Generate(context.Background(), []string{"x"}, "x", "unknown", nil)
+		_, err := gen.Generate(context.Background(), nil, "", nil, "workflow", nil)
+		Expect(err).To(MatchError(ContainSubstring("session ID or a brief")))
+		_, err = gen.Generate(context.Background(), []string{"x"}, "", nil, "unknown", nil)
 		Expect(err).To(MatchError(ContainSubstring("invalid skill type")))
 	})
 })

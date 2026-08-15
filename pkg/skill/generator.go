@@ -21,7 +21,7 @@ type GenerateOptions struct {
 	Until *time.Time // only include turns starting on or before this time
 }
 
-// Generator extracts skills from session transcripts via an LLM.
+// Generator extracts and revises skills via an LLM.
 //
 // Transcripts are built from the span model: each user-visible turn
 // contributes its prompt plus the conversation-spine ("main" call-kind,
@@ -36,25 +36,23 @@ type Generator struct {
 
 // NewGenerator creates a new skill Generator.
 func NewGenerator(query Querier, llmCall LLMCallFunc) *Generator {
-	return &Generator{
-		query:   query,
-		llmCall: llmCall,
-	}
+	return &Generator{query: query, llmCall: llmCall}
 }
 
-// Generate extracts a skill from one or more session IDs. Each ID is a
-// product session (a /v1/sessions UUID); its derived turn/span
-// projection is loaded as the conversation transcript.
-func (g *Generator) Generate(ctx context.Context, sessionIDs []string, name, skillType string, opts *GenerateOptions) (*Skill, error) {
-	if len(sessionIDs) == 0 {
-		return nil, errors.New("at least one session ID is required")
+// Generate returns an unpersisted skill draft from source sessions, an author
+// brief, or both. Feedback is replayed oldest-first on every regeneration.
+func (g *Generator) Generate(ctx context.Context, sessionIDs []string, brief string, feedback []string, skillType string, opts *GenerateOptions) (*Skill, error) {
+	if len(sessionIDs) == 0 && strings.TrimSpace(brief) == "" {
+		return nil, errors.New("at least one session ID or a brief is required")
 	}
-
 	if !ValidSkillType(skillType) {
 		return nil, fmt.Errorf("invalid skill type %q; valid types: %s", skillType, strings.Join(SkillTypes, ", "))
 	}
+	if len(sessionIDs) > 0 && g.query == nil {
+		return nil, errors.New("session generation requires a transcript querier")
+	}
 
-	var transcripts []string
+	transcripts := make([]string, 0, len(sessionIDs))
 	for _, sessionID := range sessionIDs {
 		transcript, err := BuildSessionTranscript(ctx, g.query, sessionID, WithTimeFilter(opts))
 		if err != nil {
@@ -63,17 +61,15 @@ func (g *Generator) Generate(ctx context.Context, sessionIDs []string, name, ski
 		transcripts = append(transcripts, transcript)
 	}
 
-	// Truncate large transcripts at session boundary
+	// Truncate large transcripts at a session boundary. Keep an oversized first
+	// session rather than silently generating from nothing.
 	const maxChars = 30000
 	var totalLen int
-	for i, t := range transcripts {
-		totalLen += len(t)
+	for i, transcript := range transcripts {
+		totalLen += len(transcript)
 		if i > 0 {
-			totalLen += 5 // len("\n---\n")
+			totalLen += len("\n---\n")
 		}
-		// Keep at least the first session: dropping to transcripts[:0] would
-		// feed the LLM an empty prompt. A single oversized transcript is sent
-		// whole (well within the model's context window).
 		if i > 0 && totalLen > maxChars {
 			transcripts = transcripts[:i]
 			fmt.Fprintf(os.Stderr, "warning: transcript truncated to %d of %d session(s) to fit within %d char limit\n",
@@ -82,9 +78,47 @@ func (g *Generator) Generate(ctx context.Context, sessionIDs []string, name, ski
 		}
 	}
 
-	combined := strings.Join(transcripts, "\n---\n")
+	basePrompt := buildSkillPrompt(strings.Join(transcripts, "\n---\n"), brief, feedback, skillType)
+	var lastErr error
+	for attempt := range maxGenerateRetries {
+		prompt := basePrompt
+		if attempt > 0 {
+			prompt += "\n\nReturn ONLY valid JSON, no markdown."
+		}
+		response, err := g.llmCall(ctx, prompt)
+		if err != nil {
+			return nil, fmt.Errorf("llm call: %w", err)
+		}
+		draft, err := parseSkillResponse(response)
+		if err != nil {
+			lastErr = fmt.Errorf("parse response (attempt %d): %w", attempt+1, err)
+			continue
+		}
+		draft.Name = strings.TrimSpace(draft.Name)
+		draft.Type = skillType
+		draft.Sessions = sessionIDs
+		draft.Version = "0.1.0"
+		draft.CreatedAt = time.Now()
+		return draft, nil
+	}
+	return nil, lastErr
+}
 
-	basePrompt := buildSkillPrompt(combined, name, skillType)
+// Revise rewrites an unpersisted working document. Saving remains the caller's
+// explicit next action.
+func (g *Generator) Revise(ctx context.Context, content, instruction string) (string, error) {
+	if strings.TrimSpace(content) == "" || strings.TrimSpace(instruction) == "" {
+		return "", errors.New("content and instruction are required")
+	}
+	basePrompt := fmt.Sprintf(`Rewrite the complete skill document according to the author's instruction.
+Preserve useful material that the instruction does not change.
+Return ONLY valid JSON in this shape: {"content":"the complete rewritten markdown"}.
+
+Instruction:
+%s
+
+Current document:
+%s`, instruction, content)
 
 	var lastErr error
 	for attempt := range maxGenerateRetries {
@@ -92,85 +126,77 @@ func (g *Generator) Generate(ctx context.Context, sessionIDs []string, name, ski
 		if attempt > 0 {
 			prompt += "\n\nReturn ONLY valid JSON, no markdown."
 		}
-
 		response, err := g.llmCall(ctx, prompt)
 		if err != nil {
-			return nil, fmt.Errorf("llm call: %w", err)
+			return "", fmt.Errorf("llm call: %w", err)
 		}
-
-		skill, err := parseSkillResponse(response)
-		if err != nil {
-			lastErr = fmt.Errorf("parse response (attempt %d): %w", attempt+1, err)
+		var revised struct {
+			Content string `json:"content"`
+		}
+		if err := json.Unmarshal(extractJSONObject(response), &revised); err != nil || strings.TrimSpace(revised.Content) == "" {
+			lastErr = fmt.Errorf("parse response (attempt %d): invalid revision JSON", attempt+1)
 			continue
 		}
-
-		// Use the caller-supplied name when given; otherwise keep the LLM's
-		// suggested name (the slug/identifier is derived from it downstream).
-		if strings.TrimSpace(name) != "" {
-			skill.Name = name
-		}
-		skill.Name = strings.TrimSpace(skill.Name)
-		skill.Type = skillType
-		skill.Sessions = sessionIDs
-		skill.Version = "0.1.0"
-		skill.CreatedAt = time.Now()
-
-		return skill, nil
+		return revised.Content, nil
 	}
-
-	return nil, lastErr
+	return "", lastErr
 }
 
-func buildSkillPrompt(transcript, name, skillType string) string {
-	// When the caller supplies a name we pin it; otherwise we ask the model to
-	// suggest a short human-readable title (the slug is derived from it).
-	nameInstruction := fmt.Sprintf("The skill should be named %q and categorized as %q.", name, skillType)
-	nameField := ""
-	if strings.TrimSpace(name) == "" {
-		nameInstruction = fmt.Sprintf("Categorize the skill as %q and suggest a concise, descriptive name for it.", skillType)
-		nameField = "  \"name\": \"a short human-readable skill title, e.g. Diagnose Flaky Tests\",\n"
+func buildSkillPrompt(transcript, brief string, feedback []string, skillType string) string {
+	feedbackText := "(none)"
+	if len(feedback) > 0 {
+		lines := make([]string, len(feedback))
+		for i, note := range feedback {
+			lines[i] = fmt.Sprintf("%d. %s", i+1, note)
+		}
+		feedbackText = strings.Join(lines, "\n")
 	}
-	return fmt.Sprintf(`Analyze the following LLM coding session transcript(s) and extract a reusable skill.
-
-%s
-
-Transcript format: [user] lines are the human's prompts, [assistant]
-lines are the agent's responses, and [tools] lines summarize the tools
-the agent invoked between responses.
+	if transcript == "" {
+		transcript = "(none supplied)"
+	}
+	return fmt.Sprintf(`Create a reusable %s skill from the author's brief and any source transcripts.
+The newest draft must satisfy every feedback note; notes are ordered oldest-first.
 
 Return ONLY valid JSON with these fields:
-
 {
-%s  "description": "A clear description with trigger phrases for when an agent should use this skill. Start with an action verb.",
-  "tags": ["array", "of", "relevant", "tags"],
-  "content": "Markdown body with step-by-step instructions in imperative form. Use ## headers and numbered steps."
+  "name": "a concise human-readable title",
+  "description": "A trigger description beginning with an action verb",
+  "tags": ["relevant", "tags"],
+  "content": "The complete markdown body with imperative steps"
 }
 
-Guidelines for extraction:
-- Identify the reusable pattern/workflow from the session(s)
-- Write a clear description with trigger phrases (e.g. "Use when debugging React hooks issues")
-- Write step-by-step instructions in imperative form
-- Focus on the generalizable technique, not session-specific details
-- Use the [tools] lines to capture which tools the workflow relies on
-- Include any important caveats or edge cases observed
+Guidelines:
+- Generalize the reusable technique rather than copying session-specific details
+- Use ## headers and numbered steps
+- Preserve important caveats and verification steps
+- Use transcript [tools] lines when the workflow depends on specific tools
+
+Author brief:
+%s
+
+Feedback:
+%s
 
 Transcript(s):
-%s`, nameInstruction, nameField, transcript)
+%s`, skillType, strings.TrimSpace(brief), feedbackText, transcript)
 }
 
 func parseSkillResponse(response string) (*Skill, error) {
-	jsonStr := response
-	if idx := strings.Index(response, "{"); idx >= 0 {
-		endIdx := strings.LastIndex(response, "}")
-		if endIdx > idx {
-			jsonStr = response[idx : endIdx+1]
-		}
-	}
-
-	var skill Skill
-	if err := json.Unmarshal([]byte(jsonStr), &skill); err != nil {
+	var draft Skill
+	if err := json.Unmarshal(extractJSONObject(response), &draft); err != nil {
 		return nil, fmt.Errorf("unmarshal skill JSON: %w", err)
 	}
+	if strings.TrimSpace(draft.Name) == "" || strings.TrimSpace(draft.Content) == "" {
+		return nil, errors.New("generated skill requires name and content")
+	}
+	return &draft, nil
+}
 
-	return &skill, nil
+func extractJSONObject(response string) []byte {
+	if start := strings.Index(response, "{"); start >= 0 {
+		if end := strings.LastIndex(response, "}"); end > start {
+			return []byte(response[start : end+1])
+		}
+	}
+	return []byte(response)
 }

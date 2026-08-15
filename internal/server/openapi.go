@@ -7,7 +7,7 @@ import (
 
 // Version is the cassette release identity published in the manifest and the
 // OpenAPI info block. Keep it in sync with cassette.toml.
-const Version = "0.3.0"
+const Version = "0.4.0"
 
 // openAPIDocument renders this cassette's OpenAPI document.
 //
@@ -46,7 +46,8 @@ func openAPIDocument(name string) []byte {
 						queryParam("limit", "integer", "Page size (default 24, max 100)"),
 						queryParam("cursor", "string", "Opaque keyset cursor from a previous next_cursor. Reset it when changing sort."),
 						queryParam("q", "string", "Search over name, description, and tags"),
-						queryParam("scope", "string", "Which slice to return: all, mine, or team"),
+						queryParam("scope", "string", "Which attribution slice to return: all, mine, or team"),
+						queryParam("status", "string", "Lifecycle filter: draft or published"),
 						queryParam("sort", "string", "Ordering; \"downloads\" for most-downloaded, defaults to most recently updated"),
 						queryParam("session_id", "string", "Return only the skills generated from this session (unpaginated)"),
 					),
@@ -55,9 +56,9 @@ func openAPIDocument(name string) []byte {
 						jsonResponse("400", "Malformed cursor", errorSchema()),
 						jsonResponse("500", "Listing failed", errorSchema()),
 					)),
-				"post": operation("createSkill", "Create a skill",
-					"Creates a skill authored by hand, as opposed to the generator. The caller "+
-						"supplies the content; nothing is inferred.",
+				"post": operation("createSkill", "Create a skill draft",
+					"Persists an authored or AI-generated working draft. Generation itself is "+
+						"side-effect-free; the caller supplies the chosen content and provenance.",
 					name,
 					withRequestBody("Skill to create", createSkillSchema()),
 					withResponses(
@@ -67,21 +68,33 @@ func openAPIDocument(name string) []byte {
 					)),
 			},
 			prefix + "/generate": map[string]any{
-				"post": operation("generateSkill", "Generate a skill from sessions",
-					"Runs the LLM skill generator over the nominated sessions and persists the "+
-						"result. The client nominates sources and optional hints; the server is "+
-						"authoritative on the skill body.\n\nSource transcripts are read from the "+
-						"configured Tapes core over its trace API; the cassette holds no core "+
-						"database credential.",
+				"post": operation("generateSkill", "Generate an ephemeral skill draft",
+					"Runs the LLM generator over an author brief, nominated sessions, or both, "+
+						"then returns an unpersisted draft. Ordered feedback is replayed on each "+
+						"regeneration. Source transcripts are read from Tapes core over its public "+
+						"trace API; the cassette holds no core database credential.",
 					name,
-					withRequestBody("Source sessions and optional hints", generateSkillSchema()),
+					withRequestBody("Sources, brief, and cumulative feedback", generateSkillSchema()),
 					withResponses(
-						jsonResponse("201", "The generated skill", skillSchema()),
-						jsonResponse("400", "Invalid body, or sessionIds missing/empty", errorSchema()),
+						jsonResponse("200", "The generated, unpersisted draft", generatedSkillSchema()),
+						jsonResponse("400", "Invalid or oversized input", errorSchema()),
 						jsonResponse("404", "One or more source sessions were not found", errorSchema()),
-						jsonResponse("422", "Sources carried nothing the generator could use, or no LLM key is configured", errorSchema()),
-						jsonResponse("500", "Generation or persistence failed", errorSchema()),
-						jsonResponse("501", "No core url is configured", errorSchema()),
+						jsonResponse("422", "Sources carried nothing usable, or no LLM key is configured", errorSchema()),
+						jsonResponse("500", "Generation failed", errorSchema()),
+						jsonResponse("501", "Session generation requested without a core url", errorSchema()),
+					)),
+			},
+			prefix + "/revise": map[string]any{
+				"post": operation("reviseSkill", "Revise an ephemeral skill document",
+					"Rewrites the supplied working markdown according to one instruction and "+
+						"returns the replacement content without persisting it.",
+					name,
+					withRequestBody("Working content and revision instruction", reviseSkillSchema()),
+					withResponses(
+						jsonResponse("200", "The revised content", revisedSkillSchema()),
+						jsonResponse("400", "Invalid or oversized input", errorSchema()),
+						jsonResponse("422", "No LLM key is configured", errorSchema()),
+						jsonResponse("500", "Revision failed", errorSchema()),
 					)),
 			},
 			prefix + "/{id}": map[string]any{
@@ -144,9 +157,9 @@ func openAPIDocument(name string) []byte {
 						jsonResponse("500", "Listing failed", errorSchema()),
 					)),
 				"post": operation("publishSkill", "Publish a skill version",
-					"Snapshots the skill's current content as an immutable version and advances "+
-						"the skill's semver. Versions are history: the head content stays on the "+
-						"skill row, so reading a skill never needs its versions.",
+					"In one transaction, snapshots the current content as an immutable version, "+
+						"advances the skill head, marks its lifecycle published, and widens visibility "+
+						"to team. Versions are history; current content remains on the skill row.",
 					name,
 					withRequestBody("Version metadata", publishSkillSchema()),
 					withResponses(
@@ -347,6 +360,7 @@ func skillSchema() map[string]any {
 		"type":                  map[string]any{"type": "string", "enum": []string{"workflow", "domain-knowledge", "prompt-template"}},
 		"version":               stringProp("Current published semver."),
 		"visibility":            stringProp("private or team."),
+		"status":                map[string]any{"type": "string", "enum": []string{"draft", "published"}},
 		"tags":                  stringArrayProp("Free-form tags."),
 		"content":               stringProp("Markdown body — the editable head."),
 		"isAiGenerated":         map[string]any{"type": "boolean"},
@@ -364,9 +378,10 @@ func skillsListSchema() map[string]any {
 		"items":       arrayOf(skillSchema()),
 		"next_cursor": stringProp("Opaque keyset cursor; absent on the last page."),
 		"counts": objectSchema(map[string]any{
-			"all":  map[string]any{"type": "integer"},
-			"mine": map[string]any{"type": "integer"},
-			"team": map[string]any{"type": "integer"},
+			"all":    map[string]any{"type": "integer"},
+			"mine":   map[string]any{"type": "integer"},
+			"team":   map[string]any{"type": "integer"},
+			"drafts": map[string]any{"type": "integer"},
 		}),
 	})
 }
@@ -393,34 +408,58 @@ func skillVersionsSchema() map[string]any {
 
 func createSkillSchema() map[string]any {
 	return objectSchema(map[string]any{
-		"name":        stringProp("Display name; defaults to \"New skill\"."),
-		"description": stringProp("Trigger description."),
-		"type":        map[string]any{"type": "string", "enum": []string{"workflow", "domain-knowledge", "prompt-template"}},
-		"tags":        stringArrayProp("Free-form tags."),
-		"content":     stringProp("Markdown body."),
+		"name":                  stringProp("Display name; defaults to \"New skill\"."),
+		"description":           stringProp("Trigger description."),
+		"type":                  map[string]any{"type": "string", "enum": []string{"workflow", "domain-knowledge", "prompt-template"}},
+		"tags":                  stringArrayProp("Free-form tags."),
+		"content":               stringProp("Markdown body."),
+		"originatingSessionIds": boundedStringArrayProp("Source session provenance.", maxProvenanceSessions),
+		"isAiGenerated":         map[string]any{"type": "boolean", "description": "Whether an AI generation pass produced this draft."},
 	})
 }
 
 func updateSkillSchema() map[string]any {
 	return objectSchema(map[string]any{
-		"name":        stringProp("New display name; the slug follows it."),
-		"description": stringProp("New trigger description."),
-		"type":        map[string]any{"type": "string", "enum": []string{"workflow", "domain-knowledge", "prompt-template"}},
-		"visibility":  stringProp("private or team."),
-		"tags":        stringArrayProp("Replacement tag set."),
-		"content":     stringProp("New markdown body (does not publish)."),
+		"name":                  stringProp("New display name; the slug follows it."),
+		"description":           stringProp("New trigger description."),
+		"type":                  map[string]any{"type": "string", "enum": []string{"workflow", "domain-knowledge", "prompt-template"}},
+		"visibility":            stringProp("private or team."),
+		"tags":                  stringArrayProp("Replacement tag set."),
+		"content":               stringProp("New markdown body (does not publish)."),
+		"originatingSessionIds": boundedStringArrayProp("Replacement provenance set; omission preserves it.", maxProvenanceSessions),
 	})
 }
 
 func generateSkillSchema() map[string]any {
 	return objectSchema(map[string]any{
-		"sessionIds": stringArrayProp("Source session ids; at least one is required."),
-		"hint": objectSchema(map[string]any{
-			"name":        stringProp("Pin the skill name instead of letting the generator suggest one."),
-			"description": stringProp("Unused hint carried for wire compatibility."),
-			"type":        map[string]any{"type": "string", "enum": []string{"workflow", "domain-knowledge", "prompt-template"}},
-			"tags":        stringArrayProp("Unused hint carried for wire compatibility."),
-		}),
+		"sessionIds": boundedStringArrayProp("Ordered source session ids. May be empty when brief is non-empty.", maxGenerationSessions),
+		"brief":      stringProp("Free-text author intent; maximum 10,000 UTF-8 bytes."),
+		"feedback":   boundedStringArrayProp("Cumulative review notes, oldest first; maximum 20,000 UTF-8 bytes total.", maxFeedbackItems),
+	})
+}
+
+func generatedSkillSchema() map[string]any {
+	return objectSchema(map[string]any{
+		"name":                  stringProp("Suggested display name."),
+		"description":           stringProp("Generated trigger description."),
+		"type":                  map[string]any{"type": "string", "enum": []string{"workflow", "domain-knowledge", "prompt-template"}},
+		"tags":                  stringArrayProp("Generated tags."),
+		"content":               stringProp("Generated markdown body."),
+		"originatingSessionIds": stringArrayProp("Normalized source session ids."),
+		"isAiGenerated":         map[string]any{"type": "boolean"},
+	})
+}
+
+func reviseSkillSchema() map[string]any {
+	return objectSchema(map[string]any{
+		"content":     stringProp("Current working markdown; maximum 200,000 UTF-8 bytes."),
+		"instruction": stringProp("Requested change; maximum 10,000 UTF-8 bytes."),
+	})
+}
+
+func revisedSkillSchema() map[string]any {
+	return objectSchema(map[string]any{
+		"content": stringProp("Complete replacement markdown."),
 	})
 }
 
@@ -445,6 +484,12 @@ func stringArrayProp(description string) map[string]any {
 		"description": description,
 		"items":       map[string]any{"type": "string"},
 	}
+}
+
+func boundedStringArrayProp(description string, maxItems int) map[string]any {
+	prop := stringArrayProp(description)
+	prop["maxItems"] = maxItems
+	return prop
 }
 
 func arrayOf(schema map[string]any) map[string]any {

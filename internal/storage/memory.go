@@ -101,6 +101,9 @@ func (s *MemoryStore) ListSkills(_ context.Context, opts SkillListOpts) ([]Skill
 		if opts.NotAuthor != "" && rec.AuthorSubject == opts.NotAuthor {
 			continue
 		}
+		if opts.Status != "" && rec.Status != opts.Status {
+			continue
+		}
 		matched = append(matched, rec)
 	}
 
@@ -185,6 +188,9 @@ func (s *MemoryStore) CountSkills(_ context.Context, query, author string) (Skil
 		if rec.AuthorSubject == author {
 			counts.Mine++
 		}
+		if rec.Status == SkillStatusDraft {
+			counts.Drafts++
+		}
 	}
 	return counts, nil
 }
@@ -228,6 +234,8 @@ func (s *MemoryStore) PublishSkillVersion(_ context.Context, rec SkillVersionRec
 	if skill, ok := s.skills[rec.SkillID]; ok && highest {
 		skill.Version = rec.Semver
 		skill.Content = rec.Content
+		skill.Status = SkillStatusPublished
+		skill.Visibility = "team"
 		skill.UpdatedAt = rec.PublishedAt
 		s.skills[rec.SkillID] = skill
 	}

@@ -18,8 +18,16 @@ import (
 )
 
 const (
-	defaultSkillsLimit = 24
-	maxSkillsLimit     = 100
+	defaultSkillsLimit          = 24
+	maxSkillsLimit              = 100
+	maxJSONBodyBytes            = 1 << 20
+	maxGenerationSessions       = 20
+	maxProvenanceSessions       = 100
+	maxBriefBytes               = 10_000
+	maxFeedbackItems            = 20
+	maxFeedbackBytes            = 20_000
+	maxRevisionContentBytes     = 200_000
+	maxRevisionInstructionBytes = 10_000
 )
 
 // errorResponse is the uniform error envelope, matching the shape the Tapes
@@ -81,12 +89,15 @@ func authSubjectFromRequest(r *http.Request) string {
 // the first object — matching the pre-cutover fiber BodyParser semantics. An
 // empty body returns io.EOF so callers that accept one (publish) can allow it.
 func decodeJSONBody(r *http.Request, out any) error {
-	body, err := io.ReadAll(r.Body)
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxJSONBodyBytes+1))
 	if err != nil {
 		return err
 	}
 	if len(body) == 0 {
 		return io.EOF
+	}
+	if len(body) > maxJSONBodyBytes {
+		return errors.New("request body is too large")
 	}
 	return json.Unmarshal(body, out)
 }
@@ -104,19 +115,31 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 	_, _ = w.Write(data)
 }
 
-// generateSkillRequest is the POST generate body. It mirrors the console's
-// GenerateSkillInput: the client nominates source sessions plus optional
-// hints, and the server is authoritative on the skill body. Wire shape is
-// camelCase to match the console's skills schemas (which predate and diverge
-// from the snake_case convention the rest of tapes uses).
+// generateSkillRequest describes an ephemeral generation pass. Feedback is
+// replayed oldest-first; the endpoint never writes a skill row.
 type generateSkillRequest struct {
 	SessionIDs []string `json:"sessionIds"`
-	Hint       *struct {
-		Name        string   `json:"name"`
-		Description string   `json:"description"`
-		Type        string   `json:"type"`
-		Tags        []string `json:"tags"`
-	} `json:"hint"`
+	Brief      string   `json:"brief"`
+	Feedback   []string `json:"feedback"`
+}
+
+type reviseSkillRequest struct {
+	Content     string `json:"content"`
+	Instruction string `json:"instruction"`
+}
+
+type generatedSkillResponse struct {
+	Name                  string   `json:"name"`
+	Description           string   `json:"description"`
+	Type                  string   `json:"type"`
+	Tags                  []string `json:"tags"`
+	Content               string   `json:"content"`
+	OriginatingSessionIDs []string `json:"originatingSessionIds"`
+	IsAIGenerated         bool     `json:"isAiGenerated"`
+}
+
+type revisedSkillResponse struct {
+	Content string `json:"content"`
 }
 
 // skillResponse is the unified Skill shape the console expects (camelCase). id
@@ -132,6 +155,7 @@ type skillResponse struct {
 	Type                  string   `json:"type"`
 	Version               string   `json:"version"`
 	Visibility            string   `json:"visibility"`
+	Status                string   `json:"status"`
 	Tags                  []string `json:"tags"`
 	Content               string   `json:"content"`
 	IsAIGenerated         bool     `json:"isAiGenerated"`
@@ -165,9 +189,10 @@ type skillsListResponse struct {
 // skillCountsResp are the tab counts for the current search: all matching,
 // authored by the caller (mine), and everyone else's (team = all - mine).
 type skillCountsResp struct {
-	All  int64 `json:"all"`
-	Mine int64 `json:"mine"`
-	Team int64 `json:"team"`
+	All    int64 `json:"all"`
+	Mine   int64 `json:"mine"`
+	Team   int64 `json:"team"`
+	Drafts int64 `json:"drafts"`
 }
 
 // sessionSkillsResponse is the envelope for the skills attributed to one
@@ -186,71 +211,51 @@ type skillVersionsResponse struct {
 	TotalCount int                    `json:"totalCount"`
 }
 
-// handleGenerateSkill runs the pkg/skill LLM generator over the requested
-// sessions, persists the result, and returns it.
-//
-// The generator reads session transcripts through the cassette's HTTP trace
-// client bound to the configured core URL (GET /v1/traces?session_id= and
-// GET /v1/traces/{id}) — the cassette holds no core database credential.
+// handleGenerateSkill returns an ephemeral draft from source sessions, an
+// author brief, or both. The client explicitly creates a skill only after the
+// author chooses Save draft or Publish.
 func (s *Server) handleGenerateSkill(w http.ResponseWriter, r *http.Request) {
 	var req generateSkillRequest
 	if err := decodeJSONBody(r, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid request body"})
 		return
 	}
-	if len(req.SessionIDs) == 0 {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "sessionIds is required and must be non-empty"})
+
+	sessionIDs, err := normalizeIDs(req.SessionIDs, maxGenerationSessions)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid sessionIds: " + err.Error()})
 		return
 	}
-
-	skillType := "workflow"
-	if req.Hint != nil && strings.TrimSpace(req.Hint.Type) != "" {
-		skillType = strings.TrimSpace(req.Hint.Type)
-	}
-	if !skill.ValidSkillType(skillType) {
-		writeJSON(w, http.StatusBadRequest, errorResponse{
-			Error: fmt.Sprintf("invalid type %q; valid types: %s", skillType, strings.Join(skill.SkillTypes, ", ")),
-		})
+	feedback, err := normalizeTextItems(req.Feedback, maxFeedbackItems)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid feedback: " + err.Error()})
 		return
 	}
-
-	// name may be empty — the generator then suggests a descriptive name from
-	// the transcript rather than a generic skill-from-<id> placeholder.
-	name := ""
-	if req.Hint != nil {
-		name = strings.TrimSpace(req.Hint.Name)
+	brief := strings.TrimSpace(req.Brief)
+	if len(brief) > maxBriefBytes || totalBytes(feedback) > maxFeedbackBytes {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "generation instructions are too large"})
+		return
 	}
-
-	if s.querier == nil {
+	if len(sessionIDs) == 0 && brief == "" {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "at least one sessionId or brief is required"})
+		return
+	}
+	if len(sessionIDs) > 0 && s.querier == nil {
 		writeJSON(w, http.StatusNotImplemented, errorResponse{
-			Error: "skill generation requires a configured core url (CASSETTE_CORE_URL)",
+			Error: "session generation requires a configured core url (CASSETTE_CORE_URL)",
 		})
 		return
 	}
 
-	llmCfg := s.llm
-	if strings.TrimSpace(llmCfg.Provider) == "" {
-		llmCfg.Provider = "openai"
-	}
-	llmCaller, err := skill.NewLLMCaller(llmCfg)
+	llmCaller, err := s.skillLLMCaller()
 	if err != nil {
-		// A missing provider key is a deployment configuration gap, not a
-		// server fault. Surface it as an actionable 422 rather than a 500.
-		if errors.Is(err, skill.ErrNoAPIKey) {
-			writeJSON(w, http.StatusUnprocessableEntity, errorResponse{
-				Error: "skill generation requires a configured LLM provider API key",
-			})
-			return
-		}
-		s.logger.Error("configure llm for skill generation", "error", err)
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "llm provider not configured"})
+		s.writeLLMConfigError(w, err)
 		return
 	}
-
-	sk, err := skill.NewGenerator(s.querier, llmCaller).Generate(r.Context(), req.SessionIDs, name, skillType, nil)
+	draft, err := skill.NewGenerator(s.querier, llmCaller).Generate(
+		r.Context(), sessionIDs, brief, feedback, "workflow", nil,
+	)
 	if err != nil {
-		// A source session the core answered 404 for is a 404 here, not a
-		// server fault; a session with no usable turns is a 422.
 		if errors.Is(err, skill.ErrNotFound) {
 			writeJSON(w, http.StatusNotFound, errorResponse{Error: "one or more source sessions were not found"})
 			return
@@ -262,45 +267,73 @@ func (s *Server) handleGenerateSkill(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.logger.Error("generate skill", "error", err)
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: fmt.Sprintf("failed to generate skill: %v", err)})
+		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "failed to generate skill"})
 		return
 	}
 
-	now := time.Now().UTC()
-	displayName := strings.TrimSpace(sk.Name)
-	slug := slugifySkillName(displayName)
-	if slug == "" {
-		slug = fallbackSkillName(req.SessionIDs[0])
-		displayName = slug
+	tags := draft.Tags
+	if tags == nil {
+		tags = []string{}
 	}
-	// Skills are keyed on an opaque id, so slug no longer has to be unique — two
-	// generations whose names slugify the same coexist as distinct ids. Mint the
-	// id here so the client can navigate to the new skill.
-	rec := storage.SkillRecord{
-		ID:                      uuid.NewString(),
-		Slug:                    slug,
-		Name:                    displayName,
-		Description:             sk.Description,
-		Type:                    sk.Type,
-		Version:                 sk.Version,
-		Visibility:              "private",
-		Tags:                    sk.Tags,
-		Content:                 sk.Content,
-		IsAIGenerated:           true,
-		GeneratedFromSessionIDs: sk.Sessions,
-		AuthorSubject:           authSubjectFromRequest(r),
-		CreatedAt:               now,
-		UpdatedAt:               now,
+	writeJSON(w, http.StatusOK, generatedSkillResponse{
+		Name:                  draft.Name,
+		Description:           draft.Description,
+		Type:                  draft.Type,
+		Tags:                  tags,
+		Content:               draft.Content,
+		OriginatingSessionIDs: sessionIDs,
+		IsAIGenerated:         true,
+	})
+}
+
+func (s *Server) handleReviseSkill(w http.ResponseWriter, r *http.Request) {
+	var req reviseSkillRequest
+	if err := decodeJSONBody(r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid request body"})
+		return
+	}
+	req.Content = strings.TrimSpace(req.Content)
+	req.Instruction = strings.TrimSpace(req.Instruction)
+	if req.Content == "" || req.Instruction == "" {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "content and instruction are required"})
+		return
+	}
+	if len(req.Content) > maxRevisionContentBytes || len(req.Instruction) > maxRevisionInstructionBytes {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "revision input is too large"})
+		return
 	}
 
-	saved, err := s.store.UpsertSkill(r.Context(), rec)
+	llmCaller, err := s.skillLLMCaller()
 	if err != nil {
-		s.logger.Error("persist skill", "error", err)
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "failed to persist skill"})
+		s.writeLLMConfigError(w, err)
 		return
 	}
+	content, err := skill.NewGenerator(nil, llmCaller).Revise(r.Context(), req.Content, req.Instruction)
+	if err != nil {
+		s.logger.Error("revise skill", "error", err)
+		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "failed to revise skill"})
+		return
+	}
+	writeJSON(w, http.StatusOK, revisedSkillResponse{Content: content})
+}
 
-	writeJSON(w, http.StatusCreated, skillFromRecord(*saved))
+func (s *Server) skillLLMCaller() (skill.LLMCallFunc, error) {
+	cfg := s.llm
+	if strings.TrimSpace(cfg.Provider) == "" {
+		cfg.Provider = "openai"
+	}
+	return skill.NewLLMCaller(cfg)
+}
+
+func (s *Server) writeLLMConfigError(w http.ResponseWriter, err error) {
+	if errors.Is(err, skill.ErrNoAPIKey) {
+		writeJSON(w, http.StatusUnprocessableEntity, errorResponse{
+			Error: "skill AI operations require a configured LLM provider API key",
+		})
+		return
+	}
+	s.logger.Error("configure skill llm", "error", err)
+	writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "llm provider not configured"})
 }
 
 // handleGetSkill returns a persisted skill by id.
@@ -346,6 +379,14 @@ func (s *Server) handleListSkills(w http.ResponseWriter, r *http.Request) {
 
 	query := strings.TrimSpace(r.URL.Query().Get("q"))
 	opts := storage.SkillListOpts{Query: query, Limit: limit + 1} // +1 to detect has_more
+	switch status := r.URL.Query().Get("status"); status {
+	case "":
+	case storage.SkillStatusDraft, storage.SkillStatusPublished:
+		opts.Status = status
+	default:
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "status must be draft or published"})
+		return
+	}
 	if r.URL.Query().Get("sort") == storage.SkillSortDownloads {
 		opts.Sort = storage.SkillSortDownloads
 	}
@@ -404,9 +445,10 @@ func (s *Server) handleListSkills(w http.ResponseWriter, r *http.Request) {
 		Items:      items,
 		NextCursor: nextCursor,
 		Counts: skillCountsResp{
-			All:  counts.Total,
-			Mine: counts.Mine,
-			Team: counts.Total - counts.Mine,
+			All:    counts.Total,
+			Mine:   counts.Mine,
+			Team:   counts.Total - counts.Mine,
+			Drafts: counts.Drafts,
 		},
 	})
 }
@@ -431,12 +473,13 @@ func (s *Server) listSessionSkills(w http.ResponseWriter, r *http.Request, sessi
 // updateSkillRequest is the PUT body — all fields optional; only present
 // fields are applied onto the existing record.
 type updateSkillRequest struct {
-	Name        *string  `json:"name"`
-	Description *string  `json:"description"`
-	Type        *string  `json:"type"`
-	Visibility  *string  `json:"visibility"`
-	Tags        []string `json:"tags"`
-	Content     *string  `json:"content"`
+	Name                  *string  `json:"name"`
+	Description           *string  `json:"description"`
+	Type                  *string  `json:"type"`
+	Visibility            *string  `json:"visibility"`
+	Tags                  []string `json:"tags"`
+	Content               *string  `json:"content"`
+	OriginatingSessionIDs []string `json:"originatingSessionIds"`
 }
 
 // handleUpdateSkill saves edits to a skill's working content/metadata. The
@@ -488,6 +531,14 @@ func (s *Server) handleUpdateSkill(w http.ResponseWriter, r *http.Request) {
 	if req.Content != nil {
 		rec.Content = *req.Content
 	}
+	if req.OriginatingSessionIDs != nil {
+		ids, err := normalizeIDs(req.OriginatingSessionIDs, maxProvenanceSessions)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid originatingSessionIds: " + err.Error()})
+			return
+		}
+		rec.GeneratedFromSessionIDs = ids
+	}
 	rec.UpdatedAt = time.Now().UTC()
 
 	saved, err := s.store.UpsertSkill(r.Context(), rec)
@@ -530,20 +581,21 @@ func (s *Server) handleDeleteSkill(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// createSkillRequest is the POST body for an authored-from-scratch skill —
-// only a name is required; the rest default to an empty private draft.
+// createSkillRequest persists either an authored or generated draft. Only a
+// name is required; lifecycle always starts as draft.
 type createSkillRequest struct {
-	Name        string   `json:"name"`
-	Description string   `json:"description"`
-	Type        string   `json:"type"`
-	Tags        []string `json:"tags"`
-	Content     string   `json:"content"`
+	Name                  string   `json:"name"`
+	Description           string   `json:"description"`
+	Type                  string   `json:"type"`
+	Tags                  []string `json:"tags"`
+	Content               string   `json:"content"`
+	OriginatingSessionIDs []string `json:"originatingSessionIds"`
+	IsAIGenerated         bool     `json:"isAiGenerated"`
 }
 
-// handleCreateSkill writes a new blank/authored skill (empty provenance),
-// attributed to the caller. Generate is the AI path; this is the
-// create-from-scratch path. The id is minted here; slug is a cosmetic label
-// derived from the name (no longer unique).
+// handleCreateSkill writes a new draft attributed to the caller. Generation
+// itself is side-effect-free, so generated metadata and provenance arrive here
+// only after the author chooses to save. The server mints the id and slug.
 func (s *Server) handleCreateSkill(w http.ResponseWriter, r *http.Request) {
 	var req createSkillRequest
 	if err := decodeJSONBody(r, &req); err != nil {
@@ -568,6 +620,11 @@ func (s *Server) handleCreateSkill(w http.ResponseWriter, r *http.Request) {
 	if slug == "" {
 		slug = "new-skill"
 	}
+	originatingSessionIDs, err := normalizeIDs(req.OriginatingSessionIDs, maxProvenanceSessions)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid originatingSessionIds: " + err.Error()})
+		return
+	}
 
 	now := time.Now().UTC()
 	rec := storage.SkillRecord{
@@ -578,10 +635,11 @@ func (s *Server) handleCreateSkill(w http.ResponseWriter, r *http.Request) {
 		Type:                    skillType,
 		Version:                 "0.1.0",
 		Visibility:              "private",
+		Status:                  storage.SkillStatusDraft,
 		Tags:                    req.Tags,
 		Content:                 req.Content,
-		IsAIGenerated:           false,
-		GeneratedFromSessionIDs: nil,
+		IsAIGenerated:           req.IsAIGenerated,
+		GeneratedFromSessionIDs: originatingSessionIDs,
 		AuthorSubject:           authSubjectFromRequest(r),
 		CreatedAt:               now,
 		UpdatedAt:               now,
@@ -714,6 +772,7 @@ func (s *Server) handleDuplicateSkill(w http.ResponseWriter, r *http.Request) {
 	rec.Name = existing.Name + " (copy)"
 	rec.Slug = existing.Slug // slug is cosmetic; sharing the parent's reads fine
 	rec.Visibility = "private"
+	rec.Status = storage.SkillStatusDraft
 	rec.Version = "0.1.0"
 	rec.ParentID = existing.ID
 	rec.AuthorSubject = authSubjectFromRequest(r)
@@ -793,6 +852,7 @@ func skillFromRecord(rec storage.SkillRecord) skillResponse {
 		Type:                  rec.Type,
 		Version:               rec.Version,
 		Visibility:            rec.Visibility,
+		Status:                rec.Status,
 		Tags:                  tags,
 		Content:               rec.Content,
 		IsAIGenerated:         rec.IsAIGenerated,
@@ -817,18 +877,46 @@ func skillVersionFromRecord(rec storage.SkillVersionRecord) skillVersionResponse
 	}
 }
 
-// fallbackSkillName derives a kebab-case name when the client supplies no
-// hint name, e.g. "skill-from-1a2b3c4d".
-func fallbackSkillName(sessionID string) string {
-	short := strings.ToLower(sessionID)
-	short = strings.ReplaceAll(short, "-", "")
-	if len(short) > 8 {
-		short = short[:8]
+func normalizeIDs(values []string, max int) ([]string, error) {
+	if len(values) > max {
+		return nil, fmt.Errorf("at most %d values are allowed", max)
 	}
-	if short == "" {
-		short = "session"
+	out := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return nil, errors.New("values must not be empty")
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
 	}
-	return "skill-from-" + short
+	return out, nil
+}
+
+func normalizeTextItems(values []string, max int) ([]string, error) {
+	if len(values) > max {
+		return nil, fmt.Errorf("at most %d values are allowed", max)
+	}
+	out := make([]string, len(values))
+	for i, value := range values {
+		out[i] = strings.TrimSpace(value)
+		if out[i] == "" {
+			return nil, errors.New("values must not be empty")
+		}
+	}
+	return out, nil
+}
+
+func totalBytes(values []string) int {
+	var total int
+	for _, value := range values {
+		total += len(value)
+	}
+	return total
 }
 
 // slugifySkillName lowercases and hyphenates an arbitrary name into the

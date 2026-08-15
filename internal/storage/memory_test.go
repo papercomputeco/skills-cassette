@@ -19,7 +19,8 @@ func seed(store *storage.MemoryStore, id string, updatedAt time.Time) storage.Sk
 		Description: "about " + id,
 		Type:        "workflow",
 		Version:     "0.1.0",
-		Visibility:  "private",
+		Visibility:  "team",
+		Status:      storage.SkillStatusPublished,
 		Tags:        []string{"tag-" + id},
 		Content:     "# " + id,
 		CreatedAt:   updatedAt,
@@ -95,6 +96,26 @@ var _ = Describe("MemoryStore", func() {
 		counts, err := store.CountSkills(ctx, "tag-sql-tuning", "")
 		Expect(err).NotTo(HaveOccurred())
 		Expect(counts.Total).To(Equal(int64(1)))
+		Expect(counts.Drafts).To(BeZero())
+	})
+
+	It("filters drafts independently of attribution scope", func() {
+		store := storage.NewMemoryStore()
+		now := time.Now().UTC()
+		seed(store, "published", now)
+		draft := seed(store, "draft", now.Add(time.Second))
+		draft.Status = storage.SkillStatusDraft
+		draft.Visibility = "private"
+		_, err := store.UpsertSkill(ctx, draft)
+		Expect(err).NotTo(HaveOccurred())
+
+		page, err := store.ListSkills(ctx, storage.SkillListOpts{Status: storage.SkillStatusDraft})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(page).To(HaveLen(1))
+		Expect(page[0].ID).To(Equal("draft"))
+		counts, err := store.CountSkills(ctx, "", "")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(counts.Drafts).To(Equal(int64(1)))
 	})
 
 	It("orders by downloads with its own keyset", func() {
@@ -150,6 +171,8 @@ var _ = Describe("MemoryStore", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(head.Version).To(Equal("0.1.1"))
 		Expect(head.Content).To(Equal("# newer"))
+		Expect(head.Status).To(Equal(storage.SkillStatusPublished))
+		Expect(head.Visibility).To(Equal("team"))
 
 		// ...then the older overlapping publish commits last: its history row
 		// is kept but the head must not move backwards.

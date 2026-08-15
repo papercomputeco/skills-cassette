@@ -73,6 +73,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET "+prefix, s.handleListSkills)
 	mux.HandleFunc("POST "+prefix, s.handleCreateSkill)
 	mux.HandleFunc("POST "+prefix+"/generate", s.handleGenerateSkill)
+	mux.HandleFunc("POST "+prefix+"/revise", s.handleReviseSkill)
 	mux.HandleFunc("GET "+prefix+"/{id}", s.handleGetSkill)
 	mux.HandleFunc("PUT "+prefix+"/{id}", s.handleUpdateSkill)
 	mux.HandleFunc("DELETE "+prefix+"/{id}", s.handleDeleteSkill)
