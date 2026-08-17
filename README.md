@@ -35,8 +35,11 @@ are not part of the proxied API.
 
 The cassette owns two tables, `skills` and `skill_versions`, in its own
 Postgres schema (named after the installed cassette name), and runs its own
-migrations at startup. There is no `org_id`: tenancy is gateway-owned, and
-attribution rides the gateway-trusted `x-paper-auth-subject` header.
+migrations at startup. It also publishes `<schema>.skills_view` as the stable
+read surface for dependent cassettes; the view exposes only `id`, `name`,
+`description`, `content`, and `generated_from_session_ids`. There is no
+`org_id`: tenancy is gateway-owned, and attribution rides the gateway-trusted
+`x-paper-auth-subject` header.
 
 Source transcripts for generation are read from the configured Tapes core over
 its trace API (`GET /v1/traces?session_id=` and `GET /v1/traces/{id}`); the

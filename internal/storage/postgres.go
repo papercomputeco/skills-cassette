@@ -79,6 +79,11 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 		)`, schema),
 		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS skills_updated_idx
 			ON %s.skills (updated_at DESC, id DESC)`, schema),
+		fmt.Sprintf(`CREATE OR REPLACE VIEW %s.skills_view AS
+			SELECT id, name, description, content, generated_from_session_ids
+			FROM %s.skills`, schema, schema),
+		fmt.Sprintf(`COMMENT ON VIEW %s.skills_view IS
+			'Stable read contract for cassettes that resolve skill evaluation subjects.'`, schema),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s.skill_versions (
 			skill_id       UUID NOT NULL,
 			version_number INT  NOT NULL,
