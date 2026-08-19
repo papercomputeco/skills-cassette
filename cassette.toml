@@ -21,12 +21,12 @@ kind = "cassette/v1alpha1"
 # the Postgres schema ("skills"), and the role ("cassette_skills").
 [cassette]
 name = "skills"
-version = "0.3.0"
+version = "0.4.0"
 display_name = "Skills"
 description = "Generates, stores, versions, and serves reusable SKILL.md skills extracted from Tapes sessions."
 license = "MIT OR Apache-2.0"
 homepage = "https://github.com/papercomputeco/skills-cassette"
-image = "public.ecr.aws/g4e5l3z3/papercomputeco/skills-cassette:v0.3.0"
+image = "public.ecr.aws/g4e5l3z3/papercomputeco/skills-cassette:v0.4.0"
 port = 9998
 
 # What this cassette needs from Tapes. It reads no contract views: source
@@ -51,6 +51,9 @@ prefix_path = "api"
 name = "skills"
 
 [[tables]]
+name = "skill_drafts"
+
+[[tables]]
 name = "skill_versions"
 
 # Configuration this cassette accepts, published as schema so a deployment can
@@ -61,8 +64,8 @@ name = "skill_versions"
 [[config]]
 key = "core.url"
 type = "string"
-required = true
-description = "Tapes core API origin the generator reads trace transcripts from."
+required = false
+description = "Optional Tapes core API origin for session-backed generation; brief-only generation does not require it."
 
 [[config]]
 key = "llm.provider"

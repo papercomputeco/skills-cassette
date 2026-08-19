@@ -71,14 +71,18 @@ func (s *Server) Handler() http.Handler {
 	// /api/<name>/... republishes as /v1/cassettes/<name>/...
 	prefix := "/api/" + s.name
 	mux.HandleFunc("GET "+prefix, s.handleListSkills)
-	mux.HandleFunc("POST "+prefix, s.handleCreateSkill)
-	mux.HandleFunc("POST "+prefix+"/generate", s.handleGenerateSkill)
+	mux.HandleFunc("GET "+prefix+"/drafts", s.handleListDrafts)
+	mux.HandleFunc("POST "+prefix+"/drafts", s.handleCreateDraft)
+	mux.HandleFunc("POST "+prefix+"/drafts/generate", s.handleGenerateDraft)
 	mux.HandleFunc("GET "+prefix+"/{id}", s.handleGetSkill)
-	mux.HandleFunc("PUT "+prefix+"/{id}", s.handleUpdateSkill)
 	mux.HandleFunc("DELETE "+prefix+"/{id}", s.handleDeleteSkill)
+	mux.HandleFunc("GET "+prefix+"/{id}/draft", s.handleGetDraft)
+	mux.HandleFunc("POST "+prefix+"/{id}/draft", s.handleInitializeDraft)
+	mux.HandleFunc("PUT "+prefix+"/{id}/draft", s.handleUpdateDraft)
+	mux.HandleFunc("POST "+prefix+"/{id}/draft/revise", s.handleReviseDraft)
+	mux.HandleFunc("POST "+prefix+"/{id}/publish", s.handlePublishDraft)
 	mux.HandleFunc("GET "+prefix+"/{id}/skill.md", s.handleSkillMarkdown)
 	mux.HandleFunc("GET "+prefix+"/{id}/versions", s.handleListSkillVersions)
-	mux.HandleFunc("POST "+prefix+"/{id}/versions", s.handlePublishSkill)
 	mux.HandleFunc("POST "+prefix+"/{id}/duplicate", s.handleDuplicateSkill)
 
 	return mux
