@@ -5,12 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 )
 
 const maxGenerateRetries = 3
+
+var ErrGenerationContextTooLarge = errors.New("generation transcript context exceeds 30000 bytes")
 
 // LLMCallFunc is the configured inference boundary used for skill extraction.
 type LLMCallFunc func(ctx context.Context, prompt string) (string, error)
@@ -39,9 +40,9 @@ func NewGenerator(query Querier, llmCall LLMCallFunc) *Generator {
 	return &Generator{query: query, llmCall: llmCall}
 }
 
-// Generate returns an unpersisted skill draft from source sessions, an author
-// brief, or both. Feedback is replayed oldest-first on every regeneration.
-func (g *Generator) Generate(ctx context.Context, sessionIDs []string, brief string, feedback []string, skillType string, opts *GenerateOptions) (*Skill, error) {
+// Generate returns skill content from source sessions, an author brief, or both.
+// Persistence is owned by the API after inference succeeds.
+func (g *Generator) Generate(ctx context.Context, sessionIDs []string, brief, skillType string, opts *GenerateOptions) (*Skill, error) {
 	if len(sessionIDs) == 0 && strings.TrimSpace(brief) == "" {
 		return nil, errors.New("at least one session ID or a brief is required")
 	}
@@ -61,24 +62,13 @@ func (g *Generator) Generate(ctx context.Context, sessionIDs []string, brief str
 		transcripts = append(transcripts, transcript)
 	}
 
-	// Truncate large transcripts at a session boundary. Keep an oversized first
-	// session rather than silently generating from nothing.
-	const maxChars = 30000
-	var totalLen int
-	for i, transcript := range transcripts {
-		totalLen += len(transcript)
-		if i > 0 {
-			totalLen += len("\n---\n")
-		}
-		if i > 0 && totalLen > maxChars {
-			transcripts = transcripts[:i]
-			fmt.Fprintf(os.Stderr, "warning: transcript truncated to %d of %d session(s) to fit within %d char limit\n",
-				len(transcripts), len(sessionIDs), maxChars)
-			break
-		}
+	const maxTranscriptBytes = 30000
+	joinedTranscripts := strings.Join(transcripts, "\n---\n")
+	if len(joinedTranscripts) > maxTranscriptBytes {
+		return nil, ErrGenerationContextTooLarge
 	}
 
-	basePrompt := buildSkillPrompt(strings.Join(transcripts, "\n---\n"), brief, feedback, skillType)
+	basePrompt := buildSkillPrompt(joinedTranscripts, brief, skillType)
 	var lastErr error
 	for attempt := range maxGenerateRetries {
 		prompt := basePrompt
@@ -104,8 +94,7 @@ func (g *Generator) Generate(ctx context.Context, sessionIDs []string, brief str
 	return nil, lastErr
 }
 
-// Revise rewrites an unpersisted working document. Saving remains the caller's
-// explicit next action.
+// Revise rewrites a working document; the API owns concurrency and persistence.
 func (g *Generator) Revise(ctx context.Context, content, instruction string) (string, error) {
 	if strings.TrimSpace(content) == "" || strings.TrimSpace(instruction) == "" {
 		return "", errors.New("content and instruction are required")
@@ -142,20 +131,11 @@ Current document:
 	return "", lastErr
 }
 
-func buildSkillPrompt(transcript, brief string, feedback []string, skillType string) string {
-	feedbackText := "(none)"
-	if len(feedback) > 0 {
-		lines := make([]string, len(feedback))
-		for i, note := range feedback {
-			lines[i] = fmt.Sprintf("%d. %s", i+1, note)
-		}
-		feedbackText = strings.Join(lines, "\n")
-	}
+func buildSkillPrompt(transcript, brief, skillType string) string {
 	if transcript == "" {
 		transcript = "(none supplied)"
 	}
 	return fmt.Sprintf(`Create a reusable %s skill from the author's brief and any source transcripts.
-The newest draft must satisfy every feedback note; notes are ordered oldest-first.
 
 Return ONLY valid JSON with these fields:
 {
@@ -174,11 +154,8 @@ Guidelines:
 Author brief:
 %s
 
-Feedback:
-%s
-
 Transcript(s):
-%s`, skillType, strings.TrimSpace(brief), feedbackText, transcript)
+%s`, skillType, strings.TrimSpace(brief), transcript)
 }
 
 func parseSkillResponse(response string) (*Skill, error) {

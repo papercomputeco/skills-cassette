@@ -3,13 +3,16 @@ package server_test
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
@@ -20,39 +23,12 @@ import (
 
 const authSubjectHeader = "x-paper-auth-subject"
 
-// seedSkill seeds a skill whose id equals the given slug so URLs read as
-// /api/skills/<slug>. The memory store is id-keyed, not UUID-checked, so
-// readable ids keep the specs legible.
-func seedSkill(store *storage.MemoryStore, slug string) {
-	now := time.Now().UTC()
-	_, err := store.UpsertSkill(context.Background(), storage.SkillRecord{
-		ID:                      slug,
-		Slug:                    slug,
-		Name:                    "Debug React Hooks",
-		Description:             "desc",
-		Type:                    "workflow",
-		Version:                 "0.1.0",
-		Visibility:              "team",
-		Status:                  storage.SkillStatusPublished,
-		Tags:                    []string{"react"},
-		Content:                 "# body",
-		IsAIGenerated:           true,
-		GeneratedFromSessionIDs: []string{"sess-1"},
-		AuthorSubject:           "user-seed",
-		CreatedAt:               now,
-		UpdatedAt:               now,
-	})
-	Expect(err).NotTo(HaveOccurred())
-}
-
-// doJSON issues a request (optionally with an auth-subject header) against the
-// handler and returns the decoded body map plus the status code.
 func doJSON(srv *server.Server, method, path, body, author string) (map[string]any, int) {
-	var rdr io.Reader
+	var reader io.Reader
 	if body != "" {
-		rdr = bytes.NewBufferString(body)
+		reader = bytes.NewBufferString(body)
 	}
-	req := httptest.NewRequestWithContext(context.Background(), method, path, rdr)
+	req := httptest.NewRequestWithContext(context.Background(), method, path, reader)
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -72,453 +48,347 @@ func newSkillsServer(store storage.Store) *server.Server {
 	return server.New(server.Config{}, store, nil, nil)
 }
 
-var _ = Describe("Skills handlers", func() {
-	It("returns a unified camelCase skill", func() {
-		store := storage.NewMemoryStore()
-		seedSkill(store, "debug-react-hooks")
-		srv := newSkillsServer(store)
+func seedPublished(store *storage.MemoryStore, id string, sources []string, ai bool) {
+	seedPublishedAs(store, id, sources, ai, "user-seed")
+}
 
-		body, status := doJSON(srv, http.MethodGet, "/api/skills/debug-react-hooks", "", "")
+func seedPublishedAs(store *storage.MemoryStore, id string, sources []string, ai bool, author string) {
+	now := time.Now().UTC()
+	_, err := store.CreateDraft(context.Background(), storage.SkillRecord{
+		ID: id, AuthorSubject: author, Visibility: "private", CreatedAt: now, UpdatedAt: now,
+	}, storage.SkillDraftRecord{SkillID: id, Slug: id, Name: "Skill " + id, Description: "desc", Type: "workflow",
+		Tags: []string{"test"}, Content: "# published", IsAIGenerated: ai, GeneratedFromSessionIDs: sources,
+		CreatedAt: now, UpdatedAt: now})
+	Expect(err).NotTo(HaveOccurred())
+	_, err = store.PublishDraft(context.Background(), id, 1, "first", "publisher", now)
+	Expect(err).NotTo(HaveOccurred())
+}
+
+var _ = Describe("Persisted skill drafts", func() {
+	It("creates an authored draft without publishing it", func() {
+		store := storage.NewMemoryStore()
+		srv := newSkillsServer(store)
+		body, status := doJSON(srv, http.MethodPost, "/api/skills/drafts", `{"name":"My Draft","content":"# work"}`, "author")
+		Expect(status).To(Equal(http.StatusCreated))
+		Expect(body).To(HaveKeyWithValue("revision", float64(1)))
+		Expect(body).To(HaveKeyWithValue("isAiGenerated", false))
+		Expect(body).To(HaveKeyWithValue("sourceSessionIds", BeEmpty()))
+		id := body["skillId"].(string)
+		published, err := store.GetSkill(context.Background(), id)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(published).To(BeNil())
+		list, status := doJSON(srv, http.MethodGet, "/api/skills", "", "")
 		Expect(status).To(Equal(http.StatusOK))
-		Expect(body).To(HaveKeyWithValue("id", "debug-react-hooks"))
-		Expect(body).To(HaveKeyWithValue("slug", "debug-react-hooks"))
+		Expect(list["items"]).To(BeEmpty())
+	})
+
+	It("lists tenant-wide drafts", func() {
+		store := storage.NewMemoryStore()
+		srv := newSkillsServer(store)
+		_, _ = doJSON(srv, http.MethodPost, "/api/skills/drafts", `{"name":"One"}`, "a")
+		_, _ = doJSON(srv, http.MethodPost, "/api/skills/drafts", `{"name":"Two"}`, "b")
+		body, status := doJSON(srv, http.MethodGet, "/api/skills/drafts", "", "viewer")
+		Expect(status).To(Equal(http.StatusOK))
+		Expect(body["items"]).To(HaveLen(2))
+		Expect(body).To(HaveKeyWithValue("totalCount", float64(2)))
+	})
+
+	It("updates draft fields with optimistic concurrency and preserves server metadata", func() {
+		store := storage.NewMemoryStore()
+		now := time.Now().UTC()
+		draft, err := store.CreateDraft(context.Background(), storage.SkillRecord{ID: "s", CreatedAt: now, UpdatedAt: now}, storage.SkillDraftRecord{
+			SkillID: "s", Slug: "old", Name: "Old", Type: "workflow", Content: "# old", IsAIGenerated: true,
+			GeneratedFromSessionIDs: []string{"sess-1"}, CreatedAt: now, UpdatedAt: now,
+		})
+		Expect(err).NotTo(HaveOccurred())
+		srv := newSkillsServer(store)
+		body, status := doJSON(srv, http.MethodPut, "/api/skills/s/draft", `{"revision":1,"name":"New","content":"# new","sourceSessionIds":["tamper"],"isAiGenerated":false}`, "")
+		Expect(status).To(Equal(http.StatusOK))
+		Expect(body).To(HaveKeyWithValue("revision", float64(2)))
+		Expect(body).To(HaveKeyWithValue("sourceSessionIds", ConsistOf("sess-1")))
 		Expect(body).To(HaveKeyWithValue("isAiGenerated", true))
-		Expect(body).To(HaveKey("originatingSessionIds"))
-		Expect(body).To(HaveKeyWithValue("authorId", "user-seed"))
-		Expect(body).To(HaveKeyWithValue("version", "0.1.0"))
-		Expect(body).To(HaveKeyWithValue("status", "published"))
-		Expect(body).To(HaveKeyWithValue("parentId", BeNil()))
+		_, status = doJSON(srv, http.MethodPut, "/api/skills/s/draft", `{"revision":1,"content":"stale"}`, "")
+		Expect(status).To(Equal(http.StatusConflict))
+		Expect(draft.Revision).To(Equal(1))
 	})
 
-	It("returns 404 when the skill is absent", func() {
-		srv := newSkillsServer(storage.NewMemoryStore())
-		_, status := doJSON(srv, http.MethodGet, "/api/skills/missing", "", "")
+	It("initializes a working draft from a publication without exposing later edits", func() {
+		store := storage.NewMemoryStore()
+		seedPublished(store, "s", nil, false)
+		srv := newSkillsServer(store)
+		body, status := doJSON(srv, http.MethodPost, "/api/skills/s/draft", "", "")
+		Expect(status).To(Equal(http.StatusCreated))
+		Expect(body).To(HaveKeyWithValue("content", "# published"))
+		_, status = doJSON(srv, http.MethodPost, "/api/skills/s/draft", "", "")
+		Expect(status).To(Equal(http.StatusConflict))
+		_, status = doJSON(srv, http.MethodPut, "/api/skills/s/draft", `{"revision":1,"name":"Unpublished name","tags":["pending"],"content":"# unpublished"}`, "")
+		Expect(status).To(Equal(http.StatusOK))
+		published, status := doJSON(srv, http.MethodGet, "/api/skills/s", "", "")
+		Expect(status).To(Equal(http.StatusOK))
+		Expect(published).To(HaveKeyWithValue("name", "Skill s"))
+		Expect(published).To(HaveKeyWithValue("tags", ConsistOf("test")))
+		Expect(published).To(HaveKeyWithValue("content", "# published"))
+	})
+
+	It("publishes a complete snapshot and consumes the draft", func() {
+		store := storage.NewMemoryStore()
+		srv := newSkillsServer(store)
+		created, _ := doJSON(srv, http.MethodPost, "/api/skills/drafts", `{"name":"Ready","description":"d","tags":["x"],"content":"# ready"}`, "author")
+		id := created["skillId"].(string)
+		version, status := doJSON(srv, http.MethodPost, "/api/skills/"+id+"/publish", `{"revision":1,"changelog":"first"}`, "publisher")
+		Expect(status).To(Equal(http.StatusCreated))
+		Expect(version).To(HaveKeyWithValue("name", "Ready"))
+		Expect(version).To(HaveKeyWithValue("version", "0.1.0"))
+		_, status = doJSON(srv, http.MethodGet, "/api/skills/"+id+"/draft", "", "")
 		Expect(status).To(Equal(http.StatusNotFound))
-	})
-
-	It("lists skills with counts", func() {
-		store := storage.NewMemoryStore()
-		seedSkill(store, "a-skill")
-		srv := newSkillsServer(store)
-		body, status := doJSON(srv, http.MethodGet, "/api/skills", "", "user-seed")
+		published, status := doJSON(srv, http.MethodGet, "/api/skills/"+id, "", "")
 		Expect(status).To(Equal(http.StatusOK))
-		items, _ := body["items"].([]any)
-		Expect(items).To(HaveLen(1))
-		counts, _ := body["counts"].(map[string]any)
-		Expect(counts).To(HaveKeyWithValue("all", float64(1)))
-		Expect(counts).To(HaveKeyWithValue("mine", float64(1)))
-		Expect(counts).To(HaveKeyWithValue("team", float64(0)))
-		Expect(counts).To(HaveKeyWithValue("drafts", float64(0)))
-	})
-
-	It("pages the list with an opaque keyset cursor", func() {
-		store := storage.NewMemoryStore()
-		for i := range 3 {
-			seedSkill(store, fmt.Sprintf("skill-%d", i))
-		}
-		srv := newSkillsServer(store)
-
-		body, status := doJSON(srv, http.MethodGet, "/api/skills?limit=2", "", "")
+		Expect(published).To(HaveKeyWithValue("content", "# ready"))
+		versions, status := doJSON(srv, http.MethodGet, "/api/skills/"+id+"/versions", "", "")
 		Expect(status).To(Equal(http.StatusOK))
-		firstPage, _ := body["items"].([]any)
-		Expect(firstPage).To(HaveLen(2))
-		cursor, _ := body["next_cursor"].(string)
-		Expect(cursor).NotTo(BeEmpty())
-
-		body, status = doJSON(srv, http.MethodGet, "/api/skills?limit=2&cursor="+cursor, "", "")
-		Expect(status).To(Equal(http.StatusOK))
-		secondPage, _ := body["items"].([]any)
-		Expect(secondPage).To(HaveLen(1))
-		Expect(body).NotTo(HaveKey("next_cursor"))
-
-		seen := map[string]bool{}
-		for _, page := range [][]any{firstPage, secondPage} {
-			for _, item := range page {
-				id, _ := item.(map[string]any)["id"].(string)
-				Expect(seen[id]).To(BeFalse(), "id %q served twice across pages", id)
-				seen[id] = true
-			}
-		}
+		Expect(versions).To(HaveKeyWithValue("totalCount", float64(1)))
 	})
 
-	It("rejects a malformed cursor", func() {
-		srv := newSkillsServer(storage.NewMemoryStore())
-		_, status := doJSON(srv, http.MethodGet, "/api/skills?cursor=not-base64!", "", "")
-		Expect(status).To(Equal(http.StatusBadRequest))
-	})
-
-	It("filters the list by scope", func() {
+	It("rejects stale publication without consuming the draft", func() {
 		store := storage.NewMemoryStore()
-		seedSkill(store, "mine-skill") // author user-seed
-		seedSkill(store, "team-skill")
-		teamRec, err := store.GetSkill(context.Background(), "team-skill")
-		Expect(err).NotTo(HaveOccurred())
-		// Re-seed the team skill under a different author: author_subject is
-		// preserved on update, so rebuild it from scratch.
-		_, err = store.DeleteSkill(context.Background(), "team-skill")
-		Expect(err).NotTo(HaveOccurred())
-		teamRec.AuthorSubject = "user-other"
-		_, err = store.UpsertSkill(context.Background(), *teamRec)
-		Expect(err).NotTo(HaveOccurred())
 		srv := newSkillsServer(store)
-
-		body, _ := doJSON(srv, http.MethodGet, "/api/skills?scope=mine", "", "user-seed")
-		items, _ := body["items"].([]any)
-		Expect(items).To(HaveLen(1))
-		Expect(items[0].(map[string]any)).To(HaveKeyWithValue("id", "mine-skill"))
-
-		body, _ = doJSON(srv, http.MethodGet, "/api/skills?scope=team", "", "user-seed")
-		items, _ = body["items"].([]any)
-		Expect(items).To(HaveLen(1))
-		Expect(items[0].(map[string]any)).To(HaveKeyWithValue("id", "team-skill"))
+		created, _ := doJSON(srv, http.MethodPost, "/api/skills/drafts", `{"name":"Draft"}`, "")
+		id := created["skillId"].(string)
+		_, status := doJSON(srv, http.MethodPost, "/api/skills/"+id+"/publish", `{"revision":2}`, "")
+		Expect(status).To(Equal(http.StatusConflict))
+		draft, err := store.GetDraft(context.Background(), id)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(draft).NotTo(BeNil())
 	})
 
-	It("filters and counts drafts before pagination", func() {
+	It("duplicates a publication into an authored draft without generation provenance", func() {
 		store := storage.NewMemoryStore()
-		seedSkill(store, "published")
-		now := time.Now().UTC()
-		_, err := store.UpsertSkill(context.Background(), storage.SkillRecord{
-			ID: "draft", Slug: "draft", Name: "Draft", Type: "workflow",
-			Status: storage.SkillStatusDraft, Visibility: "private",
-			CreatedAt: now, UpdatedAt: now,
-		})
-		Expect(err).NotTo(HaveOccurred())
+		seedPublished(store, "s", []string{"sess-1"}, true)
 		srv := newSkillsServer(store)
-
-		body, status := doJSON(srv, http.MethodGet, "/api/skills?status=draft", "", "")
-		Expect(status).To(Equal(http.StatusOK))
-		items, _ := body["items"].([]any)
-		Expect(items).To(HaveLen(1))
-		Expect(items[0].(map[string]any)).To(HaveKeyWithValue("id", "draft"))
-		Expect(body["counts"].(map[string]any)).To(HaveKeyWithValue("drafts", float64(1)))
-
-		body, status = doJSON(srv, http.MethodGet, "/api/skills?status=published", "", "")
-		Expect(status).To(Equal(http.StatusOK))
-		items, _ = body["items"].([]any)
-		Expect(items).To(HaveLen(1))
-		Expect(items[0].(map[string]any)).To(HaveKeyWithValue("id", "published"))
-
-		_, status = doJSON(srv, http.MethodGet, "/api/skills?status=reviewing", "", "")
-		Expect(status).To(Equal(http.StatusBadRequest))
+		body, status := doJSON(srv, http.MethodPost, "/api/skills/s/duplicate", "", "duplicator")
+		Expect(status).To(Equal(http.StatusCreated))
+		Expect(body).To(HaveKeyWithValue("isAiGenerated", false))
+		Expect(body["sourceSessionIds"]).To(BeEmpty())
+		identity, err := store.GetSkillIdentity(context.Background(), body["skillId"].(string))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(identity.ParentID).To(Equal("s"))
 	})
 
-	It("lists the skills generated from a session via ?session_id=", func() {
+	It("keeps creator-gated delete behavior for draft-only identities", func() {
 		store := storage.NewMemoryStore()
-		seedSkill(store, "from-sess") // GeneratedFromSessionIDs: ["sess-1"]
-		now := time.Now().UTC()
-		_, err := store.UpsertSkill(context.Background(), storage.SkillRecord{
-			ID: "unrelated", Slug: "unrelated", Name: "Other", Type: "workflow",
-			GeneratedFromSessionIDs: []string{"sess-other"},
-			CreatedAt:               now, UpdatedAt: now,
-		})
-		Expect(err).NotTo(HaveOccurred())
 		srv := newSkillsServer(store)
+		created, _ := doJSON(srv, http.MethodPost, "/api/skills/drafts", `{"name":"Draft"}`, "owner")
+		id := created["skillId"].(string)
+		_, status := doJSON(srv, http.MethodDelete, "/api/skills/"+id, "", "other")
+		Expect(status).To(Equal(http.StatusForbidden))
+		_, status = doJSON(srv, http.MethodDelete, "/api/skills/"+id, "", "owner")
+		Expect(status).To(Equal(http.StatusNoContent))
+	})
 
+	It("reverse lookup and markdown read current published snapshots", func() {
+		store := storage.NewMemoryStore()
+		seedPublished(store, "s", []string{"sess-1"}, true)
+		srv := newSkillsServer(store)
 		body, status := doJSON(srv, http.MethodGet, "/api/skills?session_id=sess-1", "", "")
 		Expect(status).To(Equal(http.StatusOK))
-		items, _ := body["items"].([]any)
-		Expect(items).To(HaveLen(1))
-		Expect(items[0].(map[string]any)).To(HaveKeyWithValue("id", "from-sess"))
-		Expect(body).NotTo(HaveKey("counts"), "the session lookup keeps the legacy unpaginated envelope")
-	})
-
-	It("saves edits via PUT and persists content", func() {
-		store := storage.NewMemoryStore()
-		seedSkill(store, "s")
-		srv := newSkillsServer(store)
-		body, status := doJSON(srv, http.MethodPut, "/api/skills/s", `{"content":"# new body","name":"Renamed","originatingSessionIds":["sess-2","sess-2"]}`, "")
-		Expect(status).To(Equal(http.StatusOK))
-		Expect(body).To(HaveKeyWithValue("content", "# new body"))
-		Expect(body).To(HaveKeyWithValue("name", "Renamed"))
-		Expect(body).To(HaveKeyWithValue("originatingSessionIds", ConsistOf("sess-2")))
-		Expect(body).To(HaveKeyWithValue("slug", "renamed"), "the slug follows a rename")
-
-		saved, err := store.GetSkill(context.Background(), "s")
-		Expect(err).NotTo(HaveOccurred())
-		Expect(saved.Content).To(Equal("# new body"))
-	})
-
-	It("publishes an immutable version and stamps the author", func() {
-		store := storage.NewMemoryStore()
-		seedSkill(store, "s")
-		srv := newSkillsServer(store)
-		body, status := doJSON(srv, http.MethodPost, "/api/skills/s/versions", `{"changelog":"first"}`, "user-pub")
-		Expect(status).To(Equal(http.StatusCreated))
-		Expect(body).To(HaveKeyWithValue("semver", "0.1.0"))
-		Expect(body).To(HaveKeyWithValue("authorId", "user-pub"))
-		head, err := store.GetSkill(context.Background(), "s")
-		Expect(err).NotTo(HaveOccurred())
-		Expect(head.Status).To(Equal(storage.SkillStatusPublished))
-		Expect(head.Visibility).To(Equal("team"))
-
-		// second publish bumps the patch
-		body, _ = doJSON(srv, http.MethodPost, "/api/skills/s/versions", `{"changelog":"second"}`, "")
-		Expect(body).To(HaveKeyWithValue("semver", "0.1.1"))
-
-		body, status = doJSON(srv, http.MethodGet, "/api/skills/s/versions", "", "")
-		Expect(status).To(Equal(http.StatusOK))
-		Expect(body).To(HaveKeyWithValue("totalCount", float64(2)))
-		versions, _ := body["versions"].([]any)
-		Expect(versions[0].(map[string]any)).To(HaveKeyWithValue("semver", "0.1.1"), "newest first")
-	})
-
-	It("publishes the current head when the body is empty", func() {
-		store := storage.NewMemoryStore()
-		seedSkill(store, "s") // content "# body"
-		srv := newSkillsServer(store)
-		body, status := doJSON(srv, http.MethodPost, "/api/skills/s/versions", "", "")
-		Expect(status).To(Equal(http.StatusCreated))
-		Expect(body).To(HaveKeyWithValue("content", "# body"))
-	})
-
-	It("rejects a malformed publish body without minting a version", func() {
-		store := storage.NewMemoryStore()
-		seedSkill(store, "s")
-		srv := newSkillsServer(store)
-		for _, body := range []string{
-			`{"changelog": "trunc`,        // truncated JSON
-			`{"changelog":"a"}{"more":1}`, // trailing second value
-		} {
-			_, status := doJSON(srv, http.MethodPost, "/api/skills/s/versions", body, "")
-			Expect(status).To(Equal(http.StatusBadRequest), "body %q must be rejected", body)
-		}
-
-		versions, err := store.ListSkillVersions(context.Background(), "s")
-		Expect(err).NotTo(HaveOccurred())
-		Expect(versions).To(BeEmpty(), "a garbled request must not publish")
-	})
-
-	It("duplicates a skill under a fresh id attributed to the duplicator", func() {
-		store := storage.NewMemoryStore()
-		seedSkill(store, "s")
-		srv := newSkillsServer(store)
-		body, status := doJSON(srv, http.MethodPost, "/api/skills/s/duplicate", "", "user-dup")
-		Expect(status).To(Equal(http.StatusCreated))
-		// slug is cosmetic now, so the copy shares the parent's slug; the name
-		// carries the "(copy)" marker and parentId points at the original id.
-		Expect(body).To(HaveKeyWithValue("slug", "s"))
-		Expect(body).To(HaveKeyWithValue("name", "Debug React Hooks (copy)"))
-		Expect(body).To(HaveKeyWithValue("authorId", "user-dup"))
-		Expect(body).To(HaveKeyWithValue("parentId", "s"))
-		Expect(body["id"]).NotTo(Equal("s"), "the duplicate gets its own opaque id")
-
-		// Slug is no longer an identity, so duplicates coexist — a second
-		// duplicate gets another distinct id rather than overwriting the first.
-		second, status := doJSON(srv, http.MethodPost, "/api/skills/s/duplicate", "", "user-dup")
-		Expect(status).To(Equal(http.StatusCreated))
-		Expect(second["id"]).NotTo(Equal(body["id"]))
-	})
-
-	It("creates a draft with provenance and generation attribution", func() {
-		srv := newSkillsServer(storage.NewMemoryStore())
-		body, status := doJSON(srv, http.MethodPost, "/api/skills",
-			`{"name":"My New Skill","description":"d","originatingSessionIds":["sess-1","sess-1"],"isAiGenerated":true}`, "user-new")
-		Expect(status).To(Equal(http.StatusCreated))
-		Expect(body).To(HaveKeyWithValue("slug", "my-new-skill"))
-		Expect(body).To(HaveKeyWithValue("authorId", "user-new"))
-		Expect(body).To(HaveKeyWithValue("isAiGenerated", true))
-		Expect(body).To(HaveKeyWithValue("originatingSessionIds", ConsistOf("sess-1")))
-		Expect(body).To(HaveKeyWithValue("status", "draft"))
-	})
-
-	It("deletes a skill for its creator", func() {
-		store := storage.NewMemoryStore()
-		seedSkill(store, "s") // author_subject = user-seed
-		srv := newSkillsServer(store)
-		_, status := doJSON(srv, http.MethodDelete, "/api/skills/s", "", "user-seed")
-		Expect(status).To(Equal(http.StatusNoContent))
-		rec, err := store.GetSkill(context.Background(), "s")
-		Expect(err).NotTo(HaveOccurred())
-		Expect(rec).To(BeNil())
-	})
-
-	It("forbids deleting a skill owned by another user", func() {
-		store := storage.NewMemoryStore()
-		seedSkill(store, "s") // author_subject = user-seed
-		srv := newSkillsServer(store)
-		_, status := doJSON(srv, http.MethodDelete, "/api/skills/s", "", "user-other")
-		Expect(status).To(Equal(http.StatusForbidden))
-		rec, err := store.GetSkill(context.Background(), "s")
-		Expect(err).NotTo(HaveOccurred())
-		Expect(rec).NotTo(BeNil(), "the skill survives a forbidden delete")
-	})
-
-	It("404s when deleting a missing skill", func() {
-		srv := newSkillsServer(storage.NewMemoryStore())
-		_, status := doJSON(srv, http.MethodDelete, "/api/skills/missing", "", "user-x")
-		Expect(status).To(Equal(http.StatusNotFound))
-	})
-
-	It("renders a drop-in SKILL.md and counts the download", func() {
-		store := storage.NewMemoryStore()
-		seedSkill(store, "s")
-		srv := newSkillsServer(store)
+		Expect(body["items"]).To(HaveLen(1))
 		recorder := httptest.NewRecorder()
 		srv.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/skills/s/skill.md", nil))
 		Expect(recorder.Code).To(Equal(http.StatusOK))
-		Expect(recorder.Header().Get("Content-Type")).To(ContainSubstring("text/markdown"))
+		Expect(recorder.Header().Get("Content-Type")).To(Equal("text/markdown; charset=utf-8"))
 		Expect(recorder.Header().Get("Content-Disposition")).To(ContainSubstring("s.md"))
 		Expect(recorder.Body.String()).To(ContainSubstring(`name: "s"`))
-		Expect(recorder.Body.String()).To(ContainSubstring("# body"))
-
-		rec, err := store.GetSkill(context.Background(), "s")
+		Expect(recorder.Body.String()).To(ContainSubstring("# published"))
+		Expect(recorder.Body.String()).To(ContainSubstring("sess-1"))
+		published, err := store.GetSkill(context.Background(), "s")
 		Expect(err).NotTo(HaveOccurred())
-		Expect(rec.DownloadCount).To(Equal(int64(1)), "download is counted as a usage signal")
+		Expect(published.DownloadCount).To(Equal(int64(1)))
 	})
 
-	It("sorts by downloads when asked", func() {
+	It("paginates published skills with an opaque cursor", func() {
 		store := storage.NewMemoryStore()
-		seedSkill(store, "cold")
-		seedSkill(store, "hot")
-		Expect(store.IncrementSkillDownloads(context.Background(), "hot")).To(Succeed())
+		for range 25 {
+			seedPublished(store, uuid.NewString(), nil, false)
+		}
 		srv := newSkillsServer(store)
-
-		body, status := doJSON(srv, http.MethodGet, "/api/skills?sort=downloads", "", "")
+		first, status := doJSON(srv, http.MethodGet, "/api/skills", "", "")
 		Expect(status).To(Equal(http.StatusOK))
-		items, _ := body["items"].([]any)
-		Expect(items).To(HaveLen(2))
-		Expect(items[0].(map[string]any)).To(HaveKeyWithValue("id", "hot"))
+		Expect(first["items"]).To(HaveLen(24))
+		cursor, ok := first["next_cursor"].(string)
+		Expect(ok).To(BeTrue())
+		second, status := doJSON(srv, http.MethodGet, "/api/skills?cursor="+cursor, "", "")
+		Expect(status).To(Equal(http.StatusOK))
+		Expect(second["items"]).To(HaveLen(1))
+	})
+
+	It("rejects malformed and forged cursors", func() {
+		srv := newSkillsServer(storage.NewMemoryStore())
+		_, status := doJSON(srv, http.MethodGet, "/api/skills?cursor=not-base64", "", "")
+		Expect(status).To(Equal(http.StatusBadRequest))
+		payload, err := json.Marshal(map[string]any{"id": "not-a-uuid"})
+		Expect(err).NotTo(HaveOccurred())
+		forged := base64.RawURLEncoding.EncodeToString(payload)
+		_, status = doJSON(srv, http.MethodGet, "/api/skills?cursor="+forged, "", "")
+		Expect(status).To(Equal(http.StatusBadRequest))
+	})
+
+	It("filters published skills by attribution scope and reports counts", func() {
+		store := storage.NewMemoryStore()
+		seedPublishedAs(store, uuid.NewString(), nil, false, "me")
+		seedPublishedAs(store, uuid.NewString(), nil, false, "other")
+		srv := newSkillsServer(store)
+		mine, status := doJSON(srv, http.MethodGet, "/api/skills?scope=mine", "", "me")
+		Expect(status).To(Equal(http.StatusOK))
+		Expect(mine["items"]).To(HaveLen(1))
+		Expect(mine["counts"]).To(HaveKeyWithValue("all", float64(2)))
+		team, status := doJSON(srv, http.MethodGet, "/api/skills?scope=team", "", "me")
+		Expect(status).To(Equal(http.StatusOK))
+		Expect(team["items"]).To(HaveLen(1))
+	})
+
+	It("sorts published skills by downloads", func() {
+		store := storage.NewMemoryStore()
+		popular, other := uuid.NewString(), uuid.NewString()
+		seedPublished(store, popular, nil, false)
+		seedPublished(store, other, nil, false)
+		Expect(store.IncrementSkillDownloads(context.Background(), popular)).To(Succeed())
+		Expect(store.IncrementSkillDownloads(context.Background(), popular)).To(Succeed())
+		body, status := doJSON(newSkillsServer(store), http.MethodGet, "/api/skills?sort=downloads", "", "")
+		Expect(status).To(Equal(http.StatusOK))
+		items := body["items"].([]any)
+		Expect(items[0]).To(HaveKeyWithValue("id", popular))
+	})
+
+	It("rejects malformed publish input without consuming the draft", func() {
+		store := storage.NewMemoryStore()
+		srv := newSkillsServer(store)
+		created, _ := doJSON(srv, http.MethodPost, "/api/skills/drafts", `{"name":"Draft"}`, "")
+		id := created["skillId"].(string)
+		_, status := doJSON(srv, http.MethodPost, "/api/skills/"+id+"/publish", `{`, "")
+		Expect(status).To(Equal(http.StatusBadRequest))
+		draft, err := store.GetDraft(context.Background(), id)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(draft).NotTo(BeNil())
+	})
+
+	It("returns 404 for missing published skills and deletes", func() {
+		srv := newSkillsServer(storage.NewMemoryStore())
+		_, status := doJSON(srv, http.MethodGet, "/api/skills/missing", "", "")
+		Expect(status).To(Equal(http.StatusNotFound))
+		_, status = doJSON(srv, http.MethodDelete, "/api/skills/missing", "", "")
+		Expect(status).To(Equal(http.StatusNotFound))
 	})
 })
 
-// fakeQuerier serves canned trace summaries and spans, standing in for the
-// core trace API the cassette reads over HTTP.
 type fakeQuerier struct {
 	summaries map[string][]skill.TraceSummary
-	traces    map[string]*skill.Trace
 	notFound  bool
 }
 
-func (q *fakeQuerier) TraceSummaries(_ context.Context, sessionID string) ([]skill.TraceSummary, error) {
+func (q *fakeQuerier) TraceSummaries(_ context.Context, id string) ([]skill.TraceSummary, error) {
 	if q.notFound {
-		return nil, fmt.Errorf("list traces for session %s: %w", sessionID, skill.ErrNotFound)
+		return nil, fmt.Errorf("missing: %w", skill.ErrNotFound)
 	}
-	return q.summaries[sessionID], nil
+	return q.summaries[id], nil
 }
+func (q *fakeQuerier) Trace(_ context.Context, _ string) (*skill.Trace, error) { return nil, nil }
 
-func (q *fakeQuerier) Trace(_ context.Context, traceID string) (*skill.Trace, error) {
-	return q.traces[traceID], nil
-}
-
-var _ = Describe("Generate skill", func() {
-	// stubOpenAI answers the OpenAI chat-completions shape with a fixed JSON
-	// payload, so generation and revision run without a network.
+var _ = Describe("Generated persisted drafts", func() {
 	stubOpenAI := func(generated map[string]any) *httptest.Server {
 		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			content, err := json.Marshal(generated)
-			Expect(err).NotTo(HaveOccurred())
-			response := map[string]any{
-				"choices": []any{map[string]any{"message": map[string]any{"content": string(content)}}},
-			}
-			w.Header().Set("Content-Type", "application/json")
-			Expect(json.NewEncoder(w).Encode(response)).To(Succeed())
+			content, _ := json.Marshal(generated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": string(content)}}}})
 		}))
 	}
-
-	newGenerateServer := func(store storage.Store, querier skill.Querier, llmBase string) *server.Server {
-		cfg := server.Config{
-			LLM: skill.LLMCallerConfig{Provider: "openai", APIKey: "test-key", BaseURL: llmBase},
-		}
-		return server.New(cfg, store, querier, nil)
+	newGenerateServer := func(store storage.Store, q skill.Querier, llm string) *server.Server {
+		return server.New(server.Config{LLM: skill.LLMCallerConfig{Provider: "openai", APIKey: "test", BaseURL: llm}}, store, q, nil)
 	}
 
-	sessionTurns := map[string][]skill.TraceSummary{
-		"sess-1": {{TraceID: "t1", UserPrompt: "fix the flaky test", ResponsePreview: "done"}},
-	}
-
-	It("returns an ephemeral generated draft", func() {
-		llm := stubOpenAI(map[string]any{
-			"name":        "Diagnose Flaky Tests",
-			"description": "Use when tests flake.",
-			"tags":        []string{"testing"},
-			"content":     "## Steps\n1. Re-run.",
-		})
+	It("persists successful generation with exact server-owned provenance", func() {
+		llm := stubOpenAI(map[string]any{"name": "Generated", "description": "d", "tags": []string{"x"}, "content": "# generated"})
 		defer llm.Close()
-
 		store := storage.NewMemoryStore()
-		srv := newGenerateServer(store, &fakeQuerier{summaries: sessionTurns}, llm.URL)
-		body, status := doJSON(srv, http.MethodPost, "/api/skills/generate",
-			`{"sessionIds":["sess-1","sess-1"],"brief":"Focus on diagnosis","feedback":["Add verification"]}`, "user-gen")
-		Expect(status).To(Equal(http.StatusOK))
-		Expect(body).To(HaveKeyWithValue("name", "Diagnose Flaky Tests"))
+		q := &fakeQuerier{summaries: map[string][]skill.TraceSummary{"sess-1": {{TraceID: "t", UserPrompt: "do it", ResponsePreview: "done"}}}}
+		srv := newGenerateServer(store, q, llm.URL)
+		body, status := doJSON(srv, http.MethodPost, "/api/skills/drafts/generate", `{"sessionIds":["sess-1","sess-1"],"brief":"focus"}`, "author")
+		Expect(status).To(Equal(http.StatusCreated))
+		Expect(body).To(HaveKeyWithValue("revision", float64(1)))
+		Expect(body).To(HaveKeyWithValue("sourceSessionIds", ConsistOf("sess-1")))
 		Expect(body).To(HaveKeyWithValue("isAiGenerated", true))
-		Expect(body).To(HaveKeyWithValue("originatingSessionIds", ConsistOf("sess-1")))
-		Expect(body).NotTo(HaveKey("id"))
-
-		items, err := store.ListSkills(context.Background(), storage.SkillListOpts{})
+		drafts, err := store.ListDrafts(context.Background())
 		Expect(err).NotTo(HaveOccurred())
-		Expect(items).To(BeEmpty(), "generation does not persist")
+		Expect(drafts).To(HaveLen(1))
 	})
 
-	It("generates from a brief without a core connection", func() {
-		llm := stubOpenAI(map[string]any{
-			"name": "Release process", "description": "Use when releasing.",
-			"content": "## Steps\n1. Release.",
-		})
+	It("supports brief-only generation", func() {
+		llm := stubOpenAI(map[string]any{"name": "Brief", "content": "# b"})
 		defer llm.Close()
-		srv := newGenerateServer(storage.NewMemoryStore(), nil, llm.URL)
-		body, status := doJSON(srv, http.MethodPost, "/api/skills/generate",
-			`{"brief":"Document the release process"}`, "")
+		store := storage.NewMemoryStore()
+		srv := newGenerateServer(store, nil, llm.URL)
+		body, status := doJSON(srv, http.MethodPost, "/api/skills/drafts/generate", `{"brief":"release process"}`, "")
+		Expect(status).To(Equal(http.StatusCreated))
+		Expect(body["sourceSessionIds"]).To(BeEmpty())
+	})
+
+	It("rejects the complete source set when the transcript budget is exceeded", func() {
+		store := storage.NewMemoryStore()
+		q := &fakeQuerier{summaries: map[string][]skill.TraceSummary{"huge": {{TraceID: "t", UserPrompt: strings.Repeat("x", 30001), ResponsePreview: "done"}}}}
+		srv := newGenerateServer(store, q, "http://unused.invalid")
+		body, status := doJSON(srv, http.MethodPost, "/api/skills/drafts/generate", `{"sessionIds":["huge"]}`, "")
+		Expect(status).To(Equal(http.StatusUnprocessableEntity))
+		Expect(body["error"]).To(ContainSubstring("30000"))
+		drafts, err := store.ListDrafts(context.Background())
+		Expect(err).NotTo(HaveOccurred())
+		Expect(drafts).To(BeEmpty())
+	})
+
+	It("revises server-side draft content and conditionally persists it", func() {
+		llm := stubOpenAI(map[string]any{"content": "# revised"})
+		defer llm.Close()
+		store := storage.NewMemoryStore()
+		base := newGenerateServer(store, nil, llm.URL)
+		created, _ := doJSON(base, http.MethodPost, "/api/skills/drafts", `{"name":"D","content":"# original"}`, "")
+		id := created["skillId"].(string)
+		body, status := doJSON(base, http.MethodPost, "/api/skills/"+id+"/draft/revise", `{"revision":1,"instruction":"improve"}`, "")
 		Expect(status).To(Equal(http.StatusOK))
-		Expect(body).To(HaveKeyWithValue("name", "Release process"))
+		Expect(body).To(HaveKeyWithValue("content", "# revised"))
+		Expect(body).To(HaveKeyWithValue("revision", float64(2)))
+		_, status = doJSON(base, http.MethodPost, "/api/skills/"+id+"/draft/revise", `{"revision":1,"instruction":"stale"}`, "")
+		Expect(status).To(Equal(http.StatusConflict))
 	})
 
-	It("rejects generate without sessions or a brief", func() {
-		srv := newGenerateServer(storage.NewMemoryStore(), &fakeQuerier{}, "http://unused.invalid")
-		body, status := doJSON(srv, http.MethodPost, "/api/skills/generate", `{"sessionIds":[]}`, "")
+	It("validates generation sources before inference", func() {
+		srv := newGenerateServer(storage.NewMemoryStore(), nil, "http://unused.invalid")
+		_, status := doJSON(srv, http.MethodPost, "/api/skills/drafts/generate", `{}`, "")
 		Expect(status).To(Equal(http.StatusBadRequest))
-		Expect(body["error"]).To(ContainSubstring("sessionId or brief"))
-	})
-
-	It("bounds the number of generation sources", func() {
 		ids := make([]string, 21)
 		for i := range ids {
-			ids[i] = fmt.Sprintf("sess-%d", i)
+			ids[i] = fmt.Sprintf("session-%d", i)
 		}
 		payload, err := json.Marshal(map[string]any{"sessionIds": ids})
 		Expect(err).NotTo(HaveOccurred())
-		srv := newGenerateServer(storage.NewMemoryStore(), &fakeQuerier{}, "http://unused.invalid")
-		body, status := doJSON(srv, http.MethodPost, "/api/skills/generate", string(payload), "")
+		_, status = doJSON(srv, http.MethodPost, "/api/skills/drafts/generate", string(payload), "")
 		Expect(status).To(Equal(http.StatusBadRequest))
-		Expect(body["error"]).To(ContainSubstring("at most 20"))
 	})
 
-	It("maps a session the core cannot see to 404", func() {
-		srv := newGenerateServer(storage.NewMemoryStore(), &fakeQuerier{notFound: true}, "http://unused.invalid")
-		_, status := doJSON(srv, http.MethodPost, "/api/skills/generate", `{"sessionIds":["nope"]}`, "")
+	It("maps missing and empty source sessions", func() {
+		missing := newGenerateServer(storage.NewMemoryStore(), &fakeQuerier{notFound: true}, "http://unused.invalid")
+		_, status := doJSON(missing, http.MethodPost, "/api/skills/drafts/generate", `{"sessionIds":["missing"]}`, "")
 		Expect(status).To(Equal(http.StatusNotFound))
-	})
-
-	It("maps an empty transcript to 422", func() {
-		srv := newGenerateServer(storage.NewMemoryStore(), &fakeQuerier{}, "http://unused.invalid")
-		_, status := doJSON(srv, http.MethodPost, "/api/skills/generate", `{"sessionIds":["empty-sess"]}`, "")
+		empty := newGenerateServer(storage.NewMemoryStore(), &fakeQuerier{summaries: map[string][]skill.TraceSummary{}}, "http://unused.invalid")
+		_, status = doJSON(empty, http.MethodPost, "/api/skills/drafts/generate", `{"sessionIds":["empty"]}`, "")
 		Expect(status).To(Equal(http.StatusUnprocessableEntity))
 	})
 
-	It("answers 501 when no core url is configured", func() {
-		srv := server.New(server.Config{}, storage.NewMemoryStore(), nil, nil)
-		_, status := doJSON(srv, http.MethodPost, "/api/skills/generate", `{"sessionIds":["sess-1"]}`, "")
+	It("requires core configuration only for session-backed generation", func() {
+		srv := server.New(server.Config{LLM: skill.LLMCallerConfig{Provider: "openai", APIKey: "test"}}, storage.NewMemoryStore(), nil, nil)
+		_, status := doJSON(srv, http.MethodPost, "/api/skills/drafts/generate", `{"sessionIds":["session"]}`, "")
 		Expect(status).To(Equal(http.StatusNotImplemented))
 	})
 
-	It("revises content without persisting it", func() {
-		llm := stubOpenAI(map[string]any{"content": "## Steps\n1. Retry.\n\n## Verification\nCheck it."})
-		defer llm.Close()
-		srv := newGenerateServer(storage.NewMemoryStore(), nil, llm.URL)
-		body, status := doJSON(srv, http.MethodPost, "/api/skills/revise",
-			`{"content":"## Steps\n1. Retry.","instruction":"Add verification"}`, "")
-		Expect(status).To(Equal(http.StatusOK))
-		Expect(body["content"]).To(ContainSubstring("## Verification"))
-	})
-
 	It("maps a missing provider key to 422", func() {
-		GinkgoT().Setenv("OPENAI_API_KEY", "")
-		GinkgoT().Setenv("ANTHROPIC_API_KEY", "")
-		srv := server.New(server.Config{
-			LLM: skill.LLMCallerConfig{Provider: "openai"},
-		}, storage.NewMemoryStore(), &fakeQuerier{summaries: sessionTurns}, nil)
-		body, status := doJSON(srv, http.MethodPost, "/api/skills/generate", `{"sessionIds":["sess-1"]}`, "")
+		srv := newSkillsServer(storage.NewMemoryStore())
+		_, status := doJSON(srv, http.MethodPost, "/api/skills/drafts/generate", `{"brief":"write it"}`, "")
 		Expect(status).To(Equal(http.StatusUnprocessableEntity))
-		Expect(body["error"]).To(ContainSubstring("API key"))
 	})
 })

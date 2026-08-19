@@ -77,6 +77,29 @@ var _ = Describe("cassette anchors", func() {
 		}
 	})
 
+	It("documents persisted drafts and conditional writes", func() {
+		recorder := httptest.NewRecorder()
+		newTestServer().Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/openapi", nil))
+		var document map[string]any
+		Expect(json.Unmarshal(recorder.Body.Bytes(), &document)).To(Succeed())
+		paths := document["paths"].(map[string]any)
+		Expect(paths).To(HaveKey("/api/skills/drafts/generate"))
+		Expect(paths).NotTo(HaveKey("/api/skills/generate"))
+		Expect(paths).NotTo(HaveKey("/api/skills/revise"))
+
+		requestSchema := func(path, method string) map[string]any {
+			op := paths[path].(map[string]any)[method].(map[string]any)
+			body := op["requestBody"].(map[string]any)
+			content := body["content"].(map[string]any)["application/json"].(map[string]any)
+			return content["schema"].(map[string]any)
+		}
+		Expect(requestSchema("/api/skills/{id}/draft", "put")["required"]).To(ConsistOf("revision"))
+		Expect(requestSchema("/api/skills/{id}/draft/revise", "post")["required"]).To(ConsistOf("revision", "instruction"))
+		Expect(requestSchema("/api/skills/{id}/publish", "post")["required"]).To(ConsistOf("revision"))
+		publish := paths["/api/skills/{id}/publish"].(map[string]any)["post"].(map[string]any)
+		Expect(publish["responses"]).To(HaveKey("400"))
+	})
+
 	It("republishes under an installed name other than the default", func() {
 		srv := server.New(server.Config{Name: "skills-two"}, storage.NewMemoryStore(), nil, nil)
 		recorder := httptest.NewRecorder()

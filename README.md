@@ -18,30 +18,34 @@ live under one cassette prefix:
 
 | Cassette-local route | Public route (through core) | Purpose |
 | --- | --- | --- |
-| `GET /api/skills` | `GET /v1/cassettes/skills` | Keyset-paginated list with search (`q`), attribution scopes, lifecycle status, sort, and per-tab counts |
-| `GET /api/skills?session_id=` | `GET /v1/cassettes/skills?session_id=` | Provenance reverse lookup, replacing legacy `GET /v1/sessions/:id/skills` |
-| `POST /api/skills` | `POST /v1/cassettes/skills` | Persist an authored or generated draft with provenance |
-| `POST /api/skills/generate` | `POST /v1/cassettes/skills/generate` | Ephemeral LLM generation from sessions, a brief, or both |
-| `POST /api/skills/revise` | `POST /v1/cassettes/skills/revise` | Ephemeral rewrite of working markdown from an instruction |
-| `GET /api/skills/{id}` | `GET /v1/cassettes/skills/{id}` | Point read by opaque id |
-| `PUT /api/skills/{id}` | `PUT /v1/cassettes/skills/{id}` | Partial update of the editable head |
-| `DELETE /api/skills/{id}` | `DELETE /v1/cassettes/skills/{id}` | Creator-gated delete, history included |
-| `GET /api/skills/{id}/skill.md` | `GET /v1/cassettes/skills/{id}/skill.md` | Drop-in SKILL.md download (counts a download) |
-| `GET /api/skills/{id}/versions` | `GET /v1/cassettes/skills/{id}/versions` | Full published history |
-| `POST /api/skills/{id}/versions` | `POST /v1/cassettes/skills/{id}/versions` | Atomically publish an immutable snapshot and transition lifecycle |
-| `POST /api/skills/{id}/duplicate` | `POST /v1/cassettes/skills/{id}/duplicate` | Fork under a fresh id |
+| `GET /api/skills` | `GET /v1/cassettes/skills` | Keyset-paginated immutable publications with search, attribution scopes, sort, and counts |
+| `GET /api/skills?session_id=` | `GET /v1/cassettes/skills?session_id=` | Reverse lookup over current published source provenance |
+| `GET/POST /api/skills/drafts` | `GET/POST /v1/cassettes/skills/drafts` | List tenant-wide drafts or create an authored persisted draft |
+| `POST /api/skills/drafts/generate` | `POST /v1/cassettes/skills/drafts/generate` | Generate and persist a draft from sessions, a brief, or both |
+| `GET/POST/PUT /api/skills/{id}/draft` | `GET/POST/PUT /v1/cassettes/skills/{id}/draft` | Read, initialize, or conditionally edit the working draft |
+| `POST /api/skills/{id}/draft/revise` | `POST /v1/cassettes/skills/{id}/draft/revise` | Rewrite and conditionally persist current draft content |
+| `POST /api/skills/{id}/publish` | `POST /v1/cassettes/skills/{id}/publish` | Snapshot the full draft, advance publication, and consume the draft atomically |
+| `GET /api/skills/{id}` | `GET /v1/cassettes/skills/{id}` | Read the current immutable publication |
+| `DELETE /api/skills/{id}` | `DELETE /v1/cassettes/skills/{id}` | Creator-gated delete of identity, draft, and history |
+| `GET /api/skills/{id}/skill.md` | `GET /v1/cassettes/skills/{id}/skill.md` | Download current published SKILL.md (counts a download) |
+| `GET /api/skills/{id}/versions` | `GET /v1/cassettes/skills/{id}/versions` | Complete immutable published history |
+| `POST /api/skills/{id}/duplicate` | `POST /v1/cassettes/skills/{id}/duplicate` | Fork a publication into a fresh authored draft |
 
 `/ping` and `/openapi` are the process anchors core probes and fetches; they
 are not part of the proxied API.
 
-The cassette owns two tables, `skills` and `skill_versions`, in its own
-Postgres schema (named after the installed cassette name), and runs its own
-migrations at startup. There is no `org_id`: tenancy is gateway-owned, and
+The cassette owns `skills` identities, mutable `skill_drafts`, and immutable
+`skill_versions` in its own Postgres schema (named after the installed cassette
+name), and runs its own migrations at startup. There is no `org_id`: tenancy is gateway-owned, and
 attribution rides the gateway-trusted `x-paper-auth-subject` header.
 
 Source transcripts for generation are read from the configured Tapes core over
 its trace API (`GET /v1/traces?session_id=` and `GET /v1/traces/{id}`); the
 cassette holds no core database credential and reads no contract views.
+`sourceSessionIds` is server-authored generation lineage, copied into each
+published version and never rewritten by generic draft edits. User-curated
+session relationships are a separate product concern and are not overloaded
+onto provenance.
 
 ## Run
 
@@ -67,7 +71,7 @@ deployment, following the manifest's config schema:
 | Variable | Meaning |
 | --- | --- |
 | `CASSETTE_NAME` | Installed cassette name (default `skills`); drives the route prefix and schema |
-| `CASSETTE_CORE_URL` | Tapes core API origin for reading trace transcripts. `https` is required except for loopback and cluster-local Service targets (`*.svc`, `*.svc.cluster.local`); unset disables generation (501) |
+| `CASSETTE_CORE_URL` | Optional Tapes core API origin for session-backed generation. `https` is required except for loopback and cluster-local Service targets (`*.svc`, `*.svc.cluster.local`); brief-only generation works without it |
 | `CASSETTE_LLM_PROVIDER` | `openai` (default), `anthropic`, or `ollama` |
 | `CASSETTE_LLM_MODEL` | Model override; each provider has a sensible default |
 | `CASSETTE_LLM_API_KEY` | Provider API key (falls back to `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`) |
@@ -81,7 +85,6 @@ deployment, following the manifest's config schema:
 - [ ] Provision the cassette role, secrets, configuration, NetworkPolicies, and HTTPRoutes through TKO.
 - [ ] Verify local-router and Envoy route precedence, subject-header trust, fresh installs, upgrades, and rollback.
 - [ ] Replace the pinned trace-wire compatibility fixtures with fixtures generated from the core's published OpenAPI contract.
-- [ ] Decide whether a single oversized source transcript should be truncated; multi-session generation already stops at the 30,000-byte boundary.
 
 ## Develop
 

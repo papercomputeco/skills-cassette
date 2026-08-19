@@ -69,10 +69,9 @@ var _ = Describe("skill generation boundary", func() {
 			}
 			Expect(prompt).To(ContainSubstring("Return ONLY valid JSON"))
 			Expect(prompt).To(ContainSubstring("Author brief:\nMake this reusable"))
-			Expect(prompt).To(ContainSubstring("1. Add verification"))
 			return `{"name":"do-it","description":"Use when doing it","tags":["workflow"],"content":"## Steps\\n\\n1. Do it"}`, nil
 		})
-		generated, err := gen.Generate(context.Background(), []string{"session"}, "Make this reusable", []string{"Add verification"}, "workflow", nil)
+		generated, err := gen.Generate(context.Background(), []string{"session"}, "Make this reusable", "workflow", nil)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(calls).To(Equal(2))
 		markdown := skill.RenderSkillMD(generated)
@@ -103,7 +102,7 @@ var _ = Describe("skill generation boundary", func() {
 			Expect(prompt).To(ContainSubstring("Author brief:\nDocument the release process"))
 			return `{"name":"Release process","description":"Use when releasing.","content":"## Steps\\n1. Release."}`, nil
 		})
-		generated, err := gen.Generate(context.Background(), nil, "Document the release process", nil, "workflow", nil)
+		generated, err := gen.Generate(context.Background(), nil, "Document the release process", "workflow", nil)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(generated.Sessions).To(BeEmpty())
 	})
@@ -120,9 +119,9 @@ var _ = Describe("skill generation boundary", func() {
 
 	It("rejects invalid input", func() {
 		gen := skill.NewGenerator(fakeQuerier{}, func(context.Context, string) (string, error) { return "", nil })
-		_, err := gen.Generate(context.Background(), nil, "", nil, "workflow", nil)
+		_, err := gen.Generate(context.Background(), nil, "", "workflow", nil)
 		Expect(err).To(MatchError(ContainSubstring("session ID or a brief")))
-		_, err = gen.Generate(context.Background(), []string{"x"}, "", nil, "unknown", nil)
+		_, err = gen.Generate(context.Background(), []string{"x"}, "", "unknown", nil)
 		Expect(err).To(MatchError(ContainSubstring("invalid skill type")))
 	})
 })

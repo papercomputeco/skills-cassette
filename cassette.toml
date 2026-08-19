@@ -51,6 +51,9 @@ prefix_path = "api"
 name = "skills"
 
 [[tables]]
+name = "skill_drafts"
+
+[[tables]]
 name = "skill_versions"
 
 # Configuration this cassette accepts, published as schema so a deployment can
@@ -61,8 +64,8 @@ name = "skill_versions"
 [[config]]
 key = "core.url"
 type = "string"
-required = true
-description = "Tapes core API origin the generator reads trace transcripts from."
+required = false
+description = "Optional Tapes core API origin for session-backed generation; brief-only generation does not require it."
 
 [[config]]
 key = "llm.provider"

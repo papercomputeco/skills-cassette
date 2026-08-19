@@ -44,7 +44,14 @@ func (t *SkillsCassette) goContainer() *dagger.Container {
 //
 // +check
 func (t *SkillsCassette) Test(ctx context.Context) (string, error) {
+	postgres := dag.Container().
+		From("postgres:17-bookworm").
+		WithEnvVariable("POSTGRES_PASSWORD", "postgres").
+		WithExposedPort(5432).
+		AsService()
 	return t.goContainer().
+		WithServiceBinding("postgres", postgres).
+		WithEnvVariable("TEST_POSTGRES_DSN", "postgres://postgres:postgres@postgres:5432/postgres?sslmode=disable").
 		WithExec([]string{"go", "test", "-v", "./..."}).
 		Stdout(ctx)
 }
