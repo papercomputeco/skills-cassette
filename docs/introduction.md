@@ -38,9 +38,15 @@ Source transcripts come from the configured tapes core **over its trace API** �
 `GET /v1/traces?session_id=` and `GET /v1/traces/{id}` — not from the database.
 
 That is a deliberate boundary: this cassette holds no core database credential and
-declares no contract views. Its entire relationship with tapes is HTTP. A deployment
-that gets the database wiring wrong cannot break it, and it cannot read anything a
-client with the same token could not.
+declares no contract views. Its entire relationship with tapes is HTTP, so a
+deployment that gets the database wiring wrong cannot break transcript reads.
+
+**The trace client sends no credential** — no bearer token, no
+`x-paper-auth-subject`. What authorizes those reads is where the cassette can reach
+and what core accepts from it, so the network path and core's own configuration are
+the whole of the control. Treat `CASSETTE_CORE_URL` as pointing at a core that is
+willing to answer this cassette, and see [Deploying](./deploying.md) for the
+transport requirement on it.
 
 ## Skills and versions
 
