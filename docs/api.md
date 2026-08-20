@@ -73,8 +73,11 @@ the last is a deployment error — see [Deploying](./deploying.md).
 
 `DELETE /api/skills/{id}` deletes the skill and its history: `204`, `404`, and
 **`403` when the skill has a creator and the caller is not that creator**. A skill
-with no recorded author is unattributed and deletable by anyone, which mirrors the
-edit gate. Delete is the only creator-gated route here.
+with no recorded author is unattributed and deletable by anyone.
+
+Delete is the **only** route that checks the caller. In particular `PUT` does not:
+any caller may edit any skill, including one attributed to someone else. If that
+matters for your deployment, the control has to live in front of this cassette.
 
 `POST /api/skills/{id}/duplicate` forks under a fresh id: `201`, or `404`.
 
@@ -83,9 +86,17 @@ edit gate. Delete is the only creator-gated route here.
 `GET /api/skills/{id}/versions` lists the published history: `200`, `500`.
 
 `POST /api/skills/{id}/versions` publishes an immutable snapshot: `201`, `404`, or
-`500`. A publish is all-or-nothing — a `500` means no version was persisted, so
-retry rather than assuming a snapshot landed. Concurrent publishes racing for the
-same version number are resolved internally and do not surface as errors.
+`500`. The version row and the head bump land together, so a publish never leaves
+a durable snapshot behind a stale head.
+
+A `500` is not proof that nothing landed, though: a commit whose acknowledgement
+is lost reports as a failure while having persisted. **Read
+`GET /api/skills/{id}/versions` before retrying** — a blind retry publishes a
+second version rather than repeating the first, because each retry takes the next
+version number.
+
+Concurrent publishes racing for the same number are resolved internally and do not
+surface as errors.
 
 ## Download
 
