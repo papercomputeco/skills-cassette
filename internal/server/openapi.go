@@ -5,9 +5,25 @@ import (
 	"strings"
 )
 
-// Version is the cassette release identity published in the manifest and the
-// OpenAPI info block. Keep it in sync with cassette.toml.
-const Version = "0.3.0"
+// Version is the cassette release identity published in the manifest, the
+// manifest's image tag, and the OpenAPI info block.
+//
+// It is not maintained by hand: the release stamps the tag it is publishing
+// into this variable at link time (see .dagger/image.go), and a source tree
+// always reads Placeholder, because a source tree is not a release.
+// cassette.toml declares the same placeholder, so the manifest's two
+// encodings still canonicalize to one digest.
+//
+// It must stay a package-level var. `-ldflags -X` writes to variables only
+// and silently does nothing to a constant, which would ship every image
+// reporting the placeholder while the build, the tests, and the manifest
+// digest all stayed green. BuildPushImage proves the stamp landed.
+var Version = Placeholder
+
+// Placeholder is what an unstamped build reports. A version no release can
+// produce is the point: it reads as "this came from a source tree", where a
+// plausible number would read as a release that never happened.
+const Placeholder = "0.0.0"
 
 // openAPIDocument renders this cassette's OpenAPI document.
 //
