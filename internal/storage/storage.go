@@ -21,6 +21,9 @@ import (
 // claimed the same number. Callers translate it into a retry rather than a 500.
 var ErrSkillVersionConflict = errors.New("skill version number already exists")
 
+// ErrSkillChanged means a conditional publish no longer matches the skill head.
+var ErrSkillChanged = errors.New("skill content changed")
+
 // DefaultListLimit bounds a skills page when the caller supplies no limit.
 const DefaultListLimit = 24
 
@@ -64,8 +67,10 @@ type SkillVersionRecord struct {
 	Semver        string
 	Changelog     string
 	Content       string
-	AuthorSubject string
-	PublishedAt   time.Time
+	// ExpectedContent makes publication compare-and-swap the skill head when set.
+	ExpectedContent *string
+	AuthorSubject   string
+	PublishedAt     time.Time
 }
 
 // SkillListOpts controls a single keyset page of skills. Query, Author and

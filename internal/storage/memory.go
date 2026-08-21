@@ -214,6 +214,11 @@ func (s *MemoryStore) PublishSkillVersion(_ context.Context, rec SkillVersionRec
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	skill, found := s.skills[rec.SkillID]
+	if rec.ExpectedContent != nil && (!found || skill.Content != *rec.ExpectedContent) {
+		return nil, ErrSkillChanged
+	}
+
 	highest := true
 	for _, v := range s.versions[rec.SkillID] {
 		if v.VersionNumber == rec.VersionNumber {
@@ -225,7 +230,7 @@ func (s *MemoryStore) PublishSkillVersion(_ context.Context, rec SkillVersionRec
 	}
 	s.versions[rec.SkillID] = append(s.versions[rec.SkillID], rec)
 
-	if skill, ok := s.skills[rec.SkillID]; ok && highest {
+	if found && highest {
 		skill.Version = rec.Semver
 		skill.Content = rec.Content
 		skill.UpdatedAt = rec.PublishedAt

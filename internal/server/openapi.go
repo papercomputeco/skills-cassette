@@ -112,14 +112,15 @@ func openAPIDocument(name string) []byte {
 						jsonResponse("500", "Lookup failed", errorSchema()),
 					)),
 				"put": operation("updateSkill", "Update a skill",
-					"Partial update of the skill head. Every field is optional; omitted fields are "+
-						"left as they are. Editing the head does not publish — use the versions "+
-						"endpoint to snapshot.",
+					"Partial owner-only update of the skill head. Every field is optional; omitted "+
+						"fields are left as they are. Editing the head does not publish — use the "+
+						"versions endpoint to snapshot.",
 					name,
 					withRequestBody("Fields to change", updateSkillSchema()),
 					withResponses(
 						jsonResponse("200", "The updated skill", skillSchema()),
 						jsonResponse("400", "Invalid body or unknown type", errorSchema()),
+						jsonResponse("403", "Only the creator can update this skill", errorSchema()),
 						jsonResponse("404", "Skill not found", errorSchema()),
 						jsonResponse("500", "Save failed", errorSchema()),
 					)),
@@ -160,15 +161,19 @@ func openAPIDocument(name string) []byte {
 						jsonResponse("500", "Listing failed", errorSchema()),
 					)),
 				"post": operation("publishSkill", "Publish a skill version",
-					"Snapshots the skill's current content as an immutable version and advances "+
-						"the skill's semver. Versions are history: the head content stays on the "+
-						"skill row, so reading a skill never needs its versions.",
+					"Owner-only immutable publication. expectedContent optionally compare-and-swaps "+
+						"the head; a retry after an ambiguous successful commit returns that latest "+
+						"version with 200 instead of publishing twice.",
 					name,
 					withRequestBody("Version metadata", publishSkillSchema()),
 					withResponses(
+						jsonResponse("200", "The version from an idempotent conditional retry", skillVersionSchema()),
 						jsonResponse("201", "The published version", skillVersionSchema()),
+						jsonResponse("400", "Invalid body", errorSchema()),
+						jsonResponse("403", "Only the creator can publish this skill", errorSchema()),
 						jsonResponse("404", "Skill not found", errorSchema()),
-						jsonResponse("500", "Publish failed, or the version landed but the head could not be advanced", errorSchema()),
+						jsonResponse("409", "The skill head no longer matches expectedContent", errorSchema()),
+						jsonResponse("500", "Publish failed", errorSchema()),
 					)),
 			},
 			prefix + "/{id}/duplicate": map[string]any{
@@ -442,8 +447,9 @@ func generateSkillSchema() map[string]any {
 
 func publishSkillSchema() map[string]any {
 	return objectSchema(map[string]any{
-		"content":   stringProp("Content to snapshot; defaults to the skill's current head."),
-		"changelog": stringProp("Change note recorded on the version."),
+		"content":         stringProp("Content to snapshot; defaults to the skill's current head."),
+		"changelog":       stringProp("Change note recorded on the version."),
+		"expectedContent": stringProp("Optional current head required for compare-and-swap publication."),
 	})
 }
 

@@ -187,6 +187,16 @@ func (s *PostgresStore) DeleteSkill(ctx context.Context, id string) (bool, error
 	defer tx.Rollback(ctx) //nolint:errcheck
 
 	schema := quoteIdentifier(s.schema)
+	var lockedID string
+	err = tx.QueryRow(ctx,
+		fmt.Sprintf(`SELECT id FROM %s.skills WHERE id = $1 FOR UPDATE`, schema), id,
+	).Scan(&lockedID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("lock skill for delete: %w", err)
+	}
 	if _, err := tx.Exec(ctx,
 		fmt.Sprintf(`DELETE FROM %s.skill_versions WHERE skill_id = $1`, schema), id); err != nil {
 		return false, fmt.Errorf("delete skill versions: %w", err)
@@ -321,6 +331,21 @@ func (s *PostgresStore) PublishSkillVersion(ctx context.Context, rec SkillVersio
 		return nil, fmt.Errorf("begin publish skill tx: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+
+	var current string
+	err = tx.QueryRow(ctx,
+		fmt.Sprintf(`SELECT content FROM %s.skills WHERE id = $1 FOR UPDATE`, schema),
+		rec.SkillID,
+	).Scan(&current)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrSkillChanged
+	}
+	if err != nil {
+		return nil, fmt.Errorf("lock skill head for publish: %w", err)
+	}
+	if rec.ExpectedContent != nil && current != *rec.ExpectedContent {
+		return nil, ErrSkillChanged
+	}
 
 	insert := fmt.Sprintf(`INSERT INTO %s.skill_versions (
 			skill_id, version_number, semver, changelog, content, author_subject, published_at
