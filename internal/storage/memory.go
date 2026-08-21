@@ -214,6 +214,21 @@ func (s *MemoryStore) PublishSkillVersion(_ context.Context, rec SkillVersionRec
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	skill, found := s.skills[rec.SkillID]
+	if !found {
+		return nil, ErrSkillChanged
+	}
+	compareContent := rec.ExpectedContent
+	if rec.CASContent != nil {
+		compareContent = rec.CASContent
+	}
+	if compareContent != nil && skill.Content != *compareContent {
+		return nil, ErrSkillChanged
+	}
+	// CASContent is a transaction-only override; version history retains the
+	// caller's original ExpectedContent as the retry identity.
+	rec.CASContent = nil
+
 	highest := true
 	for _, v := range s.versions[rec.SkillID] {
 		if v.VersionNumber == rec.VersionNumber {
@@ -225,7 +240,7 @@ func (s *MemoryStore) PublishSkillVersion(_ context.Context, rec SkillVersionRec
 	}
 	s.versions[rec.SkillID] = append(s.versions[rec.SkillID], rec)
 
-	if skill, ok := s.skills[rec.SkillID]; ok && highest {
+	if highest {
 		skill.Version = rec.Semver
 		skill.Content = rec.Content
 		skill.UpdatedAt = rec.PublishedAt
