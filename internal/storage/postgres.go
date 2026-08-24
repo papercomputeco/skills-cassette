@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -83,13 +84,16 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 			skill_id       UUID NOT NULL,
 			version_number INT  NOT NULL,
 			semver         TEXT NOT NULL,
-			changelog      TEXT NOT NULL DEFAULT '',
-			content        TEXT NOT NULL DEFAULT '',
-			author_subject TEXT NOT NULL DEFAULT '',
+			changelog       TEXT NOT NULL DEFAULT '',
+			content         TEXT NOT NULL DEFAULT '',
+			expected_content TEXT,
+			author_subject  TEXT NOT NULL DEFAULT '',
 			published_at   TIMESTAMPTZ NOT NULL,
 
 			CONSTRAINT skill_versions_pkey PRIMARY KEY (skill_id, version_number)
 		)`, schema),
+		fmt.Sprintf(`ALTER TABLE %s.skill_versions
+			ADD COLUMN IF NOT EXISTS expected_content TEXT`, schema),
 		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS skill_versions_skill_idx
 			ON %s.skill_versions (skill_id, version_number DESC)`, schema),
 	}
@@ -187,6 +191,16 @@ func (s *PostgresStore) DeleteSkill(ctx context.Context, id string) (bool, error
 	defer tx.Rollback(ctx) //nolint:errcheck
 
 	schema := quoteIdentifier(s.schema)
+	var lockedID string
+	err = tx.QueryRow(ctx,
+		fmt.Sprintf(`SELECT id FROM %s.skills WHERE id = $1 FOR UPDATE`, schema), id,
+	).Scan(&lockedID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("lock skill for delete: %w", err)
+	}
 	if _, err := tx.Exec(ctx,
 		fmt.Sprintf(`DELETE FROM %s.skill_versions WHERE skill_id = $1`, schema), id); err != nil {
 		return false, fmt.Errorf("delete skill versions: %w", err)
@@ -322,17 +336,38 @@ func (s *PostgresStore) PublishSkillVersion(ctx context.Context, rec SkillVersio
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
+	var current string
+	err = tx.QueryRow(ctx,
+		fmt.Sprintf(`SELECT content FROM %s.skills WHERE id = $1 FOR UPDATE`, schema),
+		rec.SkillID,
+	).Scan(&current)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrSkillChanged
+	}
+	if err != nil {
+		return nil, fmt.Errorf("lock skill head for publish: %w", err)
+	}
+	compareContent := rec.ExpectedContent
+	if rec.CASContent != nil {
+		compareContent = rec.CASContent
+	}
+	if compareContent != nil && current != *compareContent {
+		return nil, ErrSkillChanged
+	}
+
 	insert := fmt.Sprintf(`INSERT INTO %s.skill_versions (
-			skill_id, version_number, semver, changelog, content, author_subject, published_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7)
-		RETURNING skill_id::text, version_number, semver, changelog, content, author_subject, published_at`,
-		schema)
+			skill_id, version_number, semver, changelog, content, expected_content,
+			author_subject, published_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		RETURNING skill_id::text, version_number, semver, changelog, content,
+			expected_content, author_subject, published_at`, schema)
 	var out SkillVersionRecord
+	var expectedContent pgtype.Text
 	err = tx.QueryRow(ctx, insert,
 		rec.SkillID, rec.VersionNumber, rec.Semver, rec.Changelog, rec.Content,
-		rec.AuthorSubject, rec.PublishedAt).
+		rec.ExpectedContent, rec.AuthorSubject, rec.PublishedAt).
 		Scan(&out.SkillID, &out.VersionNumber, &out.Semver, &out.Changelog,
-			&out.Content, &out.AuthorSubject, &out.PublishedAt)
+			&out.Content, &expectedContent, &out.AuthorSubject, &out.PublishedAt)
 	if err != nil {
 		// A concurrent publish already claimed this version number; surface a
 		// typed conflict so the handler can recompute and retry instead of 500.
@@ -341,6 +376,9 @@ func (s *PostgresStore) PublishSkillVersion(ctx context.Context, rec SkillVersio
 			return nil, ErrSkillVersionConflict
 		}
 		return nil, fmt.Errorf("publish skill version: %w", err)
+	}
+	if expectedContent.Valid {
+		out.ExpectedContent = &expectedContent.String
 	}
 
 	bump := fmt.Sprintf(`UPDATE %s.skills
@@ -367,7 +405,7 @@ func (s *PostgresStore) ListSkillVersions(ctx context.Context, skillID string) (
 		return []SkillVersionRecord{}, nil
 	}
 	query := fmt.Sprintf(`SELECT skill_id::text, version_number, semver, changelog, content,
-			author_subject, published_at
+			expected_content, author_subject, published_at
 		FROM %s.skill_versions WHERE skill_id = $1
 		ORDER BY version_number DESC`, quoteIdentifier(s.schema))
 	rows, err := s.pool.Query(ctx, query, skillID)
@@ -379,9 +417,13 @@ func (s *PostgresStore) ListSkillVersions(ctx context.Context, skillID string) (
 	out := make([]SkillVersionRecord, 0)
 	for rows.Next() {
 		var rec SkillVersionRecord
+		var expectedContent pgtype.Text
 		if err := rows.Scan(&rec.SkillID, &rec.VersionNumber, &rec.Semver, &rec.Changelog,
-			&rec.Content, &rec.AuthorSubject, &rec.PublishedAt); err != nil {
+			&rec.Content, &expectedContent, &rec.AuthorSubject, &rec.PublishedAt); err != nil {
 			return nil, fmt.Errorf("list skill versions: %w", err)
+		}
+		if expectedContent.Valid {
+			rec.ExpectedContent = &expectedContent.String
 		}
 		out = append(out, rec)
 	}

@@ -194,7 +194,7 @@ var _ = Describe("Skills handlers", func() {
 		store := storage.NewMemoryStore()
 		seedSkill(store, "s")
 		srv := newSkillsServer(store)
-		body, status := doJSON(srv, http.MethodPut, "/api/skills/s", `{"content":"# new body","name":"Renamed"}`, "")
+		body, status := doJSON(srv, http.MethodPut, "/api/skills/s", `{"content":"# new body","name":"Renamed"}`, "user-seed")
 		Expect(status).To(Equal(http.StatusOK))
 		Expect(body).To(HaveKeyWithValue("content", "# new body"))
 		Expect(body).To(HaveKeyWithValue("name", "Renamed"))
@@ -205,17 +205,28 @@ var _ = Describe("Skills handlers", func() {
 		Expect(saved.Content).To(Equal("# new body"))
 	})
 
+	It("forbids editing a skill owned by another user", func() {
+		store := storage.NewMemoryStore()
+		seedSkill(store, "s")
+		srv := newSkillsServer(store)
+		_, status := doJSON(srv, http.MethodPut, "/api/skills/s", `{"content":"# stolen"}`, "user-other")
+		Expect(status).To(Equal(http.StatusForbidden))
+		record, err := store.GetSkill(context.Background(), "s")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(record.Content).To(Equal("# body"))
+	})
+
 	It("publishes an immutable version and stamps the author", func() {
 		store := storage.NewMemoryStore()
 		seedSkill(store, "s")
 		srv := newSkillsServer(store)
-		body, status := doJSON(srv, http.MethodPost, "/api/skills/s/versions", `{"changelog":"first"}`, "user-pub")
+		body, status := doJSON(srv, http.MethodPost, "/api/skills/s/versions", `{"changelog":"first"}`, "user-seed")
 		Expect(status).To(Equal(http.StatusCreated))
 		Expect(body).To(HaveKeyWithValue("semver", "0.1.0"))
-		Expect(body).To(HaveKeyWithValue("authorId", "user-pub"))
+		Expect(body).To(HaveKeyWithValue("authorId", "user-seed"))
 
 		// second publish bumps the patch
-		body, _ = doJSON(srv, http.MethodPost, "/api/skills/s/versions", `{"changelog":"second"}`, "")
+		body, _ = doJSON(srv, http.MethodPost, "/api/skills/s/versions", `{"changelog":"second"}`, "user-seed")
 		Expect(body).To(HaveKeyWithValue("semver", "0.1.1"))
 
 		body, status = doJSON(srv, http.MethodGet, "/api/skills/s/versions", "", "")
@@ -225,11 +236,84 @@ var _ = Describe("Skills handlers", func() {
 		Expect(versions[0].(map[string]any)).To(HaveKeyWithValue("semver", "0.1.1"), "newest first")
 	})
 
+	It("compare-and-swaps a publish and makes an ambiguous retry idempotent", func() {
+		store := storage.NewMemoryStore()
+		seedSkill(store, "s")
+		srv := newSkillsServer(store)
+		request := `{"content":"# revised","expectedContent":"# body","changelog":"eval"}`
+		first, status := doJSON(srv, http.MethodPost, "/api/skills/s/versions", request, "user-seed")
+		Expect(status).To(Equal(http.StatusCreated))
+
+		retry, status := doJSON(srv, http.MethodPost, "/api/skills/s/versions", request, "user-seed")
+		Expect(status).To(Equal(http.StatusOK))
+		Expect(retry["id"]).To(Equal(first["id"]))
+
+		_, status = doJSON(srv, http.MethodPut, "/api/skills/s", `{"content":"# newer"}`, "user-seed")
+		Expect(status).To(Equal(http.StatusOK))
+		retry, status = doJSON(srv, http.MethodPost, "/api/skills/s/versions", request, "user-seed")
+		Expect(status).To(Equal(http.StatusOK), "a later edit must not hide an ambiguous committed publish")
+		Expect(retry["id"]).To(Equal(first["id"]))
+
+		_, status = doJSON(srv, http.MethodPost, "/api/skills/s/versions",
+			`{"content":"# revised","expectedContent":"# unrelated base","changelog":"eval"}`, "user-seed")
+		Expect(status).To(Equal(http.StatusConflict), "different expected content is not the same request")
+		_, status = doJSON(srv, http.MethodPost, "/api/skills/s/versions",
+			`{"content":"# revised","expectedContent":"# body","changelog":"other"}`, "user-seed")
+		Expect(status).To(Equal(http.StatusConflict), "different publish metadata is not the same request")
+		_, status = doJSON(srv, http.MethodPost, "/api/skills/s/versions",
+			`{"content":"# overwrite","expectedContent":"# body"}`, "user-seed")
+		Expect(status).To(Equal(http.StatusConflict))
+		versions, err := store.ListSkillVersions(context.Background(), "s")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(versions).To(HaveLen(1))
+	})
+
+	It("reconciles a retry even when publication did not change the content", func() {
+		store := storage.NewMemoryStore()
+		seedSkill(store, "s")
+		srv := newSkillsServer(store)
+		request := `{"content":"# body","expectedContent":"# body","changelog":"metadata only"}`
+		first, status := doJSON(srv, http.MethodPost, "/api/skills/s/versions", request, "user-seed")
+		Expect(status).To(Equal(http.StatusCreated))
+
+		retry, status := doJSON(srv, http.MethodPost, "/api/skills/s/versions", request, "user-seed")
+		Expect(status).To(Equal(http.StatusOK))
+		Expect(retry["id"]).To(Equal(first["id"]))
+	})
+
+	It("publishes content that was manually saved from the same proposal", func() {
+		store := storage.NewMemoryStore()
+		seedSkill(store, "s")
+		srv := newSkillsServer(store)
+		_, status := doJSON(srv, http.MethodPut, "/api/skills/s", `{"content":"# revised"}`, "user-seed")
+		Expect(status).To(Equal(http.StatusOK))
+
+		request := `{"content":"# revised","expectedContent":"# body","changelog":"eval"}`
+		body, status := doJSON(srv, http.MethodPost, "/api/skills/s/versions", request, "user-seed")
+		Expect(status).To(Equal(http.StatusCreated))
+		Expect(body).To(HaveKeyWithValue("content", "# revised"))
+
+		retry, status := doJSON(srv, http.MethodPost, "/api/skills/s/versions", request, "user-seed")
+		Expect(status).To(Equal(http.StatusOK))
+		Expect(retry["id"]).To(Equal(body["id"]))
+	})
+
+	It("forbids publishing a skill owned by another user", func() {
+		store := storage.NewMemoryStore()
+		seedSkill(store, "s")
+		srv := newSkillsServer(store)
+		_, status := doJSON(srv, http.MethodPost, "/api/skills/s/versions", "", "user-other")
+		Expect(status).To(Equal(http.StatusForbidden))
+		versions, err := store.ListSkillVersions(context.Background(), "s")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(versions).To(BeEmpty())
+	})
+
 	It("publishes the current head when the body is empty", func() {
 		store := storage.NewMemoryStore()
 		seedSkill(store, "s") // content "# body"
 		srv := newSkillsServer(store)
-		body, status := doJSON(srv, http.MethodPost, "/api/skills/s/versions", "", "")
+		body, status := doJSON(srv, http.MethodPost, "/api/skills/s/versions", "", "user-seed")
 		Expect(status).To(Equal(http.StatusCreated))
 		Expect(body).To(HaveKeyWithValue("content", "# body"))
 	})
@@ -242,7 +326,7 @@ var _ = Describe("Skills handlers", func() {
 			`{"changelog": "trunc`,        // truncated JSON
 			`{"changelog":"a"}{"more":1}`, // trailing second value
 		} {
-			_, status := doJSON(srv, http.MethodPost, "/api/skills/s/versions", body, "")
+			_, status := doJSON(srv, http.MethodPost, "/api/skills/s/versions", body, "user-seed")
 			Expect(status).To(Equal(http.StatusBadRequest), "body %q must be rejected", body)
 		}
 

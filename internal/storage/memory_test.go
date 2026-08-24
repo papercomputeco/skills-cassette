@@ -119,9 +119,22 @@ var _ = Describe("MemoryStore", func() {
 		Expect(page[0].ID).To(Equal("a"))
 	})
 
+	It("refuses publication when the skill is missing", func() {
+		store := storage.NewMemoryStore()
+		_, err := store.PublishSkillVersion(ctx, storage.SkillVersionRecord{
+			SkillID: "missing", VersionNumber: 1, Semver: "0.1.0", PublishedAt: time.Now().UTC(),
+		})
+		Expect(err).To(MatchError(storage.ErrSkillChanged))
+
+		versions, err := store.ListSkillVersions(ctx, "missing")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(versions).To(BeEmpty())
+	})
+
 	It("refuses a duplicate version number with the typed conflict", func() {
 		store := storage.NewMemoryStore()
 		now := time.Now().UTC()
+		seed(store, "s", now)
 		_, err := store.PublishSkillVersion(ctx, storage.SkillVersionRecord{
 			SkillID: "s", VersionNumber: 1, Semver: "0.1.0", PublishedAt: now,
 		})

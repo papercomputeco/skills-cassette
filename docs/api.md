@@ -69,15 +69,15 @@ the last is a deployment error — see [Deploying](./deploying.md).
 
 `GET /api/skills/{id}` reads one: `200`, or `404`.
 
-`PUT /api/skills/{id}` updates the head: `200`, `400` on an invalid body, `404`.
+`PUT /api/skills/{id}` updates the head: `200`, `400` on an invalid body, `404`,
+or **`403` when the skill has a creator and the caller is not that creator**.
 
-`DELETE /api/skills/{id}` deletes the skill and its history: `204`, `404`, and
-**`403` when the skill has a creator and the caller is not that creator**. A skill
-with no recorded author is unattributed and deletable by anyone.
+`DELETE /api/skills/{id}` deletes the skill and its history: `204`, `404`, or
+`403` under the same owner rule. A skill with no recorded author is unattributed
+and may be mutated by anyone.
 
-Delete is the **only** route that checks the caller. In particular `PUT` does not:
-any caller may edit any skill, including one attributed to someone else. If that
-matters for your deployment, the control has to live in front of this cassette.
+The `PUT`, `DELETE`, and publish routes enforce this owner rule from the
+gateway-trusted `x-paper-auth-subject` header.
 
 `POST /api/skills/{id}/duplicate` forks under a fresh id: `201`, or `404`.
 
@@ -85,18 +85,21 @@ matters for your deployment, the control has to live in front of this cassette.
 
 `GET /api/skills/{id}/versions` lists the published history: `200`, `500`.
 
-`POST /api/skills/{id}/versions` publishes an immutable snapshot: `201`, `404`, or
-`500`. The version row and the head bump land together, so a publish never leaves
-a durable snapshot behind a stale head.
+`POST /api/skills/{id}/versions` publishes an immutable snapshot: `201`, `200`
+for an idempotent conditional retry, `400`, `403`, `404`, `409`, or `500`. The
+version row and the head bump land together, so a publish never leaves a durable
+snapshot behind a stale head.
 
-A `500` is not proof that nothing landed, though: a commit whose acknowledgement
-is lost reports as a failure while having persisted. **Read
-`GET /api/skills/{id}/versions` before retrying** — a blind retry publishes a
-second version rather than repeating the first, because each retry takes the next
-version number.
+Set `expectedContent` to the head used to prepare the new `content`. Publication
+then compare-and-swaps the head: a different current head returns `409`. If the
+same conditional request committed but its acknowledgement was lost, retrying its
+identical `content`, `changelog`, and `expectedContent` returns the existing
+version with `200` instead of minting a duplicate. Without `expectedContent`, callers retain the legacy unconditional
+publish behavior and should inspect version history before retrying.
 
-Concurrent publishes racing for the same number are resolved internally and do not
-surface as errors.
+Concurrent publishes racing for the same number are resolved internally; a
+conditional publish instead returns `409` if another writer changed its expected
+head.
 
 ## Download
 

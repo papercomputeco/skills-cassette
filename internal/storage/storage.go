@@ -21,6 +21,9 @@ import (
 // claimed the same number. Callers translate it into a retry rather than a 500.
 var ErrSkillVersionConflict = errors.New("skill version number already exists")
 
+// ErrSkillChanged means a conditional publish no longer matches the skill head.
+var ErrSkillChanged = errors.New("skill content changed")
+
 // DefaultListLimit bounds a skills page when the caller supplies no limit.
 const DefaultListLimit = 24
 
@@ -64,6 +67,12 @@ type SkillVersionRecord struct {
 	Semver        string
 	Changelog     string
 	Content       string
+	// ExpectedContent is the caller's original publication precondition. It is
+	// persisted as part of the request identity used to reconcile retries.
+	ExpectedContent *string
+	// CASContent overrides the value checked against the locked head. It differs
+	// only when the proposed content was manually saved before publication.
+	CASContent    *string
 	AuthorSubject string
 	PublishedAt   time.Time
 }

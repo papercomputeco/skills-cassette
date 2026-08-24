@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -453,6 +454,10 @@ func (s *Server) handleUpdateSkill(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, errorResponse{Error: "skill not found"})
 		return
 	}
+	if !mayMutateSkill(r, existing) {
+		writeJSON(w, http.StatusForbidden, errorResponse{Error: "only the creator can edit this skill"})
+		return
+	}
 
 	var req updateSkillRequest
 	if err := decodeJSONBody(r, &req); err != nil {
@@ -499,6 +504,10 @@ func (s *Server) handleUpdateSkill(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, skillFromRecord(*saved))
 }
 
+func mayMutateSkill(r *http.Request, skill *storage.SkillRecord) bool {
+	return skill.AuthorSubject == "" || authSubjectFromRequest(r) == skill.AuthorSubject
+}
+
 // handleDeleteSkill removes a skill and its version history. Owner-gated: only
 // the recorded author may delete (unattributed skills are deletable by anyone,
 // matching the edit affordance).
@@ -516,8 +525,7 @@ func (s *Server) handleDeleteSkill(w http.ResponseWriter, r *http.Request) {
 
 	// Only the creator may delete. An empty author_subject means unattributed
 	// (legacy/demo) — deletable by anyone, mirroring the edit gate.
-	subject := authSubjectFromRequest(r)
-	if existing.AuthorSubject != "" && subject != existing.AuthorSubject {
+	if !mayMutateSkill(r, existing) {
 		writeJSON(w, http.StatusForbidden, errorResponse{Error: "only the creator can delete this skill"})
 		return
 	}
@@ -597,8 +605,9 @@ func (s *Server) handleCreateSkill(w http.ResponseWriter, r *http.Request) {
 
 // publishSkillRequest is the POST versions body.
 type publishSkillRequest struct {
-	Content   string `json:"content"`
-	Changelog string `json:"changelog"`
+	Content         string  `json:"content"`
+	Changelog       string  `json:"changelog"`
+	ExpectedContent *string `json:"expectedContent"`
 }
 
 // maxPublishAttempts bounds the retry loop that resolves a concurrent
@@ -618,6 +627,10 @@ func (s *Server) handlePublishSkill(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, errorResponse{Error: "skill not found"})
 		return
 	}
+	if !mayMutateSkill(r, existing) {
+		writeJSON(w, http.StatusForbidden, errorResponse{Error: "only the creator can publish this skill"})
+		return
+	}
 	skillID := existing.ID
 
 	// An empty body is a valid publish — it snapshots the skill's current head.
@@ -631,6 +644,34 @@ func (s *Server) handlePublishSkill(w http.ResponseWriter, r *http.Request) {
 	content := req.Content
 	if strings.TrimSpace(content) == "" {
 		content = existing.Content
+	}
+	casContent := req.ExpectedContent
+	if req.ExpectedContent != nil {
+		version, latestHasContent, err := inspectPublishedVersions(
+			r.Context(), s.store, skillID, content, req.Changelog, req.ExpectedContent,
+		)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "failed to inspect skill versions"})
+			return
+		}
+		if version != nil {
+			writeJSON(w, http.StatusOK, skillVersionFromRecord(*version))
+			return
+		}
+		if existing.Content != *req.ExpectedContent {
+			if latestHasContent {
+				writeJSON(w, http.StatusConflict, errorResponse{Error: "a different publish already changed this skill"})
+				return
+			}
+			if existing.Content != content {
+				writeJSON(w, http.StatusConflict, errorResponse{Error: "skill changed since this publish was proposed"})
+				return
+			}
+			// The desired text was saved without publication. Snapshot that current
+			// head while still protecting against another edit before the transaction.
+			// Keep the request's original expectedContent as its retry identity.
+			casContent = &existing.Content
+		}
 	}
 
 	now := time.Now().UTC()
@@ -656,13 +697,15 @@ func (s *Server) handlePublishSkill(w http.ResponseWriter, r *http.Request) {
 		semver := fmt.Sprintf("0.1.%d", n-1) // n=1 -> 0.1.0, n=2 -> 0.1.1, …
 
 		ver, err = s.store.PublishSkillVersion(r.Context(), storage.SkillVersionRecord{
-			SkillID:       skillID,
-			VersionNumber: n,
-			Semver:        semver,
-			Changelog:     req.Changelog,
-			Content:       content,
-			AuthorSubject: authSubjectFromRequest(r),
-			PublishedAt:   now,
+			SkillID:         skillID,
+			VersionNumber:   n,
+			Semver:          semver,
+			Changelog:       req.Changelog,
+			Content:         content,
+			ExpectedContent: req.ExpectedContent,
+			CASContent:      casContent,
+			AuthorSubject:   authSubjectFromRequest(r),
+			PublishedAt:     now,
 		})
 		if err == nil {
 			break
@@ -670,12 +713,56 @@ func (s *Server) handlePublishSkill(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, storage.ErrSkillVersionConflict) && attempt < maxPublishAttempts-1 {
 			continue // a concurrent publish took this number; recompute and retry
 		}
+		if errors.Is(err, storage.ErrSkillChanged) {
+			version, _, lookupErr := inspectPublishedVersions(
+				r.Context(), s.store, skillID, content, req.Changelog, req.ExpectedContent,
+			)
+			if lookupErr != nil {
+				s.logger.Error("inspect skill versions after publish conflict", "error", lookupErr)
+				writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "failed to inspect skill versions"})
+				return
+			}
+			if version != nil {
+				writeJSON(w, http.StatusOK, skillVersionFromRecord(*version))
+				return
+			}
+			writeJSON(w, http.StatusConflict, errorResponse{Error: "skill changed since this publish was proposed"})
+			return
+		}
 		s.logger.Error("publish skill version", "error", err)
 		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "failed to publish skill"})
 		return
 	}
 
 	writeJSON(w, http.StatusCreated, skillVersionFromRecord(*ver))
+}
+
+func inspectPublishedVersions(
+	ctx context.Context,
+	store storage.Store,
+	skillID string,
+	content string,
+	changelog string,
+	expectedContent *string,
+) (exact *storage.SkillVersionRecord, latestHasContent bool, err error) {
+	versions, err := store.ListSkillVersions(ctx, skillID)
+	if err != nil {
+		return nil, false, err
+	}
+	for i := range versions {
+		if versions[i].Content == content && versions[i].Changelog == changelog &&
+			sameOptionalString(versions[i].ExpectedContent, expectedContent) {
+			return &versions[i], len(versions) > 0 && versions[0].Content == content, nil
+		}
+	}
+	return nil, len(versions) > 0 && versions[0].Content == content, nil
+}
+
+func sameOptionalString(a, b *string) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
 }
 
 // handleListSkillVersions returns a skill's published version history.
