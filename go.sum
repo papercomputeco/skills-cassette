@@ -48,8 +48,8 @@ github.com/onsi/ginkgo/v2 v2.27.4 h1:fcEcQW/A++6aZAZQNUmNjvA9PSOzefMJBerHJ4t8v8Y
 github.com/onsi/ginkgo/v2 v2.27.4/go.mod h1:ArE1D/XhNXBXCBkKOLkbsb2c81dQHCRcF5zwn/ykDRo=
 github.com/onsi/gomega v1.39.0 h1:y2ROC3hKFmQZJNFeGAMeHZKkjBL65mIZcvrLQBF9k6Q=
 github.com/onsi/gomega v1.39.0/go.mod h1:ZCU1pkQcXDO5Sl9/VVEGlDyp+zm0m1cmeG5TOzLgdh4=
-github.com/papercomputeco/tapes v0.31.0 h1:uyAmj9BDGDbLuwBozNxOF9kc+5FD/TbPBOUd3VfmUok=
-github.com/papercomputeco/tapes v0.31.0/go.mod h1:1DKArzrVhBrEiUqa0F3jeLSS9P2i54OuYOxLpcyncKs=
+github.com/papercomputeco/tapes v0.39.0 h1:qnZu6fZvZcNkvZzu1DkNMGbhRH8lXa1dfy6+ovlChjw=
+github.com/papercomputeco/tapes v0.39.0/go.mod h1:UzuiGV2Jxl2U0Y5nuVHzAT0wGVMiHm/MQkQOExHakf0=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/rogpeppe/go-internal v1.13.1 h1:KvO1DLK/DRN07sQ1LQKScxyZJuNnedQ5/wKSR38lUII=

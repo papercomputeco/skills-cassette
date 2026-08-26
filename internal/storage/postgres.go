@@ -224,7 +224,9 @@ const searchPredicate = `($1::text IS NULL
 	OR EXISTS (SELECT 1 FROM unnest(tags) tag WHERE tag ILIKE '%' || $1::text || '%'))`
 
 // ListSkills returns one keyset page honoring the optional search/scope
-// filters, the requested sort, and the cursor in opts.
+// filters, any armed external attachment-view filters, the requested sort,
+// and the cursor in opts. External predicates render inside this one
+// paginating query — never as a post-fetch filter.
 func (s *PostgresStore) ListSkills(ctx context.Context, opts SkillListOpts) ([]SkillRecord, error) {
 	limit := opts.Limit
 	if limit <= 0 {
@@ -234,42 +236,125 @@ func (s *PostgresStore) ListSkills(ctx context.Context, opts SkillListOpts) ([]S
 
 	selectHead := fmt.Sprintf(`SELECT %s FROM %s.skills WHERE `, skillColumns, schema)
 
-	var rows pgx.Rows
-	var err error
+	var where, orderBy string
+	args := []any{nullText(opts.Query), nullText(opts.Author), nullText(opts.NotAuthor)}
 	if opts.Sort == SkillSortDownloads {
-		query := selectHead + searchPredicate + `
+		where = searchPredicate + `
 			  AND ($2::text IS NULL OR author_subject = $2::text)
 			  AND ($3::text IS NULL OR author_subject <> $3::text)
 			  AND (
 			    $4::bigint IS NULL
 			    OR download_count < $4::bigint
 			    OR (download_count = $4::bigint AND id < $5::uuid)
-			  )
-			ORDER BY download_count DESC, id DESC
-			LIMIT $6`
-		rows, err = s.pool.Query(ctx, query,
-			nullText(opts.Query), nullText(opts.Author), nullText(opts.NotAuthor),
-			opts.CursorDownloads, nullText(opts.CursorID), limit)
+			  )`
+		orderBy = `ORDER BY download_count DESC, id DESC`
+		args = append(args, opts.CursorDownloads, nullText(opts.CursorID))
 	} else {
-		query := selectHead + searchPredicate + `
+		where = searchPredicate + `
 			  AND ($2::text IS NULL OR author_subject = $2::text)
 			  AND ($3::text IS NULL OR author_subject <> $3::text)
 			  AND (
 			    $4::timestamptz IS NULL
 			    OR updated_at < $4::timestamptz
 			    OR (updated_at = $4::timestamptz AND id < $5::uuid)
-			  )
-			ORDER BY updated_at DESC, id DESC
-			LIMIT $6`
-		rows, err = s.pool.Query(ctx, query,
-			nullText(opts.Query), nullText(opts.Author), nullText(opts.NotAuthor),
-			opts.CursorTs, nullText(opts.CursorID), limit)
+			  )`
+		orderBy = `ORDER BY updated_at DESC, id DESC`
+		args = append(args, opts.CursorTs, nullText(opts.CursorID))
 	}
+	where, args = appendExternalFilterPredicates(where, args, opts.External)
+	args = append(args, limit)
+	query := selectHead + where + fmt.Sprintf(`
+			%s
+			LIMIT $%d`, orderBy, len(args))
+
+	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("list skills: %w", err)
+		return nil, listSkillsError(err, opts)
 	}
 	defer rows.Close()
-	return collectSkills(rows)
+	recs, err := collectSkills(rows)
+	if err != nil {
+		// pgx can defer query-execution errors (a dropped external view
+		// included) to row iteration, so classify here as well.
+		return nil, listSkillsError(err, opts)
+	}
+	return recs, nil
+}
+
+// listSkillsError wraps a list failure, surfacing the typed
+// ErrExternalViewUnavailable when an armed external filter is the cause so
+// the handler can apply the missing-relation convention instead of a plain
+// 500 — and never a silently unfiltered page.
+func listSkillsError(err error, opts SkillListOpts) error {
+	if len(opts.External) > 0 && isExternalRelationError(err) {
+		return fmt.Errorf("list skills: %w: %v", ErrExternalViewUnavailable, err)
+	}
+	return fmt.Errorf("list skills: %w", err)
+}
+
+// appendExternalFilterPredicates renders one EXISTS per configured filter
+// value against the deployment-granted external view, ANDed onto the where
+// clause. The view identifier passes through the quoting helper (config
+// validation constrains its grammar upstream; quoting is belt and braces),
+// and the type discriminator and every value bind as positional args — no
+// configured string is ever interpolated as data.
+func appendExternalFilterPredicates(where string, args []any, filters []ExternalAttachmentFilter) (string, []any) {
+	for _, filter := range filters {
+		view := quoteQualifiedIdentifier(filter.View)
+		for _, value := range filter.Values {
+			args = append(args, filter.TypeValue, value)
+			where += fmt.Sprintf(`
+			  AND EXISTS (
+			    SELECT 1 FROM %s ext
+			    WHERE ext.primitive_type = $%d
+			      AND ext.primitive_id = skills.id::text
+			      AND ext.value = $%d
+			  )`, view, len(args)-1, len(args))
+		}
+	}
+	return where, args
+}
+
+// ProbeExternalView checks that a configured external attachment view is
+// readable and serves the canonical shape (primitive_type, primitive_id,
+// value). The server runs it once at startup: a failing probe leaves the
+// filter unarmed (absence is cheap), while a view that breaks later surfaces
+// as ErrExternalViewUnavailable from ListSkills (breakage is loud).
+func (s *PostgresStore) ProbeExternalView(ctx context.Context, view string) error {
+	query := fmt.Sprintf(`SELECT primitive_type, primitive_id, value FROM %s WHERE FALSE`,
+		quoteQualifiedIdentifier(view))
+	rows, err := s.pool.Query(ctx, query)
+	if err != nil {
+		return fmt.Errorf("probe external view %s: %w", view, err)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("probe external view %s: %w", view, err)
+	}
+	return nil
+}
+
+var _ ExternalViewProber = (*PostgresStore)(nil)
+
+// isExternalRelationError reports whether err is Postgres undefined_table
+// (42P01) or insufficient_privilege (42501) — the two ways a configured
+// external view stops being readable after its startup probe passed.
+func isExternalRelationError(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	return pgErr.Code == "42P01" || pgErr.Code == "42501"
+}
+
+// quoteQualifiedIdentifier renders a schema-qualified relation name safely,
+// quoting each dot-separated segment independently.
+func quoteQualifiedIdentifier(value string) string {
+	segments := strings.Split(value, ".")
+	for i, segment := range segments {
+		segments[i] = quoteIdentifier(segment)
+	}
+	return strings.Join(segments, ".")
 }
 
 // ListSkillsBySession returns the skills generated from a given session
@@ -286,17 +371,27 @@ func (s *PostgresStore) ListSkillsBySession(ctx context.Context, sessionID strin
 	return collectSkills(rows)
 }
 
-// CountSkills returns the per-tab totals for a search (ignoring scope and
-// cursor): every matching skill and how many the caller authored.
-func (s *PostgresStore) CountSkills(ctx context.Context, query, author string) (SkillCounts, error) {
+// CountSkills returns the per-tab totals for a search (ignoring cursor):
+// every matching skill and how many the caller authored. Any armed external
+// filters render into the same WHERE clause the page uses, so the totals
+// describe exactly the filtered set — and a view that breaks mid-count
+// surfaces as ErrExternalViewUnavailable, the same loud degradation as the
+// page query, never silently unfiltered totals.
+func (s *PostgresStore) CountSkills(ctx context.Context, opts SkillCountOpts) (SkillCounts, error) {
+	where := searchPredicate
+	args := []any{nullText(opts.Query), opts.Author}
+	where, args = appendExternalFilterPredicates(where, args, opts.External)
 	statement := fmt.Sprintf(`SELECT
 			COUNT(*)::bigint AS total,
 			COUNT(*) FILTER (WHERE author_subject = $2)::bigint AS mine
 		FROM %s.skills
-		WHERE `, quoteIdentifier(s.schema)) + searchPredicate
+		WHERE `, quoteIdentifier(s.schema)) + where
 	var counts SkillCounts
-	if err := s.pool.QueryRow(ctx, statement, nullText(query), author).
+	if err := s.pool.QueryRow(ctx, statement, args...).
 		Scan(&counts.Total, &counts.Mine); err != nil {
+		if len(opts.External) > 0 && isExternalRelationError(err) {
+			return SkillCounts{}, fmt.Errorf("count skills: %w: %v", ErrExternalViewUnavailable, err)
+		}
 		return SkillCounts{}, fmt.Errorf("count skills: %w", err)
 	}
 	return counts, nil

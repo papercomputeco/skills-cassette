@@ -372,8 +372,39 @@ func (s *Server) handleListSkills(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Deployment-configured external filters. Only params armed by the
+	// startup probe are parsed at all — an unconfigured or unarmed param is
+	// ignored byte-identically to its absence. Each armed param is
+	// repeatable; values are normalized per the configured verbs and ANDed
+	// in storage as one EXISTS per value, inside the same paginating query.
+	for _, filter := range s.filters {
+		values := r.URL.Query()[filter.Param]
+		if len(values) == 0 {
+			continue
+		}
+		normalized := make([]string, len(values))
+		for i, value := range values {
+			normalized[i] = NormalizeFilterValue(value, filter.Normalize)
+		}
+		opts.External = append(opts.External, storage.ExternalAttachmentFilter{
+			View:      filter.View,
+			TypeValue: filter.TypeValue,
+			Values:    normalized,
+		})
+	}
+
 	recs, err := s.store.ListSkills(r.Context(), opts)
 	if err != nil {
+		if errors.Is(err, storage.ErrExternalViewUnavailable) {
+			// An armed filter broke after its startup probe. The
+			// missing-relation convention applies: answer 503 naming the
+			// cause, and never serve unfiltered rows as if filtered.
+			s.logger.Error("list skills external filter", "error", err)
+			writeJSON(w, http.StatusServiceUnavailable, errorResponse{
+				Error: "a configured external filter view is missing or unreadable; the filtered list cannot be served",
+			})
+			return
+		}
 		s.logger.Error("list skills", "error", err)
 		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "failed to list skills"})
 		return
@@ -390,8 +421,23 @@ func (s *Server) handleListSkills(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	counts, err := s.store.CountSkills(r.Context(), query, subject)
+	// The per-tab totals honor the same armed external filters as the page:
+	// counting the unfiltered table would report tabs for skills the filtered
+	// listing excludes. The same degradation convention applies too — a view
+	// broken mid-count is a loud 503, never silently unfiltered totals.
+	counts, err := s.store.CountSkills(r.Context(), storage.SkillCountOpts{
+		Query:    query,
+		Author:   subject,
+		External: opts.External,
+	})
 	if err != nil {
+		if errors.Is(err, storage.ErrExternalViewUnavailable) {
+			s.logger.Error("count skills external filter", "error", err)
+			writeJSON(w, http.StatusServiceUnavailable, errorResponse{
+				Error: "a configured external filter view is missing or unreadable; the filtered list cannot be served",
+			})
+			return
+		}
 		s.logger.Error("count skills", "error", err)
 		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "failed to list skills"})
 		return

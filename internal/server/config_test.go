@@ -1,6 +1,8 @@
 package server_test
 
 import (
+	"strings"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
@@ -65,5 +67,66 @@ var _ = Describe("config from env", func() {
 	It("defaults the name when the environment is empty", func() {
 		GinkgoT().Setenv("CASSETTE_NAME", "")
 		Expect(server.ConfigFromEnv().Name).To(Equal(server.DefaultName))
+	})
+})
+
+var _ = Describe("external filter configuration", func() {
+	It("parses a deployment-supplied filter list", func() {
+		filters, err := server.ParseExternalFilters(
+			`[{"param":"label","view":"attach_fixture.attachments","type_value":"skill","normalize":["trim","nfc","casefold"]}]`)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(filters).To(HaveLen(1))
+		Expect(filters[0].Param).To(Equal("label"))
+		Expect(filters[0].View).To(Equal("attach_fixture.attachments"))
+		Expect(filters[0].TypeValue).To(Equal("skill"))
+		Expect(filters[0].Normalize).To(Equal([]string{"trim", "nfc", "casefold"}))
+	})
+
+	It("treats an absent value as the capability being off", func() {
+		filters, err := server.ParseExternalFilters("")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(filters).To(BeEmpty())
+
+		filters, err = server.ParseExternalFilters("   ")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(filters).To(BeEmpty())
+	})
+
+	It("refuses malformed filter entries at startup", func() {
+		malformed := []string{
+			`not json`,
+			`[{"param":"label"}]`, // missing view and type_value
+			`[{"param":"label","view":"a.b","type_value":"skill","unknown":"x"}]`,                               // unknown field
+			`[{"param":"Bad-Param","view":"a.b","type_value":"skill"}]`,                                         // param grammar
+			`[{"param":"cursor","view":"a.b","type_value":"skill"}]`,                                            // reserved param
+			`[{"param":"p","view":"unqualified","type_value":"skill"}]`,                                         // view must be schema-qualified
+			`[{"param":"p","view":"a.b.c","type_value":"skill"}]`,                                               // too many segments
+			`[{"param":"p","view":"A.b","type_value":"skill"}]`,                                                 // uppercase view
+			`[{"param":"p","view":"a.b","type_value":"Not A Token"}]`,                                           // type_value grammar
+			`[{"param":"p","view":"a.b","type_value":"skill","normalize":["upper"]}]`,                           // unknown verb
+			`[{"param":"p","view":"a.b","type_value":"skill"},{"param":"p","view":"c.d","type_value":"skill"}]`, // duplicate param
+		}
+		for _, raw := range malformed {
+			_, err := server.ParseExternalFilters(raw)
+			Expect(err).To(HaveOccurred(), "expected %s to be refused", raw)
+		}
+	})
+
+	It("refuses an overlong view segment", func() {
+		segment := strings.Repeat("a", 64)
+		_, err := server.ParseExternalFilters(
+			`[{"param":"p","view":"` + segment + `.b","type_value":"skill"}]`)
+		Expect(err).To(HaveOccurred())
+	})
+
+	It("applies the configured normalize verbs in order", func() {
+		Expect(server.NormalizeFilterValue("  Hello  ", []string{"trim"})).To(Equal("Hello"))
+		Expect(server.NormalizeFilterValue("HeLLo", []string{"casefold"})).To(Equal("hello"))
+		// NFC composes a combining acute accent onto its base letter.
+		Expect(server.NormalizeFilterValue("é", []string{"nfc"})).To(Equal("é"))
+		// Full casefold expands sharp s.
+		Expect(server.NormalizeFilterValue("  Straße ", []string{"trim", "nfc", "casefold"})).To(Equal("strasse"))
+		// No verbs declared: the value binds raw.
+		Expect(server.NormalizeFilterValue("  RaW ", nil)).To(Equal("  RaW "))
 	})
 })

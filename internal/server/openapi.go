@@ -56,7 +56,13 @@ func openAPIDocument(name string) []byte {
 						"active search. Pagination mirrors /v1/sessions: pass the returned next_cursor "+
 						"to continue; its absence means the last page.\n\nPassing session_id switches "+
 						"the route to the provenance reverse lookup: the skills generated from that "+
-						"session, unpaginated, in the legacy GET /v1/sessions/:id/skills envelope.",
+						"session, unpaginated, in the legacy GET /v1/sessions/:id/skills envelope."+
+						"\n\nA deployment may wire additional repeatable filter params to external "+
+						"attachment views (the filters config). An armed param filters with AND "+
+						"semantics after the configured normalization, and the per-tab counts "+
+						"describe the same filtered set as the page; a view that stops being "+
+						"readable after startup fails the filtered request with 503 rather than "+
+						"serving unfiltered rows or totals.",
 					name,
 					withParameters(
 						queryParam("limit", "integer", "Page size (default 24, max 100)"),
@@ -70,6 +76,7 @@ func openAPIDocument(name string) []byte {
 						jsonResponse("200", "One page of skills", skillsListSchema()),
 						jsonResponse("400", "Malformed cursor", errorSchema()),
 						jsonResponse("500", "Listing failed", errorSchema()),
+						jsonResponse("503", "A configured external filter view is missing or unreadable", errorSchema()),
 					)),
 				"post": operation("createSkill", "Create a skill",
 					"Creates a skill authored by hand, as opposed to the generator. The caller "+
@@ -260,6 +267,21 @@ func manifest(name string) map[string]any {
 				"key":         "llm.base_url",
 				"type":        "string",
 				"description": "Provider base URL override for proxies and self-hosted endpoints.",
+			},
+			{
+				"key":         "filters",
+				"type":        "json",
+				"description": "External attachment-view filters: a JSON list of {param, view, type_value, normalize} entries, each wiring one repeatable skills-list query param to a deployment-granted view of the canonical attachment shape (primitive_type, primitive_id, value). Normalize verbs: trim, nfc, casefold. Absent: the capability is off.",
+			},
+		},
+		// Entities this cassette offers, feeding the platform's entity
+		// registry. Pure self-description: the cassette declares what it is
+		// and knows nothing about who consumes the declaration.
+		"entities": []map[string]any{
+			{
+				"type":         "skill",
+				"id_kind":      "uuid",
+				"display_name": "Skill",
 			},
 		},
 	}

@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"sort"
 	"strings"
@@ -82,6 +83,14 @@ func (s *MemoryStore) DeleteSkill(_ context.Context, id string) (bool, error) {
 // ListSkills returns one keyset page honoring the search/scope filters, the
 // requested sort, and the cursor in opts.
 func (s *MemoryStore) ListSkills(_ context.Context, opts SkillListOpts) ([]SkillRecord, error) {
+	// A memory store reads no external views, and it does not implement
+	// ExternalViewProber, so the server never arms external filters over it.
+	// If one arrives anyway the contract is loud failure — a silently
+	// unfiltered page is the one forbidden degradation.
+	if len(opts.External) > 0 {
+		return nil, fmt.Errorf("list skills: %w: the in-memory store reads no external views", ErrExternalViewUnavailable)
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -170,19 +179,26 @@ func (s *MemoryStore) ListSkillsBySession(_ context.Context, sessionID string) (
 	return out, nil
 }
 
-// CountSkills returns the per-tab totals for a search, ignoring scope and
-// cursor so every tab shows its full size for the active query.
-func (s *MemoryStore) CountSkills(_ context.Context, query, author string) (SkillCounts, error) {
+// CountSkills returns the per-tab totals for a search, ignoring cursor so
+// every tab shows its full size for the active query and filters.
+func (s *MemoryStore) CountSkills(_ context.Context, opts SkillCountOpts) (SkillCounts, error) {
+	// Same contract as ListSkills: this store reads no external views, so an
+	// external filter reaching it fails loudly — totals over unfiltered rows
+	// would misdescribe a filtered page.
+	if len(opts.External) > 0 {
+		return SkillCounts{}, fmt.Errorf("count skills: %w: the in-memory store reads no external views", ErrExternalViewUnavailable)
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	var counts SkillCounts
 	for _, rec := range s.skills {
-		if !matchesQuery(rec, query) {
+		if !matchesQuery(rec, opts.Query) {
 			continue
 		}
 		counts.Total++
-		if rec.AuthorSubject == author {
+		if rec.AuthorSubject == opts.Author {
 			counts.Mine++
 		}
 	}
