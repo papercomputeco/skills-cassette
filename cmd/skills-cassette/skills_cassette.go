@@ -55,6 +55,9 @@ Configuration arrives through the environment supplied by the deployment:
   CASSETTE_LLM_API_KEY   provider API key (falls back to OPENAI_API_KEY /
                          ANTHROPIC_API_KEY)
   CASSETTE_LLM_BASE_URL  provider base URL override
+  CASSETTE_FILTERS       external attachment-view filters: a JSON list of
+                         {param, view, type_value, normalize} entries; absent
+                         turns the capability off
   TAPES_DATABASE_URL     Postgres DSN; without one skills are stored in a
                          non-durable in-memory store`,
 		Args: cobra.NoArgs,
@@ -73,6 +76,11 @@ func runServe(ctx context.Context, address string) error {
 	if err := server.ValidateCoreURL(cfg.CoreURL); err != nil {
 		return err
 	}
+	filters, err := server.ExternalFiltersFromEnv()
+	if err != nil {
+		return err
+	}
+	cfg.Filters = filters
 	var querier skill.Querier
 	if cfg.CoreURL != "" {
 		querier = skill.NewAPIClient(cfg.CoreURL)

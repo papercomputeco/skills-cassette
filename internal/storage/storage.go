@@ -92,10 +92,25 @@ type SkillListOpts struct {
 	CursorDownloads *int64     // downloads keyset: download_count of that row
 	CursorID        string     // keyset tiebreak: id of that last row
 	Limit           int        // page size; zero falls back to DefaultListLimit
+	// External carries the deployment-configured attachment-view filters
+	// armed for this request; every filter must hold for a row to appear.
+	External []ExternalAttachmentFilter
 }
 
 // SkillSortDownloads is the SkillListOpts.Sort value for most-downloaded order.
 const SkillSortDownloads = "downloads"
+
+// SkillCountOpts controls the per-tab totals query. It carries the same
+// search text and armed external filters as the page the totals describe —
+// counting a superset of a filtered page would report tabs for rows the
+// caller can never see.
+type SkillCountOpts struct {
+	Query  string // name/description/tag search (empty = no filter)
+	Author string // the caller's subject, splitting Total into Mine/team
+	// External carries the deployment-configured attachment-view filters
+	// armed for this request; the totals must honor every one of them.
+	External []ExternalAttachmentFilter
+}
 
 // SkillCounts are the per-tab totals for a search: every matching skill, and
 // how many the caller authored. "team" is derived as Total - Mine.
@@ -114,7 +129,7 @@ type Store interface {
 	GetSkill(ctx context.Context, id string) (*SkillRecord, error)
 	ListSkills(ctx context.Context, opts SkillListOpts) ([]SkillRecord, error)
 	ListSkillsBySession(ctx context.Context, sessionID string) ([]SkillRecord, error)
-	CountSkills(ctx context.Context, query, author string) (SkillCounts, error)
+	CountSkills(ctx context.Context, opts SkillCountOpts) (SkillCounts, error)
 	NextSkillVersionNumber(ctx context.Context, skillID string) (int, error)
 	// PublishSkillVersion appends the immutable snapshot and advances the
 	// skill's head (version, content, updated_at) in one atomic step. The head
@@ -127,4 +142,29 @@ type Store interface {
 	IncrementSkillDownloads(ctx context.Context, id string) error
 	DeleteSkill(ctx context.Context, id string) (bool, error)
 	Close()
+}
+
+// ErrExternalViewUnavailable means a deployment-configured external
+// attachment view could not be read at query time — dropped, or its grant
+// revoked, after the startup probe passed. Handlers translate it into the
+// missing-relation error convention (503); serving unfiltered rows as if
+// the filter had applied is the one forbidden degradation.
+var ErrExternalViewUnavailable = errors.New("external attachment view unavailable")
+
+// ExternalAttachmentFilter restricts a skills page to rows referenced by an
+// external view of the canonical attachment shape (primitive_type,
+// primitive_id, value). Values arrive already normalized (the API boundary
+// applies the configured verbs) and are matched exactly, one independent
+// probe per value, ANDed.
+type ExternalAttachmentFilter struct {
+	View      string   // schema-qualified relation, deployment-configured
+	TypeValue string   // primitive_type discriminator for this surface
+	Values    []string // one EXISTS probe per value, ANDed
+}
+
+// ExternalViewProber is implemented by stores that can check whether a
+// configured external attachment view is readable. The server probes once at
+// startup; a store without the capability never arms external filters.
+type ExternalViewProber interface {
+	ProbeExternalView(ctx context.Context, view string) error
 }

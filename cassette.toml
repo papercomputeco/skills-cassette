@@ -89,3 +89,23 @@ description = "Provider API key. Not required for ollama."
 key = "llm.base_url"
 type = "string"
 description = "Provider base URL override for proxies and self-hosted endpoints."
+
+# External attachment-view filters. The manifest declares only this generic
+# schema; every VALUE — which params exist, which views they read, which
+# type_value they select on — is deployment-supplied through CASSETTE_FILTERS.
+# Each configured view must serve the canonical attachment shape
+# (primitive_type text, primitive_id text, value text); SELECT grants on it
+# are deployment-owned, mirroring how depends.views grants work. Absent value:
+# the capability is off with zero behavioral change.
+[[config]]
+key = "filters"
+type = "json"
+description = "External attachment-view filters: a JSON list of {param, view, type_value, normalize} entries, each wiring one repeatable skills-list query param to a deployment-granted view of the canonical attachment shape (primitive_type, primitive_id, value). Normalize verbs: trim, nfc, casefold. Absent: the capability is off."
+
+# Entities this cassette offers, feeding the platform's entity registry.
+# Pure self-description: the cassette declares what it is and knows nothing
+# about who consumes the declaration.
+[[entities]]
+type = "skill"
+id_kind = "uuid"
+display_name = "Skill"

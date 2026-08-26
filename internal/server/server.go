@@ -18,6 +18,12 @@ import (
 
 const shutdownTimeout = 5 * time.Second
 
+// externalFilterProbeTimeout bounds the one-time startup probe of a single
+// configured external attachment view. The budget is per view: one slow or
+// hanging probe exhausts only its own deadline, never the deadline of the
+// views probed after it. It is a var only so tests can shrink it.
+var externalFilterProbeTimeout = 5 * time.Second
+
 // Server is the whole cassette: an identity, a store for skills, a querier
 // for reading trace transcripts off the core, and an LLM configuration for
 // the generator.
@@ -28,6 +34,9 @@ type Server struct {
 	llm     skill.LLMCallerConfig
 	logger  *slog.Logger
 	openapi []byte
+	// filters are the external attachment-view filters that survived the
+	// startup availability probe. Only these params are ever parsed.
+	filters []ExternalFilter
 }
 
 // New builds the cassette server. querier may be nil when no core URL is
@@ -47,7 +56,46 @@ func New(cfg Config, store storage.Store, querier skill.Querier, logger *slog.Lo
 		llm:     cfg.LLM,
 		logger:  logger,
 		openapi: openAPIDocument(name),
+		filters: armExternalFilters(cfg.Filters, store, logger),
 	}
+}
+
+// armExternalFilters probes each configured external attachment view once
+// and returns the filters whose views are readable. Absent is cheap: an
+// unreadable view (or a store that reads no external views at all) leaves
+// that filter unarmed, its param ignored with zero behavioral change. The
+// distinct case — a view that breaks after arming — stays loud at request
+// time (ErrExternalViewUnavailable, 503); there is no per-request re-probe
+// and no fallback.
+func armExternalFilters(filters []ExternalFilter, store storage.Store, logger *slog.Logger) []ExternalFilter {
+	if len(filters) == 0 {
+		return nil
+	}
+	prober, ok := store.(storage.ExternalViewProber)
+	if !ok {
+		logger.Warn("external filters configured but the store reads no external views; the capability is off",
+			"store", store.Kind())
+		return nil
+	}
+	armed := make([]ExternalFilter, 0, len(filters))
+	for _, filter := range filters {
+		if err := probeExternalView(prober, filter.View); err != nil {
+			logger.Warn("external filter view is not readable; its param will be ignored",
+				"param", filter.Param, "view", filter.View, "error", err)
+			continue
+		}
+		armed = append(armed, filter)
+	}
+	return armed
+}
+
+// probeExternalView checks one view under its own fresh deadline. A shared
+// deadline would let one slow probe hand every later view an expired context,
+// silently disarming filters whose views are perfectly readable.
+func probeExternalView(prober storage.ExternalViewProber, view string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), externalFilterProbeTimeout)
+	defer cancel()
+	return prober.ProbeExternalView(ctx, view)
 }
 
 // Handler mounts the anchors and the skills API.

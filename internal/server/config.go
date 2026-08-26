@@ -1,11 +1,18 @@
 package server
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
+
+	"golang.org/x/text/cases"
+	"golang.org/x/text/unicode/norm"
 
 	"github.com/papercomputeco/skills-cassette/pkg/skill"
 )
@@ -27,6 +34,10 @@ type Config struct {
 	CoreURL string
 	// LLM configures the provider used by POST generate.
 	LLM skill.LLMCallerConfig
+	// Filters are the deployment-configured external attachment-view
+	// filters (CASSETTE_FILTERS), validated at startup. Absent: the
+	// capability is off with zero behavioral change.
+	Filters []ExternalFilter
 }
 
 // ConfigFromEnv reads the manifest-declared configuration from the
@@ -91,4 +102,134 @@ func envOrDefault(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+// ExternalFilter is one deployment-configured attachment-view filter: a
+// repeatable query param on the skills list wired to an external view of the
+// canonical attachment shape (primitive_type, primitive_id, value). The
+// manifest declares only this generic schema; every value here — the param
+// name, the view it reads, the type it selects on — is deployment-supplied,
+// so no external product's names are compiled into this repository.
+type ExternalFilter struct {
+	// Param is the query param the deployment claims on the skills list.
+	Param string `json:"param"`
+	// View is the schema-qualified relation of the canonical attachment
+	// shape this filter reads. SELECT grants on it are deployment-owned.
+	View string `json:"view"`
+	// TypeValue is the primitive_type discriminator selecting this
+	// surface's rows in the view.
+	TypeValue string `json:"type_value"`
+	// Normalize names the verbs applied, in order, to each supplied value
+	// before it binds. Vocabulary: trim, nfc, casefold.
+	Normalize []string `json:"normalize,omitempty"`
+}
+
+// reservedListParams are the skills list's own query params. A configured
+// external filter may not claim one — the same reserved-param discipline the
+// platform applies to cassette filter claims, derived from this surface's
+// documented parameters (openapi.go's listSkills operation).
+var reservedListParams = map[string]bool{
+	"limit":      true,
+	"cursor":     true,
+	"q":          true,
+	"scope":      true,
+	"sort":       true,
+	"session_id": true,
+}
+
+// lowerSnakeToken is the grammar shared by filter params, view segments, and
+// type values: lowercase snake tokens of at most 63 bytes, matching the
+// platform's identifier admission rules.
+var lowerSnakeToken = regexp.MustCompile(`^[a-z][a-z0-9_]{0,62}$`)
+
+// normalizeVerbs is the supported normalization vocabulary.
+var normalizeVerbs = map[string]bool{"trim": true, "nfc": true, "casefold": true}
+
+// ExternalFiltersFromEnv parses and validates the deployment-supplied
+// external-filter configuration from CASSETTE_FILTERS. Invalid configuration
+// refuses startup — a deployment that asked for a filter must get it or know
+// why not; an absent value simply turns the capability off.
+func ExternalFiltersFromEnv() ([]ExternalFilter, error) {
+	return ParseExternalFilters(os.Getenv("CASSETTE_FILTERS"))
+}
+
+// ParseExternalFilters strictly decodes and validates an external-filter
+// configuration document: a JSON list of {param, view, type_value,
+// normalize} entries. Empty input means the capability is off.
+func ParseExternalFilters(raw string) ([]ExternalFilter, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	var filters []ExternalFilter
+	if err := decoder.Decode(&filters); err != nil {
+		return nil, fmt.Errorf("external filters: %w", err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return nil, errors.New("external filters: trailing JSON value")
+	}
+
+	seen := make(map[string]int, len(filters))
+	for index, filter := range filters {
+		if err := validateExternalFilter(filter); err != nil {
+			return nil, fmt.Errorf("external filters[%d]: %w", index, err)
+		}
+		if previous, exists := seen[filter.Param]; exists {
+			return nil, fmt.Errorf("external filters[%d]: param %q duplicates filters[%d]", index, filter.Param, previous)
+		}
+		seen[filter.Param] = index
+	}
+	return filters, nil
+}
+
+// validateExternalFilter enforces the configuration grammar. Configured
+// strings later reach an identifier position (the view) and a query-param
+// namespace (the param), so both are held to strict token grammars — the
+// quoting in storage is belt and braces, not the defense.
+func validateExternalFilter(filter ExternalFilter) error {
+	if !lowerSnakeToken.MatchString(filter.Param) {
+		return fmt.Errorf("param %q must be a lowercase snake token of at most 63 bytes", filter.Param)
+	}
+	if reservedListParams[filter.Param] {
+		return fmt.Errorf("param %q is owned by the skills list itself", filter.Param)
+	}
+	segments := strings.Split(filter.View, ".")
+	if len(segments) != 2 {
+		return fmt.Errorf("view %q must be a schema-qualified relation (schema.view)", filter.View)
+	}
+	for _, segment := range segments {
+		if !lowerSnakeToken.MatchString(segment) {
+			return fmt.Errorf("view %q segments must be lowercase snake tokens of at most 63 bytes", filter.View)
+		}
+	}
+	if !lowerSnakeToken.MatchString(filter.TypeValue) {
+		return fmt.Errorf("type_value %q must be a lowercase snake token of at most 63 bytes", filter.TypeValue)
+	}
+	for _, verb := range filter.Normalize {
+		if !normalizeVerbs[verb] {
+			return fmt.Errorf("unknown normalize verb %q (supported: trim, nfc, casefold)", verb)
+		}
+	}
+	return nil
+}
+
+// NormalizeFilterValue applies the configured normalize verbs to one filter
+// value, in the configured order. Normalization happens exactly once, here
+// at the API boundary — never per-row in SQL, where it would defeat index
+// probes on the external view.
+func NormalizeFilterValue(value string, verbs []string) string {
+	for _, verb := range verbs {
+		switch verb {
+		case "trim":
+			value = strings.TrimSpace(value)
+		case "nfc":
+			value = norm.NFC.String(value)
+		case "casefold":
+			value = cases.Fold().String(value)
+		}
+	}
+	return value
 }

@@ -92,7 +92,7 @@ var _ = Describe("MemoryStore", func() {
 		Expect(page).To(HaveLen(1))
 		Expect(page[0].ID).To(Equal("react-debug"))
 
-		counts, err := store.CountSkills(ctx, "tag-sql-tuning", "")
+		counts, err := store.CountSkills(ctx, storage.SkillCountOpts{Query: "tag-sql-tuning"})
 		Expect(err).NotTo(HaveOccurred())
 		Expect(counts.Total).To(Equal(int64(1)))
 	})
