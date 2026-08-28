@@ -3,10 +3,12 @@ package server_test
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -421,5 +423,276 @@ var _ = Describe("external attachment-view filters (Postgres)", func() {
 			}},
 		})
 		Expect(err).To(MatchError(storage.ErrExternalViewUnavailable))
+	})
+
+	It("arms a filter whose view becomes readable only after startup", func() {
+		DeferCleanup(server.StubExternalFilterReprobeInterval(20 * time.Millisecond))
+
+		// The view does not exist yet when the server boots — the shape of
+		// a deployment whose SELECT grant or view lands moments after the
+		// pod starts. The param is ignored, exactly as before.
+		srv := newServer(config(fixture + ".late_attachments"))
+		withParam, status := rawGET(srv, "/api/skills?label=alpha")
+		Expect(status).To(Equal(http.StatusOK))
+		without, _ := rawGET(srv, "/api/skills")
+		Expect(withParam).To(Equal(without))
+
+		DeferCleanup(serveInBackground(srv))
+
+		// The view materializes; the background loop arms the filter and
+		// requests start filtering without a restart.
+		_, err := pool.Exec(ctx, fmt.Sprintf(`CREATE VIEW %q.late_attachments AS
+			SELECT primitive_type, primitive_id, value FROM %q.rows`, fixture, fixture))
+		Expect(err).NotTo(HaveOccurred())
+
+		Eventually(func() []string {
+			body, status := doJSON(srv, http.MethodGet, "/api/skills?label=alpha", "", "")
+			if status != http.StatusOK {
+				return nil
+			}
+			return ids(body)
+		}, 2*time.Second).Should(ConsistOf(skillA, skillB))
+	})
+})
+
+// reprobeStore reads external views for the re-probe specs. Probe outcomes
+// are controlled per view and every probe attempt is counted, so the specs
+// can observe exactly when the background loop fires and against which
+// views. All state is mutex-guarded: probes arrive from the server's
+// background loop while the specs read counts and issue requests.
+type reprobeStore struct {
+	storage.Store
+	mu       sync.Mutex
+	readable map[string]bool
+	probes   map[string]int
+	// hangProbes makes every probe consume its whole context before
+	// failing, for the shutdown-under-a-hanging-probe spec.
+	hangProbes   bool
+	lastExternal []storage.ExternalAttachmentFilter
+	// sawExternal sticks once any list carried an armed external filter —
+	// an arming signal that concurrent unfiltered lists cannot overwrite.
+	sawExternal bool
+}
+
+func newReprobeStore() *reprobeStore {
+	return &reprobeStore{
+		Store:    storage.NewMemoryStore(),
+		readable: map[string]bool{},
+		probes:   map[string]int{},
+	}
+}
+
+func (s *reprobeStore) setReadable(view string, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.readable[view] = ok
+}
+
+func (s *reprobeStore) setHangProbes(hang bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.hangProbes = hang
+}
+
+func (s *reprobeStore) probeCount(view string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.probes[view]
+}
+
+func (s *reprobeStore) listedWithExternal() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sawExternal
+}
+
+// external returns the external filters the most recent list threaded into
+// storage — the observable proof of which filters were armed at that moment.
+func (s *reprobeStore) external() []storage.ExternalAttachmentFilter {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastExternal
+}
+
+func (s *reprobeStore) ProbeExternalView(ctx context.Context, view string) error {
+	s.mu.Lock()
+	s.probes[view]++
+	readable := s.readable[view]
+	hang := s.hangProbes
+	s.mu.Unlock()
+	if hang {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	if !readable {
+		return fmt.Errorf("view %s is not readable", view)
+	}
+	return nil
+}
+
+func (s *reprobeStore) ListSkills(ctx context.Context, opts storage.SkillListOpts) ([]storage.SkillRecord, error) {
+	s.mu.Lock()
+	s.lastExternal = opts.External
+	if len(opts.External) > 0 {
+		s.sawExternal = true
+	}
+	s.mu.Unlock()
+	stripped := opts
+	stripped.External = nil
+	return s.Store.ListSkills(ctx, stripped)
+}
+
+func (s *reprobeStore) CountSkills(ctx context.Context, opts storage.SkillCountOpts) (storage.SkillCounts, error) {
+	stripped := opts
+	stripped.External = nil
+	return s.Store.CountSkills(ctx, stripped)
+}
+
+// serveInBackground runs srv.Serve on a loopback listener so the background
+// re-probe loop is live, and returns a stop func that cancels the server and
+// asserts it exits cleanly.
+func serveInBackground(srv *server.Server) (stop func()) {
+	ctx, cancel := context.WithCancel(context.Background())
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	Expect(err).NotTo(HaveOccurred())
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(ctx, listener) }()
+	return func() {
+		cancel()
+		Eventually(done, 3*time.Second).Should(Receive(BeNil()),
+			"the server (and its re-probe loop) must shut down cleanly")
+	}
+}
+
+var _ = Describe("external filter re-probing", func() {
+	// As everywhere in these specs, the param and view names are
+	// deployment-supplied VALUES from test configuration.
+	const view = "attach_fixture.attachments"
+	config := `[{"param":"label","view":"` + view + `","type_value":"skill"}]`
+
+	It("arms an unreadable-at-boot filter once its view becomes readable", func() {
+		DeferCleanup(server.StubExternalFilterReprobeInterval(20 * time.Millisecond))
+
+		filters, err := server.ParseExternalFilters(config)
+		Expect(err).NotTo(HaveOccurred())
+		store := newReprobeStore()
+		seedSkill(store.Store.(*storage.MemoryStore), "a-skill")
+		srv := server.New(server.Config{Filters: filters}, store, nil, nil)
+
+		// Unreadable at boot: the param is ignored, exactly as before.
+		_, status := doJSON(srv, http.MethodGet, "/api/skills?label=x", "", "")
+		Expect(status).To(Equal(http.StatusOK))
+		Expect(store.external()).To(BeEmpty())
+
+		DeferCleanup(serveInBackground(srv))
+
+		// The view becomes readable shortly after boot — the deployment's
+		// grant converging — and the background loop arms the filter
+		// without a restart.
+		store.setReadable(view, true)
+		Eventually(func() []storage.ExternalAttachmentFilter {
+			_, _ = doJSON(srv, http.MethodGet, "/api/skills?label=x", "", "")
+			return store.external()
+		}, time.Second).Should(HaveLen(1))
+		Expect(store.external()[0].View).To(Equal(view))
+	})
+
+	It("re-probes only unarmed filters and stops once everything is armed", func() {
+		DeferCleanup(server.StubExternalFilterReprobeInterval(20 * time.Millisecond))
+
+		const readyView = "attach_fixture.ready"
+		const lateView = "attach_fixture.late"
+		filters, err := server.ParseExternalFilters(
+			`[{"param":"label","view":"` + readyView + `","type_value":"skill"},
+			  {"param":"stage","view":"` + lateView + `","type_value":"skill"}]`)
+		Expect(err).NotTo(HaveOccurred())
+
+		store := newReprobeStore()
+		store.setReadable(readyView, true)
+		seedSkill(store.Store.(*storage.MemoryStore), "a-skill")
+		srv := server.New(server.Config{Filters: filters}, store, nil, nil)
+		Expect(store.probeCount(readyView)).To(Equal(1), "startup probes each view once")
+
+		DeferCleanup(serveInBackground(srv))
+
+		// The unarmed view is retried on the interval; the armed one never
+		// sees another probe.
+		Eventually(func() int { return store.probeCount(lateView) }, time.Second).
+			Should(BeNumerically(">=", 3))
+		Expect(store.probeCount(readyView)).To(Equal(1))
+
+		// Once the late view becomes readable it arms...
+		store.setReadable(lateView, true)
+		Eventually(func() []storage.ExternalAttachmentFilter {
+			_, _ = doJSON(srv, http.MethodGet, "/api/skills?stage=x", "", "")
+			return store.external()
+		}, time.Second).Should(HaveLen(1))
+		Expect(store.external()[0].View).To(Equal(lateView))
+
+		// ...and with nothing left unarmed the loop stops probing at all.
+		settled := store.probeCount(lateView)
+		Consistently(func() int { return store.probeCount(lateView) }, 200*time.Millisecond).
+			Should(Equal(settled))
+		Expect(store.probeCount(readyView)).To(Equal(1))
+	})
+
+	It("serves list reads race-free while the loop arms a filter", func() {
+		DeferCleanup(server.StubExternalFilterReprobeInterval(time.Millisecond))
+
+		filters, err := server.ParseExternalFilters(config)
+		Expect(err).NotTo(HaveOccurred())
+		store := newReprobeStore()
+		seedSkill(store.Store.(*storage.MemoryStore), "a-skill")
+		srv := server.New(server.Config{Filters: filters}, store, nil, nil)
+		DeferCleanup(serveInBackground(srv))
+
+		// Hammer the list from several goroutines while the background loop
+		// arms the filter mid-flight. The race detector is the assertion.
+		stopHammer := make(chan struct{})
+		var wg sync.WaitGroup
+		for range 4 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer GinkgoRecover()
+				for {
+					select {
+					case <-stopHammer:
+						return
+					default:
+						_, status := rawGET(srv, "/api/skills")
+						Expect(status).To(Equal(http.StatusOK))
+					}
+				}
+			}()
+		}
+		store.setReadable(view, true)
+		// The sticky signal, not lastExternal: the hammering unfiltered
+		// lists legitimately record an empty filter set right after the
+		// filtered one lands.
+		Eventually(func() bool {
+			_, _ = doJSON(srv, http.MethodGet, "/api/skills?label=x", "", "")
+			return store.listedWithExternal()
+		}, time.Second).Should(BeTrue())
+		close(stopHammer)
+		wg.Wait()
+	})
+
+	It("shuts down cleanly while an unarmed filter is mid-probe", func() {
+		DeferCleanup(server.StubExternalFilterReprobeInterval(20 * time.Millisecond))
+
+		filters, err := server.ParseExternalFilters(config)
+		Expect(err).NotTo(HaveOccurred())
+		store := newReprobeStore()
+		srv := server.New(server.Config{Filters: filters}, store, nil, nil)
+
+		// Every re-probe from here on hangs for its whole deadline (5s by
+		// default). Shutdown must not wait it out: canceling the server
+		// must cancel the in-flight probe too.
+		store.setHangProbes(true)
+		stop := serveInBackground(srv)
+		Eventually(func() int { return store.probeCount(view) }, time.Second).
+			Should(BeNumerically(">=", 2), "a re-probe attempt is in flight")
+		stop()
 	})
 })
