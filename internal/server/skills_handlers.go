@@ -372,12 +372,13 @@ func (s *Server) handleListSkills(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Deployment-configured external filters. Only params armed by the
-	// startup probe are parsed at all — an unconfigured or unarmed param is
-	// ignored byte-identically to its absence. Each armed param is
-	// repeatable; values are normalized per the configured verbs and ANDed
-	// in storage as one EXISTS per value, inside the same paginating query.
-	for _, filter := range s.filters {
+	// Deployment-configured external filters. Only armed params — probed
+	// readable at startup or by the background re-probe loop — are parsed at
+	// all; an unconfigured or unarmed param is ignored byte-identically to
+	// its absence. Each armed param is repeatable; values are normalized per
+	// the configured verbs and ANDed in storage as one EXISTS per value,
+	// inside the same paginating query.
+	for _, filter := range s.armedFilters() {
 		values := r.URL.Query()[filter.Param]
 		if len(values) == 0 {
 			continue
