@@ -39,6 +39,8 @@ make test
 make check
 ```
 
-Do not write design documents or implementation plans to disk. Pull request
-titles use the repository's accepted contribution labels, such as `✨ feat:`,
-`🔧 fix:`, `🧹 chore:`, or `📚 docs:`.
+Do not commit design documents or implementation plans to the repository. Local
+planning artifacts are encouraged for staging and execution, but keep them
+untracked and exclude or remove them before committing. Pull request titles use
+the repository's accepted contribution labels, such as `✨ feat:`, `🔧 fix:`,
+`🧹 chore:`, or `📚 docs:`.
