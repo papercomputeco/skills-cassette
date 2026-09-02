@@ -126,6 +126,9 @@ type Store interface {
 	// logs can never misread a demo as durable.
 	Kind() string
 	UpsertSkill(ctx context.Context, rec SkillRecord) (*SkillRecord, error)
+	// CreatePublishedSkill atomically inserts a new skill and its initial
+	// immutable version. Callers must supply version number 1 for the same id.
+	CreatePublishedSkill(ctx context.Context, rec SkillRecord, version SkillVersionRecord) (*SkillRecord, error)
 	GetSkill(ctx context.Context, id string) (*SkillRecord, error)
 	ListSkills(ctx context.Context, opts SkillListOpts) ([]SkillRecord, error)
 	ListSkillsBySession(ctx context.Context, sessionID string) ([]SkillRecord, error)

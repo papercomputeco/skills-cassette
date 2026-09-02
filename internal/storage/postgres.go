@@ -52,7 +52,9 @@ func (s *PostgresStore) Close() { s.pool.Close() }
 // migrate is the cassette's own migration, run at startup. This is the final
 // two-table form of the four historical Tapes migration steps (skills,
 // skill_versions + author_subject, download_count, id keys), re-homed without
-// org_id and without core foreign keys. Identifiers are quoted because a
+// org_id and without core foreign keys. It also publishes any legacy skill
+// with no history as v0.1.0; the insert trigger closes the same gap for older
+// writers during a rolling deployment. Identifiers are quoted because a
 // cassette name may legally contain a hyphen.
 func (s *PostgresStore) migrate(ctx context.Context) error {
 	schema := quoteIdentifier(s.schema)
@@ -96,11 +98,44 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 			ADD COLUMN IF NOT EXISTS expected_content TEXT`, schema),
 		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS skill_versions_skill_idx
 			ON %s.skill_versions (skill_id, version_number DESC)`, schema),
+		fmt.Sprintf(`CREATE OR REPLACE FUNCTION %s.publish_initial_skill_version()
+			RETURNS trigger LANGUAGE plpgsql AS $$
+			BEGIN
+				INSERT INTO %s.skill_versions (
+					skill_id, version_number, semver, changelog, content,
+					author_subject, published_at
+				) VALUES (NEW.id, 1, '0.1.0', '', NEW.content, NEW.author_subject, NEW.updated_at)
+				ON CONFLICT DO NOTHING;
+				RETURN NEW;
+			END
+			$$`, schema, schema),
+		fmt.Sprintf(`DROP TRIGGER IF EXISTS publish_initial_skill_version ON %s.skills`, schema),
+		fmt.Sprintf(`CREATE TRIGGER publish_initial_skill_version
+			AFTER INSERT ON %s.skills
+			FOR EACH ROW EXECUTE FUNCTION %s.publish_initial_skill_version()`, schema, schema),
+		fmt.Sprintf(`INSERT INTO %s.skill_versions (
+			skill_id, version_number, semver, changelog, content,
+			author_subject, published_at
+		)
+		SELECT id, 1, '0.1.0', '', content, author_subject, updated_at
+		FROM %s.skills skill
+		WHERE NOT EXISTS (
+			SELECT 1 FROM %s.skill_versions version WHERE version.skill_id = skill.id
+		)
+		ON CONFLICT DO NOTHING`, schema, schema, schema),
 	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin skills migration tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
 	for _, statement := range statements {
-		if _, err := s.pool.Exec(ctx, statement); err != nil {
+		if _, err := tx.Exec(ctx, statement); err != nil {
 			return fmt.Errorf("migrating skills tables: %w", err)
 		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit skills migration tx: %w", err)
 	}
 	return nil
 }
@@ -156,6 +191,58 @@ func (s *PostgresStore) UpsertSkill(ctx context.Context, rec SkillRecord) (*Skil
 	out, err := scanSkill(row)
 	if err != nil {
 		return nil, fmt.Errorf("upsert skill: %w", err)
+	}
+	return &out, nil
+}
+
+// CreatePublishedSkill inserts a skill and its first immutable version in one
+// transaction, so readers never observe a skill without version history.
+func (s *PostgresStore) CreatePublishedSkill(ctx context.Context, rec SkillRecord, version SkillVersionRecord) (*SkillRecord, error) {
+	if !validUUID(rec.ID) || version.SkillID != rec.ID || version.VersionNumber != 1 {
+		return nil, errors.New("create published skill: invalid initial version")
+	}
+	if rec.ParentID != "" && !validUUID(rec.ParentID) {
+		return nil, fmt.Errorf("create published skill: invalid parent id %q", rec.ParentID)
+	}
+	rec.Version = version.Semver
+	rec.Content = version.Content
+	rec.UpdatedAt = version.PublishedAt
+	schema := quoteIdentifier(s.schema)
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("begin create published skill tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	// skill_versions deliberately has no cross-table foreign key, so inserting
+	// the version first lets the skills INSERT trigger remain a safety net for
+	// older writers without duplicating this caller's changelog-bearing row.
+	insertVersion := fmt.Sprintf(`INSERT INTO %s.skill_versions (
+			skill_id, version_number, semver, changelog, content, expected_content,
+			author_subject, published_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`, schema)
+	if _, err := tx.Exec(ctx, insertVersion,
+		version.SkillID, version.VersionNumber, version.Semver, version.Changelog,
+		version.Content, version.ExpectedContent, version.AuthorSubject, version.PublishedAt); err != nil {
+		return nil, fmt.Errorf("insert initial skill version: %w", err)
+	}
+
+	insertSkill := fmt.Sprintf(`INSERT INTO %s.skills (
+			id, slug, name, description, type, version, visibility, tags, content,
+			is_ai_generated, generated_from_session_ids, parent_id, author_subject,
+			created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NULLIF($12, '')::uuid, $13, $14, $15)
+		RETURNING `+skillColumns, schema)
+	out, err := scanSkill(tx.QueryRow(ctx, insertSkill,
+		rec.ID, rec.Slug, rec.Name, rec.Description, rec.Type, rec.Version, rec.Visibility,
+		nonNilStrings(rec.Tags), rec.Content, rec.IsAIGenerated,
+		nonNilStrings(rec.GeneratedFromSessionIDs), rec.ParentID, rec.AuthorSubject,
+		rec.CreatedAt, rec.UpdatedAt))
+	if err != nil {
+		return nil, fmt.Errorf("insert published skill: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit create published skill tx: %w", err)
 	}
 	return &out, nil
 }

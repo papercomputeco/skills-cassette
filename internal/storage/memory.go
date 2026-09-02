@@ -54,6 +54,26 @@ func (s *MemoryStore) UpsertSkill(_ context.Context, rec SkillRecord) (*SkillRec
 	return &out, nil
 }
 
+// CreatePublishedSkill inserts a skill and its first immutable version under
+// one lock, so a visible skill can never exist without version history.
+func (s *MemoryStore) CreatePublishedSkill(_ context.Context, rec SkillRecord, version SkillVersionRecord) (*SkillRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, exists := s.skills[rec.ID]; exists || version.SkillID != rec.ID || version.VersionNumber != 1 {
+		return nil, ErrSkillVersionConflict
+	}
+	rec.Tags = cloneStrings(rec.Tags)
+	rec.GeneratedFromSessionIDs = cloneStrings(rec.GeneratedFromSessionIDs)
+	rec.Version = version.Semver
+	rec.Content = version.Content
+	rec.UpdatedAt = version.PublishedAt
+	s.skills[rec.ID] = rec
+	s.versions[rec.ID] = []SkillVersionRecord{version}
+	out := rec
+	return &out, nil
+}
+
 // GetSkill returns a skill by id, or nil when absent.
 func (s *MemoryStore) GetSkill(_ context.Context, id string) (*SkillRecord, error) {
 	s.mu.Lock()

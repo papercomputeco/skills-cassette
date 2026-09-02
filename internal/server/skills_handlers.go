@@ -188,7 +188,7 @@ type skillVersionsResponse struct {
 }
 
 // handleGenerateSkill runs the pkg/skill LLM generator over the requested
-// sessions, persists the result, and returns it.
+// sessions, atomically publishes the result as v0.1.0, and returns it.
 //
 // The generator reads session transcripts through the cassette's HTTP trace
 // client bound to the configured core URL (GET /v1/traces?session_id= and
@@ -294,10 +294,10 @@ func (s *Server) handleGenerateSkill(w http.ResponseWriter, r *http.Request) {
 		UpdatedAt:               now,
 	}
 
-	saved, err := s.store.UpsertSkill(r.Context(), rec)
+	saved, err := s.store.CreatePublishedSkill(r.Context(), rec, initialVersion(rec, ""))
 	if err != nil {
-		s.logger.Error("persist skill", "error", err)
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "failed to persist skill"})
+		s.logger.Error("persist generated skill", "error", err)
+		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "failed to persist generated skill"})
 		return
 	}
 
@@ -586,19 +586,20 @@ func (s *Server) handleDeleteSkill(w http.ResponseWriter, r *http.Request) {
 }
 
 // createSkillRequest is the POST body for an authored-from-scratch skill —
-// only a name is required; the rest default to an empty private draft.
+// only a name is required; the rest default to an empty private skill.
 type createSkillRequest struct {
 	Name        string   `json:"name"`
 	Description string   `json:"description"`
 	Type        string   `json:"type"`
 	Tags        []string `json:"tags"`
 	Content     string   `json:"content"`
+	Changelog   string   `json:"changelog"`
 }
 
-// handleCreateSkill writes a new blank/authored skill (empty provenance),
-// attributed to the caller. Generate is the AI path; this is the
-// create-from-scratch path. The id is minted here; slug is a cosmetic label
-// derived from the name (no longer unique).
+// handleCreateSkill atomically writes and publishes a new authored skill
+// (empty provenance), attributed to the caller. Generate is the AI path; this
+// is the create-from-scratch path. The id is minted here; slug is a cosmetic
+// label derived from the name (no longer unique).
 func (s *Server) handleCreateSkill(w http.ResponseWriter, r *http.Request) {
 	var req createSkillRequest
 	if err := decodeJSONBody(r, &req); err != nil {
@@ -641,13 +642,25 @@ func (s *Server) handleCreateSkill(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:               now,
 		UpdatedAt:               now,
 	}
-	saved, err := s.store.UpsertSkill(r.Context(), rec)
+	saved, err := s.store.CreatePublishedSkill(r.Context(), rec, initialVersion(rec, req.Changelog))
 	if err != nil {
 		s.logger.Error("create skill", "error", err)
 		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "failed to create skill"})
 		return
 	}
 	writeJSON(w, http.StatusCreated, skillFromRecord(*saved))
+}
+
+func initialVersion(rec storage.SkillRecord, changelog string) storage.SkillVersionRecord {
+	return storage.SkillVersionRecord{
+		SkillID:       rec.ID,
+		VersionNumber: 1,
+		Semver:        "0.1.0",
+		Changelog:     changelog,
+		Content:       rec.Content,
+		AuthorSubject: rec.AuthorSubject,
+		PublishedAt:   rec.UpdatedAt,
+	}
 }
 
 // publishSkillRequest is the POST versions body.
@@ -827,9 +840,9 @@ func (s *Server) handleListSkillVersions(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, skillVersionsResponse{Versions: items, TotalCount: len(items)})
 }
 
-// handleDuplicateSkill copies a skill under a fresh id, attributed to the
-// duplicating user. Because slug is no longer an identity it can be shared with
-// the parent freely — no "-copy" suffix is needed to stay distinct.
+// handleDuplicateSkill copies and publishes a skill under a fresh id,
+// attributed to the duplicating user. Because slug is no longer an identity it
+// can be shared with the parent freely — no "-copy" suffix is needed.
 func (s *Server) handleDuplicateSkill(w http.ResponseWriter, r *http.Request) {
 	existing, err := s.store.GetSkill(r.Context(), r.PathValue("id"))
 	if err != nil {
@@ -855,7 +868,7 @@ func (s *Server) handleDuplicateSkill(w http.ResponseWriter, r *http.Request) {
 	rec.CreatedAt = now
 	rec.UpdatedAt = now
 
-	saved, err := s.store.UpsertSkill(r.Context(), rec)
+	saved, err := s.store.CreatePublishedSkill(r.Context(), rec, initialVersion(rec, ""))
 	if err != nil {
 		s.logger.Error("duplicate skill", "error", err)
 		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "failed to duplicate skill"})
