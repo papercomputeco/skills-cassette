@@ -348,6 +348,10 @@ var _ = Describe("Skills handlers", func() {
 		Expect(body).To(HaveKeyWithValue("authorId", "user-dup"))
 		Expect(body).To(HaveKeyWithValue("parentId", "s"))
 		Expect(body["id"]).NotTo(Equal("s"), "the duplicate gets its own opaque id")
+		versions, err := store.ListSkillVersions(context.Background(), body["id"].(string))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(versions).To(HaveLen(1))
+		Expect(versions[0].Semver).To(Equal("0.1.0"))
 
 		// Slug is no longer an identity, so duplicates coexist — a second
 		// duplicate gets another distinct id rather than overwriting the first.
@@ -356,15 +360,22 @@ var _ = Describe("Skills handlers", func() {
 		Expect(second["id"]).NotTo(Equal(body["id"]))
 	})
 
-	It("creates a blank skill from scratch attributed to the caller", func() {
-		srv := newSkillsServer(storage.NewMemoryStore())
+	It("creates and publishes a skill from scratch atomically", func() {
+		store := storage.NewMemoryStore()
+		srv := newSkillsServer(store)
 		body, status := doJSON(srv, http.MethodPost, "/api/skills",
-			`{"name":"My New Skill","description":"d"}`, "user-new")
+			`{"name":"My New Skill","description":"d","content":"# Skill","changelog":"initial"}`, "user-new")
 		Expect(status).To(Equal(http.StatusCreated))
 		Expect(body).To(HaveKeyWithValue("slug", "my-new-skill"))
 		Expect(body).To(HaveKeyWithValue("authorId", "user-new"))
 		Expect(body).To(HaveKeyWithValue("isAiGenerated", false))
 		Expect(body).To(HaveKeyWithValue("originatingSessionIds", BeEmpty()))
+		versions, err := store.ListSkillVersions(context.Background(), body["id"].(string))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(versions).To(HaveLen(1))
+		Expect(versions[0].Semver).To(Equal("0.1.0"))
+		Expect(versions[0].Content).To(Equal("# Skill"))
+		Expect(versions[0].Changelog).To(Equal("initial"))
 	})
 
 	It("deletes a skill for its creator", func() {
@@ -497,6 +508,11 @@ var _ = Describe("Generate skill", func() {
 		rec, err := store.GetSkill(context.Background(), id)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(rec).NotTo(BeNil(), "the generated skill is persisted under its minted id")
+		versions, err := store.ListSkillVersions(context.Background(), id)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(versions).To(HaveLen(1))
+		Expect(versions[0].Semver).To(Equal("0.1.0"))
+		Expect(versions[0].Content).To(Equal("## Steps\n1. Re-run."))
 	})
 
 	It("rejects generate with no sessionIds before touching anything", func() {

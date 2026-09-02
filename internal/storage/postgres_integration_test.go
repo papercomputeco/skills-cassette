@@ -40,7 +40,7 @@ func TestPostgresConditionalPublish(t *testing.T) {
 
 	expected := "# original"
 	_, err = store.PublishSkillVersion(ctx, SkillVersionRecord{
-		SkillID: id, VersionNumber: 1, Semver: "0.1.0", Content: "# revised",
+		SkillID: id, VersionNumber: 2, Semver: "0.1.1", Content: "# revised",
 		ExpectedContent: &expected, PublishedAt: now,
 	})
 	if err != nil {
@@ -50,12 +50,12 @@ func TestPostgresConditionalPublish(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(versions) != 1 || versions[0].ExpectedContent == nil || *versions[0].ExpectedContent != expected {
+	if len(versions) != 2 || versions[0].ExpectedContent == nil || *versions[0].ExpectedContent != expected {
 		t.Fatalf("stored expected content = %#v, want %q", versions, expected)
 	}
 
 	_, err = store.PublishSkillVersion(ctx, SkillVersionRecord{
-		SkillID: id, VersionNumber: 2, Semver: "0.1.1", Content: "# overwrite",
+		SkillID: id, VersionNumber: 3, Semver: "0.1.2", Content: "# overwrite",
 		ExpectedContent: &expected, PublishedAt: now,
 	})
 	if !errors.Is(err, ErrSkillChanged) {
@@ -68,6 +68,67 @@ func TestPostgresConditionalPublish(t *testing.T) {
 	})
 	if !errors.Is(err, ErrSkillChanged) {
 		t.Fatalf("missing-skill publish error = %v, want %v", err, ErrSkillChanged)
+	}
+}
+
+func TestPostgresPublishedCreationRollbackAndBackfill(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx := context.Background()
+	schema := "skills_initial_" + uuid.NewString()[:8]
+	store, err := OpenPostgresStore(ctx, dsn, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_, _ = store.pool.Exec(ctx, fmt.Sprintf("DROP SCHEMA %s CASCADE", quoteIdentifier(schema)))
+		store.Close()
+	}()
+
+	_, err = store.pool.Exec(ctx, fmt.Sprintf(
+		"DROP TRIGGER publish_initial_skill_version ON %s.skills", quoteIdentifier(schema),
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	id := uuid.NewString()
+	_, err = store.UpsertSkill(ctx, SkillRecord{
+		ID: id, Slug: "legacy", Name: "Legacy", Content: "# Legacy",
+		Type: "workflow", Version: "0.1.0", Visibility: "private",
+		CreatedAt: now, UpdatedAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = store.CreatePublishedSkill(ctx, SkillRecord{
+		ID: id, Slug: "duplicate", Name: "Duplicate", CreatedAt: now, UpdatedAt: now,
+	}, SkillVersionRecord{
+		SkillID: id, VersionNumber: 1, Semver: "0.1.0", Content: "# Duplicate", PublishedAt: now,
+	})
+	if err == nil {
+		t.Fatal("duplicate skill creation succeeded")
+	}
+	versions, err := store.ListSkillVersions(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(versions) != 0 {
+		t.Fatalf("rolled-back initial versions = %d, want 0", len(versions))
+	}
+
+	if err := store.migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	versions, err = store.ListSkillVersions(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(versions) != 1 || versions[0].Semver != "0.1.0" || versions[0].Content != "# Legacy" {
+		t.Fatalf("backfilled versions = %#v", versions)
 	}
 }
 

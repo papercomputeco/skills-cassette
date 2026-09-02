@@ -50,10 +50,10 @@ transport requirement on it.
 
 ## Skills and versions
 
-A skill has an editable head and an immutable published history. Editing the head
-changes what the next reader gets; publishing snapshots it as a version that never
-changes afterward. Downloads count against the skill, which is what the
-`sort=downloads` ordering ranks.
+Every created, generated, or duplicated skill starts with an immutable `v0.1.0`
+publication. Editing changes the working head; publishing snapshots it as the next
+version that never changes afterward. Downloads count against the skill, which is
+what the `sort=downloads` ordering ranks.
 
 There is no `org_id` here. Tenancy is gateway-owned, and attribution rides the
 gateway-trusted `x-paper-auth-subject` header — the cassette trusts what the

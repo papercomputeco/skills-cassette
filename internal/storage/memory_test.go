@@ -119,6 +119,22 @@ var _ = Describe("MemoryStore", func() {
 		Expect(page[0].ID).To(Equal("a"))
 	})
 
+	It("creates a skill with its initial version atomically", func() {
+		store := storage.NewMemoryStore()
+		now := time.Now().UTC()
+		skill, err := store.CreatePublishedSkill(ctx, storage.SkillRecord{
+			ID: "s", Slug: "s", Name: "Skill", CreatedAt: now, UpdatedAt: now,
+		}, storage.SkillVersionRecord{
+			SkillID: "s", VersionNumber: 1, Semver: "0.1.0", Content: "# Skill", PublishedAt: now,
+		})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(skill.Content).To(Equal("# Skill"))
+		versions, err := store.ListSkillVersions(ctx, "s")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(versions).To(HaveLen(1))
+		Expect(versions[0].Content).To(Equal("# Skill"))
+	})
+
 	It("refuses publication when the skill is missing", func() {
 		store := storage.NewMemoryStore()
 		_, err := store.PublishSkillVersion(ctx, storage.SkillVersionRecord{

@@ -11,8 +11,8 @@ Paths below are given on the cassette's own listener. Through tapes, replace
 | Route | Purpose |
 | --- | --- |
 | `GET /api/skills` | Paginated list, with search, scopes and sort |
-| `POST /api/skills` | Create a skill authored from scratch |
-| `POST /api/skills/generate` | Generate a skill from nominated sessions |
+| `POST /api/skills` | Create and publish a skill authored from scratch |
+| `POST /api/skills/generate` | Generate and publish a skill from nominated sessions |
 | `GET /api/skills/{id}` | Read one skill |
 | `PUT /api/skills/{id}` | Update the editable head |
 | `DELETE /api/skills/{id}` | Delete, history included |
@@ -47,7 +47,8 @@ session?" and returns the whole answer without paging.
 
 `POST /api/skills/generate`
 
-Takes the session ids to learn from and generates a skill with the configured LLM.
+Takes the session ids to learn from and atomically generates and publishes a
+`v0.1.0` skill with the configured LLM.
 
 | Code | When |
 | --- | --- |
@@ -65,7 +66,8 @@ the last is a deployment error — see [Deploying](./deploying.md).
 
 ## The editable head
 
-`POST /api/skills` creates one from scratch: `201`, or `400` on an invalid body.
+`POST /api/skills` atomically creates one from scratch with its immutable
+`v0.1.0` version: `201`, or `400` on an invalid body.
 
 `GET /api/skills/{id}` reads one: `200`, or `404`.
 
@@ -79,7 +81,8 @@ and may be mutated by anyone.
 The `PUT`, `DELETE`, and publish routes enforce this owner rule from the
 gateway-trusted `x-paper-auth-subject` header.
 
-`POST /api/skills/{id}/duplicate` forks under a fresh id: `201`, or `404`.
+`POST /api/skills/{id}/duplicate` forks under a fresh id and publishes the copy
+as `v0.1.0`: `201`, or `404`.
 
 ## Versions
 

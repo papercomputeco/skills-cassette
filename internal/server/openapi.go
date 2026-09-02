@@ -79,8 +79,8 @@ func openAPIDocument(name string) []byte {
 						jsonResponse("503", "A configured external filter view is missing or unreadable", errorSchema()),
 					)),
 				"post": operation("createSkill", "Create a skill",
-					"Creates a skill authored by hand, as opposed to the generator. The caller "+
-						"supplies the content; nothing is inferred.",
+					"Creates a hand-authored skill and its immutable v0.1.0 publication "+
+						"atomically. The caller supplies the content; nothing is inferred.",
 					name,
 					withRequestBody("Skill to create", createSkillSchema()),
 					withResponses(
@@ -91,9 +91,9 @@ func openAPIDocument(name string) []byte {
 			},
 			prefix + "/generate": map[string]any{
 				"post": operation("generateSkill", "Generate a skill from sessions",
-					"Runs the LLM skill generator over the nominated sessions and persists the "+
-						"result. The client nominates sources and optional hints; the server is "+
-						"authoritative on the skill body.\n\nSource transcripts are read from the "+
+					"Runs the LLM skill generator over the nominated sessions and atomically "+
+						"publishes the result as v0.1.0. The client nominates sources and optional "+
+						"hints; the server is authoritative on the skill body.\n\nSource transcripts are read from the "+
 						"configured Tapes core over its trace API; the cassette holds no core "+
 						"database credential.",
 					name,
@@ -186,8 +186,8 @@ func openAPIDocument(name string) []byte {
 			prefix + "/{id}/duplicate": map[string]any{
 				"parameters": []any{idPathParam("Skill id to duplicate")},
 				"post": operation("duplicateSkill", "Duplicate a skill",
-					"Forks a skill into a new one owned by the caller, with parentId set to the "+
-						"source. The copy starts its own version history; the source is untouched.",
+					"Forks and publishes a skill as v0.1.0 under a new id owned by the caller, "+
+						"with parentId set to the source. The source is untouched.",
 					name,
 					withResponses(
 						jsonResponse("201", "The duplicated skill", skillSchema()),
@@ -441,6 +441,7 @@ func createSkillSchema() map[string]any {
 		"type":        map[string]any{"type": "string", "enum": []string{"workflow", "domain-knowledge", "prompt-template"}},
 		"tags":        stringArrayProp("Free-form tags."),
 		"content":     stringProp("Markdown body."),
+		"changelog":   stringProp("Change note recorded on the initial version."),
 	})
 }
 
