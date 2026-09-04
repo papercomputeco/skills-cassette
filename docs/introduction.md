@@ -5,9 +5,6 @@ sidebar:
   order: 1
 ---
 
-> This page describes the target unified-revision lifecycle proposed in
-> `docs/features/0001-durable-skill-generation`.
-
 `skills-cassette` turns agent-session evidence and author guidance into reusable
 `SKILL.md` documents without treating long model work as one synchronous HTTP
 mutation. Skill identities, immutable revisions, visibility metadata, explicit
@@ -92,8 +89,11 @@ snapshots ranking policy; skills-evaluator owns transcript triage, judge
 execution, normalization, and weighted scoring.
 
 Durable user-requested evaluation targets one exact accessible revision UUID,
-including private revisions. Evaluation history follows that revision's current
-visibility, so private work and its findings remain creator-only.
+including private revisions. Skills-evaluator resolves that revision through
+this cassette's exact revision read with the forwarded viewer subject and never
+re-resolves latest. Evaluation history follows that revision's current
+visibility, so private work and its findings remain creator-only until the
+revision is made public.
 
 Source transcripts come from the configured tenant-local Tapes core over its
 trace API and remain transient bounded inputs. There is no `org_id` column in

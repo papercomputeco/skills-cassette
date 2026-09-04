@@ -1,5 +1,9 @@
 // Package evaluator defines the skills-evaluator cassette boundary used by
-// asynchronous candidate generation.
+// asynchronous candidate generation: the stateless candidate contract this
+// cassette calls with its own rubric. The durable revision contract runs the
+// other way, with skills-evaluator reading exact revisions from this cassette;
+// both are verified against the real applications by
+// scripts/test-skills-evaluator-contract.sh.
 package evaluator
 
 import (
