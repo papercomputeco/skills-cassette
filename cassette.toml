@@ -40,6 +40,12 @@ port = 9998
 core = "v1"
 views = []
 
+# The only database contracts this cassette publishes are the immutable skill
+# and revision identity bridges used by downstream migrations. They intentionally
+# omit revision content and all mutable or authorization-bearing metadata.
+[publishes]
+views = ["skills_contract_v1.skill_identities", "skills_contract_v1.revision_identities"]
+
 # Where the things core needs live on this cassette's own listener. The API is
 # served under /api/skills and core republishes it under /v1/cassettes/skills.
 [api]

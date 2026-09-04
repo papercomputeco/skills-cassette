@@ -18,6 +18,7 @@ import (
 	"github.com/papercomputeco/skills-cassette/internal/evaluator"
 	"github.com/papercomputeco/skills-cassette/internal/server"
 	"github.com/papercomputeco/skills-cassette/internal/storage"
+	"github.com/papercomputeco/skills-cassette/internal/storage/storagetest"
 )
 
 func commit7PostgresDSN() string {
@@ -70,7 +71,7 @@ func runCommit7GenerationHistoryVisibilitySpec() {
 	Expect(err).NotTo(HaveOccurred())
 	DeferCleanup(func() {
 		postgresStore.Close()
-		_, _ = admin.Exec(context.Background(), fmt.Sprintf("DROP SCHEMA IF EXISTS %q CASCADE", schema))
+		_ = storagetest.DropSchema(context.Background(), admin, schema)
 		admin.Close()
 	})
 	fixtures = append(fixtures, fixture{name: "postgres", store: postgresStore})

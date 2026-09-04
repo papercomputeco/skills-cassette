@@ -26,7 +26,7 @@ var _ = Describe("Postgres snapshot migration", func() {
 		pool, err := pgxpool.New(ctx, dsn)
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(func() {
-			_, _ = pool.Exec(context.Background(), fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", quotedSchema))
+			_ = DropPrivateSchema(context.Background(), pool, schema)
 			pool.Close()
 		})
 
@@ -164,7 +164,7 @@ var _ = Describe("Postgres snapshot migration", func() {
 		pool, err := pgxpool.New(ctx, dsn)
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(func() {
-			_, _ = pool.Exec(context.Background(), fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", quotedSchema))
+			_ = DropPrivateSchema(context.Background(), pool, schema)
 			pool.Close()
 		})
 
@@ -302,7 +302,7 @@ var _ = Describe("Postgres snapshot migration", func() {
 		pool, err := pgxpool.New(ctx, dsn)
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(func() {
-			_, _ = pool.Exec(context.Background(), fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", quotedSchema))
+			_ = DropPrivateSchema(context.Background(), pool, schema)
 			pool.Close()
 		})
 
@@ -540,7 +540,7 @@ var _ = Describe("Postgres snapshot migration", func() {
 		mainPool, err := pgxpool.New(ctx, dsn)
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(func() {
-			_, _ = mainPool.Exec(context.Background(), fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", quotedMainSchema))
+			_ = DropPrivateSchema(context.Background(), mainPool, mainSchema)
 			mainPool.Close()
 		})
 		_, err = mainPool.Exec(ctx, fmt.Sprintf(`
@@ -694,7 +694,7 @@ var _ = Describe("Postgres snapshot migration", func() {
 		predecessorStore, err := OpenPostgresStore(ctx, dsn, predecessorSchema)
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(func() {
-			_, _ = predecessorStore.pool.Exec(context.Background(), fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", quotedPredecessorSchema))
+			_ = DropPrivateSchema(context.Background(), predecessorStore.pool, predecessorSchema)
 			predecessorStore.Close()
 		})
 		Expect(removeDurableRevisionTargetForFixture(ctx, predecessorStore)).To(Succeed())
@@ -1298,7 +1298,7 @@ var _ = Describe("Postgres snapshot migration", func() {
 		store, err := OpenPostgresStore(ctx, dsn, schema)
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(func() {
-			_, _ = store.pool.Exec(context.Background(), fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", quotedSchema))
+			_ = DropPrivateSchema(context.Background(), store.pool, schema)
 			store.Close()
 		})
 
@@ -1516,7 +1516,7 @@ var _ = Describe("Postgres snapshot migration", func() {
 		store, err := OpenPostgresStore(ctx, dsn, schema)
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(func() {
-			_, _ = store.pool.Exec(context.Background(), fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", quotedSchema))
+			_ = DropPrivateSchema(context.Background(), store.pool, schema)
 			store.Close()
 		})
 		Expect(removeDurableRevisionTargetForFixture(ctx, store)).To(Succeed())
@@ -1635,7 +1635,7 @@ var _ = Describe("Postgres snapshot migration", func() {
 		store, err := OpenPostgresStore(ctx, dsn, schema)
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(func() {
-			_, _ = store.pool.Exec(context.Background(), fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", quotedSchema))
+			_ = DropPrivateSchema(context.Background(), store.pool, schema)
 			store.Close()
 		})
 		Expect(removeDurableRevisionTargetForFixture(ctx, store)).To(Succeed())
@@ -1813,7 +1813,7 @@ var _ = Describe("Postgres snapshot migration", func() {
 		store, err := OpenPostgresStore(ctx, dsn, schema)
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(func() {
-			_, _ = store.pool.Exec(context.Background(), fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", quotedSchema))
+			_ = DropPrivateSchema(context.Background(), store.pool, schema)
 			store.Close()
 		})
 		Expect(removeDurableRevisionTargetForFixture(ctx, store)).To(Succeed())
@@ -1967,7 +1967,7 @@ var _ = Describe("Postgres snapshot migration", func() {
 		store, err := OpenPostgresStore(ctx, dsn, schema)
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(func() {
-			_, _ = store.pool.Exec(context.Background(), fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", quotedSchema))
+			_ = DropPrivateSchema(context.Background(), store.pool, schema)
 			store.Close()
 		})
 		Expect(removeDurableRevisionTargetForFixture(ctx, store)).To(Succeed())
@@ -2052,7 +2052,7 @@ var _ = Describe("Postgres snapshot migration", func() {
 		store, err := OpenPostgresStore(ctx, dsn, schema)
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(func() {
-			_, _ = store.pool.Exec(context.Background(), fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", quotedSchema))
+			_ = DropPrivateSchema(context.Background(), store.pool, schema)
 			store.Close()
 		})
 		Expect(removeDurableRevisionTargetForFixture(ctx, store)).To(Succeed())
@@ -2136,11 +2136,10 @@ var _ = Describe("Postgres snapshot migration", func() {
 		ctx := context.Background()
 		now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
 		schema := "skills_working_occurrence_" + uuid.NewString()[:8]
-		quotedSchema := quoteIdentifier(schema)
 		store, err := OpenPostgresStore(ctx, dsn, schema)
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(func() {
-			_, _ = store.pool.Exec(context.Background(), fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", quotedSchema))
+			_ = DropPrivateSchema(context.Background(), store.pool, schema)
 			store.Close()
 		})
 		Expect(removeDurableRevisionTargetForFixture(ctx, store)).To(Succeed())
@@ -2221,11 +2220,10 @@ var _ = Describe("Postgres snapshot migration", func() {
 		ctx := context.Background()
 		now := time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC)
 		schema := "skills_head_occurrence_" + uuid.NewString()[:8]
-		quotedSchema := quoteIdentifier(schema)
 		store, err := OpenPostgresStore(ctx, dsn, schema)
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(func() {
-			_, _ = store.pool.Exec(context.Background(), fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", quotedSchema))
+			_ = DropPrivateSchema(context.Background(), store.pool, schema)
 			store.Close()
 		})
 		Expect(removeDurableRevisionTargetForFixture(ctx, store)).To(Succeed())
@@ -2296,11 +2294,10 @@ var _ = Describe("Postgres snapshot migration", func() {
 		ctx := context.Background()
 		now := time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC)
 		schema := "skills_frozen_source_" + uuid.NewString()[:8]
-		quotedSchema := quoteIdentifier(schema)
 		store, err := OpenPostgresStore(ctx, dsn, schema)
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(func() {
-			_, _ = store.pool.Exec(context.Background(), fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", quotedSchema))
+			_ = DropPrivateSchema(context.Background(), store.pool, schema)
 			store.Close()
 		})
 		Expect(removeDurableRevisionTargetForFixture(ctx, store)).To(Succeed())
@@ -2377,7 +2374,7 @@ var _ = Describe("Postgres snapshot migration", func() {
 		store, err := OpenPostgresStore(ctx, dsn, schema)
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(func() {
-			_, _ = store.pool.Exec(context.Background(), fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", quotedSchema))
+			_ = DropPrivateSchema(context.Background(), store.pool, schema)
 			store.Close()
 		})
 

@@ -64,7 +64,7 @@ var _ = storagetest.RevisionStoreContract("postgres", func() storagetest.Revisio
 		},
 		Cleanup: func() {
 			store.Close()
-			_, _ = admin.Exec(context.Background(), "DROP SCHEMA IF EXISTS "+schema+" CASCADE")
+			_ = storagetest.DropSchema(context.Background(), admin, schema)
 			admin.Close()
 		},
 	}
@@ -88,7 +88,7 @@ var _ = storagetest.LifecycleStoreContract("postgres", func() (storagetest.Lifec
 	Expect(err).NotTo(HaveOccurred())
 	return store, func() {
 		store.Close()
-		_, _ = admin.Exec(context.Background(), "DROP SCHEMA IF EXISTS "+schema+" CASCADE")
+		_ = storagetest.DropSchema(context.Background(), admin, schema)
 		admin.Close()
 	}
 }, uuid.NewString)

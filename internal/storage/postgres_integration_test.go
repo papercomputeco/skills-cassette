@@ -32,7 +32,7 @@ func TestPostgresConditionalPublish(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() {
-		_, _ = store.pool.Exec(ctx, fmt.Sprintf("DROP SCHEMA %s CASCADE", quoteIdentifier(schema)))
+		_ = DropPrivateSchema(ctx, store.pool, schema)
 		store.Close()
 	}()
 
@@ -92,7 +92,7 @@ func TestPostgresPublishedCreationRollsBack(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() {
-		_, _ = store.pool.Exec(ctx, fmt.Sprintf("DROP SCHEMA %s CASCADE", quoteIdentifier(schema)))
+		_ = DropPrivateSchema(ctx, store.pool, schema)
 		store.Close()
 	}()
 
@@ -165,7 +165,7 @@ var _ = Describe("Postgres durable revision identities", func() {
 		Expect(err).NotTo(HaveOccurred())
 		now = time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
 		DeferCleanup(func() {
-			_, _ = store.pool.Exec(context.Background(), fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", quoteIdentifier(schema)))
+			_ = DropPrivateSchema(context.Background(), store.pool, schema)
 			store.Close()
 		})
 	})
@@ -1036,7 +1036,7 @@ var _ = Describe("Postgres durable generations", func() {
 		Expect(store.pool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now)).To(Succeed())
 		now = now.UTC()
 		DeferCleanup(func() {
-			_, _ = store.pool.Exec(context.Background(), fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", quoteIdentifier(schema)))
+			_ = DropPrivateSchema(context.Background(), store.pool, schema)
 			store.Close()
 		})
 	})
@@ -2563,8 +2563,8 @@ func TestPostgresExternalAttachmentFilter(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() {
-		_, _ = store.pool.Exec(ctx, fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", quoteIdentifier(fixture)))
-		_, _ = store.pool.Exec(ctx, fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", quoteIdentifier(schema)))
+		_ = DropPrivateSchema(ctx, store.pool, fixture)
+		_ = DropPrivateSchema(ctx, store.pool, schema)
 		store.Close()
 	}()
 
