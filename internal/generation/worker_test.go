@@ -31,6 +31,7 @@ import (
 	"github.com/papercomputeco/skills-cassette/internal/generation"
 	"github.com/papercomputeco/skills-cassette/internal/server"
 	"github.com/papercomputeco/skills-cassette/internal/storage"
+	"github.com/papercomputeco/skills-cassette/internal/storage/storagetest"
 	"github.com/papercomputeco/skills-cassette/pkg/skill"
 )
 
@@ -174,7 +175,7 @@ func openWorkerPostgresFixture(dsn, prefix string) *workerPostgresFixture {
 	fixture := &workerPostgresFixture{store: store, admin: admin, schema: schema}
 	DeferCleanup(func() {
 		store.Close()
-		_, _ = admin.Exec(context.Background(), fmt.Sprintf("DROP SCHEMA IF EXISTS %q CASCADE", schema))
+		_ = storagetest.DropSchema(context.Background(), admin, schema)
 		admin.Close()
 	})
 	return fixture

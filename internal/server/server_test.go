@@ -28,6 +28,7 @@ import (
 	"github.com/papercomputeco/skills-cassette/internal/generation"
 	"github.com/papercomputeco/skills-cassette/internal/server"
 	"github.com/papercomputeco/skills-cassette/internal/storage"
+	"github.com/papercomputeco/skills-cassette/internal/storage/storagetest"
 	"github.com/papercomputeco/skills-cassette/pkg/skill"
 )
 
@@ -328,7 +329,7 @@ var _ = Describe("skill-scoped generation creation", func() {
 			Expect(err).NotTo(HaveOccurred())
 			DeferCleanup(func() {
 				postgresStore.Close()
-				_, _ = admin.Exec(context.Background(), fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", schema))
+				_ = storagetest.DropSchema(context.Background(), admin, schema)
 				admin.Close()
 			})
 			fixtures = append(fixtures, struct {
@@ -682,7 +683,7 @@ var _ = Describe("skill-scoped generation creation", func() {
 			Expect(err).NotTo(HaveOccurred())
 			DeferCleanup(func() {
 				postgresStore.Close()
-				_, _ = admin.Exec(context.Background(), fmt.Sprintf("DROP SCHEMA IF EXISTS %q CASCADE", schema))
+				_ = storagetest.DropSchema(context.Background(), admin, schema)
 				admin.Close()
 			})
 			fixtures = append(fixtures, struct {

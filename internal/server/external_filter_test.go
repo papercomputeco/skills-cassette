@@ -18,6 +18,7 @@ import (
 
 	"github.com/papercomputeco/skills-cassette/internal/server"
 	"github.com/papercomputeco/skills-cassette/internal/storage"
+	"github.com/papercomputeco/skills-cassette/internal/storage/storagetest"
 )
 
 // rawGET issues a request and returns the raw body plus status — for the
@@ -352,8 +353,8 @@ var _ = Describe("external attachment-view filters (Postgres)", func() {
 		if pool == nil {
 			return
 		}
-		_, _ = pool.Exec(ctx, fmt.Sprintf(`DROP SCHEMA IF EXISTS %q CASCADE`, fixture))
-		_, _ = pool.Exec(ctx, fmt.Sprintf(`DROP SCHEMA IF EXISTS %q CASCADE`, schema))
+		_ = storagetest.DropSchema(ctx, pool, fixture)
+		_ = storagetest.DropSchema(ctx, pool, schema)
 		store.Close()
 		pool.Close()
 		pool = nil

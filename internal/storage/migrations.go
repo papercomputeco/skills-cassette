@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // postgresMigration describes the additive DDL, data conversion, verification,
@@ -25,11 +26,104 @@ type postgresMigration struct {
 	contract []string
 }
 
+const (
+	revisionIdentityContractSchema    = "skills_contract_v1"
+	skillIdentityContractView         = "skill_identities"
+	revisionIdentityContractView      = "revision_identities"
+	publishedIdentityContractReadRole = "tapes_published_readers"
+)
+
 // migrate upgrades the cassette-owned schema while serializing concurrent
 // cassette startups with a schema-scoped advisory transaction lock. Every
 // statement is idempotent because installations can jump directly from any
 // previously shipped schema to the current shape.
-func (s *PostgresStore) migrate(ctx context.Context) (err error) {
+// migrate runs the cassette's migration to completion. Every attempt is one
+// transaction; a Postgres deadlock report (40P01) rolls it back and retries
+// under bounded backoff, because deadlock detection is the server's normal
+// answer to a lock-order inversion caused by a session this process does not
+// control -- an operator's manual DDL, or a CASCADE from tooling touching the
+// published contract views -- and the transaction is safe to replay.
+func (s *PostgresStore) migrate(ctx context.Context) error {
+	return retryMigration(ctx, migrationDeadlockAttempts, migrationDeadlockBackoff, s.migrateOnce)
+}
+
+const (
+	pgDeadlockDetected        = "40P01"
+	migrationDeadlockAttempts = 3
+	migrationDeadlockBackoff  = 100 * time.Millisecond
+)
+
+// retryMigration runs one attempt at a time and replays it only after a
+// deadlock report, waiting attempt*backoff between tries. Any other error, a
+// canceled context, or exhausting attempts returns the last error unchanged.
+func retryMigration(ctx context.Context, attempts int, backoff time.Duration, run func(context.Context) error) error {
+	if attempts < 1 {
+		attempts = 1
+	}
+	var err error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		err = run(ctx)
+		if err == nil || !isMigrationDeadlock(err) || attempt == attempts {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(time.Duration(attempt) * backoff):
+		}
+	}
+	return err
+}
+
+// isMigrationDeadlock reports whether err carries Postgres SQLSTATE 40P01.
+func isMigrationDeadlock(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == pgDeadlockDetected
+}
+
+// PublishedContractLockKey is the advisory-lock key expression guarding the
+// published skills_contract_v1 views. The views are defined over whichever
+// private schema migrated last, so every session that creates, replaces, or
+// drops anything they depend on -- a migration's contract phase, or a DROP
+// SCHEMA ... CASCADE of a private schema -- must hold this key first, with
+// pg_advisory_xact_lock or pg_advisory_lock. One shared expression keeps the
+// producers and the droppers from drifting onto different keys.
+const PublishedContractLockKey = "pg_catalog.hashtextextended('skills_contract_v1', 0)"
+
+const publishedContractXactLockStatement = "SELECT pg_catalog.pg_advisory_xact_lock(" + PublishedContractLockKey + ")"
+
+// SchemaDropper is the transaction capability DropPrivateSchema needs; a
+// *pgxpool.Pool and a *pgx.Conn both satisfy it.
+type SchemaDropper interface {
+	Begin(ctx context.Context) (pgx.Tx, error)
+}
+
+// DropPrivateSchema drops one private cassette schema and everything in it
+// while holding the published-contract advisory lock in the same transaction.
+// The skills_contract_v1 views depend on the last-migrated private schema, so
+// a bare DROP SCHEMA ... CASCADE takes AccessExclusive locks on those views
+// without the lock; against a concurrent migration that holds the lock and is
+// replacing the same views, Postgres reports a deadlock in one of the two
+// sessions. Taking the lock first serializes the drop behind that migration.
+func DropPrivateSchema(ctx context.Context, executor SchemaDropper, schema string) error {
+	tx, err := executor.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin drop schema %s: %w", schema, err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if _, err := tx.Exec(ctx, publishedContractXactLockStatement); err != nil {
+		return fmt.Errorf("lock published contract before dropping %s: %w", schema, err)
+	}
+	if _, err := tx.Exec(ctx, "DROP SCHEMA IF EXISTS "+quoteIdentifier(schema)+" CASCADE"); err != nil {
+		return fmt.Errorf("drop schema %s: %w", schema, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit drop schema %s: %w", schema, err)
+	}
+	return nil
+}
+
+func (s *PostgresStore) migrateOnce(ctx context.Context) (err error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return fmt.Errorf("begin skills migration: %w", err)
@@ -506,7 +600,7 @@ func executePostgresMigration(ctx context.Context, tx pgx.Tx, migration postgres
 func (s *PostgresStore) durableRevisionIdentityMigration() postgresMigration {
 	schema := quoteIdentifier(s.schema)
 	var expectations *durableRevisionMigrationExpectations
-	return postgresMigration{
+	migration := postgresMigration{
 		name: "durable-skill-revision-identities",
 		expand: []string{
 			fmt.Sprintf(`ALTER TABLE %s.skills
@@ -708,6 +802,68 @@ func (s *PostgresStore) durableRevisionIdentityMigration() postgresMigration {
 			migrationCompositeForeignKeyStatement(s.schema, "skill_generations", "skill_generations_same_generation_result_revision_fkey",
 				[]string{"id", "result_revision_id"}, "skill_revisions", []string{"generation_id", "id"}),
 		},
+	}
+	migration.contract = append(migration.contract, publishedIdentityContractStatements(schema)...)
+	return migration
+}
+
+// publishedIdentityContractStatements creates the fixed public bridge from the
+// configured private schema. The additional lock serializes independent store
+// migrations because their ordinary advisory lock is intentionally schema-local.
+func publishedIdentityContractStatements(quotedPrivateSchema string) []string {
+	return []string{
+		publishedContractXactLockStatement,
+		`CREATE SCHEMA IF NOT EXISTS ` + quoteIdentifier(revisionIdentityContractSchema),
+		fmt.Sprintf(`CREATE OR REPLACE VIEW %s.%s
+			WITH (security_invoker = false) AS
+			SELECT identity.id AS predecessor_skill_id,
+			       COALESCE(identity.migration_alias_of_skill_id, identity.id) AS skill_id
+			FROM %s.skills AS identity`,
+			quoteIdentifier(revisionIdentityContractSchema), quoteIdentifier(skillIdentityContractView), quotedPrivateSchema),
+		fmt.Sprintf(`CREATE OR REPLACE VIEW %s.%s
+			WITH (security_invoker = false) AS
+			SELECT revision.skill_id,
+			       revision.id AS revision_id,
+			       CASE
+			         WHEN predecessor.id IS NOT NULL
+			          AND legacy.parts[2]::BIGINT <= 2147483647
+			         THEN predecessor.id
+			         ELSE NULL::UUID
+			       END AS predecessor_skill_id,
+			       CASE
+			         WHEN predecessor.id IS NOT NULL
+			          AND legacy.parts[2]::BIGINT <= 2147483647
+			         THEN legacy.parts[2]::INT
+			         ELSE NULL::INT
+			       END AS predecessor_version_number
+			FROM %s.skill_revisions AS revision
+			LEFT JOIN LATERAL pg_catalog.regexp_match(
+				 revision.legacy_reference,
+				 '^skill-version:([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}):([1-9][0-9]{0,9})$'
+			) AS legacy(parts) ON TRUE
+			LEFT JOIN %s.skills AS predecessor
+			  ON predecessor.id = legacy.parts[1]::UUID
+			 AND COALESCE(predecessor.migration_alias_of_skill_id, predecessor.id) = revision.skill_id`,
+			quoteIdentifier(revisionIdentityContractSchema), quoteIdentifier(revisionIdentityContractView),
+			quotedPrivateSchema, quotedPrivateSchema),
+		fmt.Sprintf(`DO $migration$
+		BEGIN
+			IF EXISTS (
+				SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = '%s'
+			) THEN
+				GRANT USAGE ON SCHEMA %s TO %s;
+				GRANT SELECT ON %s.%s, %s.%s TO %s;
+				ALTER DEFAULT PRIVILEGES IN SCHEMA %s
+					GRANT SELECT ON TABLES TO %s;
+			END IF;
+		END
+		$migration$`,
+			publishedIdentityContractReadRole,
+			quoteIdentifier(revisionIdentityContractSchema), quoteIdentifier(publishedIdentityContractReadRole),
+			quoteIdentifier(revisionIdentityContractSchema), quoteIdentifier(skillIdentityContractView),
+			quoteIdentifier(revisionIdentityContractSchema), quoteIdentifier(revisionIdentityContractView),
+			quoteIdentifier(publishedIdentityContractReadRole),
+			quoteIdentifier(revisionIdentityContractSchema), quoteIdentifier(publishedIdentityContractReadRole)),
 	}
 }
 

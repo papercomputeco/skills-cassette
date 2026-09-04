@@ -63,6 +63,16 @@ func manifestTableNames(raw map[string]any) []string {
 	return names
 }
 
+func manifestPublishedViewNames(raw map[string]any) []string {
+	encoded, err := json.Marshal(raw["publishes"])
+	Expect(err).NotTo(HaveOccurred())
+	var publishes struct {
+		Views []string `json:"views"`
+	}
+	Expect(json.Unmarshal(encoded, &publishes)).To(Succeed())
+	return publishes.Views
+}
+
 type publishedIntegerBound struct {
 	Default int
 	Minimum int
@@ -334,6 +344,14 @@ var _ = Describe("unified revision manifest and route surface", func() {
 		}
 		Expect(manifestTableNames(authoredRaw)).To(Equal(unifiedTables))
 		Expect(manifestTableNames(embeddedRaw)).To(Equal(unifiedTables))
+		publishedViews := []string{
+			"skills_contract_v1.skill_identities",
+			"skills_contract_v1.revision_identities",
+		}
+		Expect(manifestPublishedViewNames(authoredRaw)).To(Equal(publishedViews))
+		Expect(manifestPublishedViewNames(embeddedRaw)).To(Equal(publishedViews))
+		Expect(authored.GrantPlan().CoreSelects).To(ConsistOf(publishedViews))
+		Expect(embedded.GrantPlan().CoreSelects).To(ConsistOf(publishedViews))
 		for _, predecessor := range []string{
 			"skill_versions", "skill_drafts", "draft_sessions", "draft_revisions", "publications",
 		} {

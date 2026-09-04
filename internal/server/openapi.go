@@ -55,6 +55,10 @@ func manifest(name string) map[string]any {
 			"port":  9998,
 		},
 		"depends": map[string]any{"core": "v1", "views": []string{}},
+		"publishes": map[string]any{"views": []string{
+			"skills_contract_v1.skill_identities",
+			"skills_contract_v1.revision_identities",
+		}},
 		"api": map[string]any{
 			"health": "/ping", "openapi": "/openapi", "prefix_path": "api",
 		},
