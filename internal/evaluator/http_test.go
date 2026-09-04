@@ -220,6 +220,51 @@ var _ = Describe("candidate evaluator HTTP adapter", func() {
 		}
 	})
 
+	It("accepts the evaluator's echoed revision ref fields as bounded opaque strings", func() {
+		request := evaluator.CandidateEvaluationRequest{
+			Ref: "generation-9/candidate-1", Profile: evaluator.GenerationCandidateProfile, ProfileVersion: "1",
+			Criteria: []evaluator.Criterion{{ID: "safe", Kind: "content", Description: "Remain safe.", Weight: 1}},
+		}
+		var received map[string]any
+		evaluateWithRef := func(ref string) error {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				Expect(json.NewDecoder(r.Body).Decode(&received)).To(Succeed())
+				_, writeErr := fmt.Fprintf(w, `{
+					"ref":%s,
+					"profile":"generation-candidate-v1","profile_version":"1","evaluator_version":"v1",
+					"score":0.8,"decision":"pass",
+					"criterion_results":[{"criterion_id":"safe","weight":1,"passed":true,"rationale":"ok"}],
+					"findings":[],"strengths":[]}`, ref)
+				Expect(writeErr).NotTo(HaveOccurred())
+			}))
+			defer server.Close()
+			_, err := evaluator.NewHTTPClient(server.URL, server.Client()).EvaluateCandidate(context.Background(), request)
+			return err
+		}
+
+		Expect(evaluateWithRef(`{"source":"skills-cassette","id":"generation-9/candidate-1","revision":"","revision_sha256":""}`)).To(Succeed(),
+			"the evaluator echoes its whole ref record, including empty durable-revision fields")
+		Expect(evaluateWithRef(`{"source":"skills-cassette","id":"generation-9/candidate-1","revision":"opaque-revision","revision_sha256":"` +
+			strings.Repeat("a", 64) + `"}`)).To(Succeed())
+		Expect(evaluateWithRef(`{"source":"skills-cassette","id":"generation-9/candidate-1"}`)).To(Succeed())
+		requestRef := received["ref"].(map[string]any)
+		Expect(requestRef).To(Equal(map[string]any{"source": "skills-cassette", "id": "generation-9/candidate-1"}),
+			"candidate evaluation requests identify work by source and id only")
+
+		for _, invalid := range []string{
+			`{"source":"skills-cassette","id":"generation-9/candidate-1","revision":"` + strings.Repeat("界", 257) + `"}`,
+			`{"source":"skills-cassette","id":"generation-9/candidate-1","revision_sha256":"sha\n256"}`,
+			`{"source":"skills-cassette","id":"other","revision":"","revision_sha256":""}`,
+			`{"source":"other","id":"generation-9/candidate-1","revision":"","revision_sha256":""}`,
+			`{"source":"skills-cassette","id":"generation-9/candidate-1","unknown":""}`,
+		} {
+			var callError *evaluator.CallError
+			Expect(errors.As(evaluateWithRef(invalid), &callError)).To(BeTrue(), invalid)
+			Expect(callError.Code).To(Equal("evaluator_invalid_response"), invalid)
+			Expect(callError.Retryable).To(BeFalse())
+		}
+	})
+
 	It("strictly validates and canonicalizes evaluator-owned detail JSON", func() {
 		request := evaluator.CandidateEvaluationRequest{
 			Ref: "strict", Profile: evaluator.GenerationCandidateProfile, ProfileVersion: "1",

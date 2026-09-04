@@ -45,6 +45,7 @@ const (
 	maxEvaluatorStrengths         = 50
 	maxEvaluatorTextBytes         = 4000
 	maxEvaluatorVersionCodePoints = 256
+	maxEvaluatorRefCodePoints     = 256
 )
 
 // HTTPClient translates the internal candidate-evaluation domain into the
@@ -161,6 +162,8 @@ func invalidResponseError() error {
 
 func translateEvaluationResponse(wire candidateEvaluationResponseWire, request CandidateEvaluationRequest) (CandidateEvaluation, error) {
 	if wire.Ref.Source != "skills-cassette" || wire.Ref.ID != request.Ref ||
+		!validEvaluatorIdentity(wire.Ref.Revision, maxEvaluatorRefCodePoints) ||
+		!validEvaluatorIdentity(wire.Ref.RevisionSHA256, maxEvaluatorRefCodePoints) ||
 		wire.Profile != request.Profile || wire.ProfileVersion != request.ProfileVersion ||
 		wire.Profile == "" || wire.ProfileVersion == "" || !validEvaluatorVersion(wire.EvaluatorVersion) {
 		return CandidateEvaluation{}, errors.New("missing or invalid evaluator identity")
@@ -413,9 +416,15 @@ func nonNilStrings(values []string) []string {
 	return values
 }
 
+// evaluationRefWire is the evaluator's opaque correlation record. Candidate
+// evaluation identifies work by source and id only; the evaluator echoes the
+// whole record, including the durable-revision fields it also carries, so those
+// are accepted as bounded opaque strings and never interpreted.
 type evaluationRefWire struct {
-	Source string `json:"source"`
-	ID     string `json:"id"`
+	Source         string `json:"source"`
+	ID             string `json:"id"`
+	Revision       string `json:"revision,omitempty"`
+	RevisionSHA256 string `json:"revision_sha256,omitempty"`
 }
 
 type candidateBundleWire struct {
