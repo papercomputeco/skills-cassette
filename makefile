@@ -57,7 +57,7 @@ test: ## Runs tests through Dagger.
 	dagger call test
 
 .PHONY: test-skills-evaluator-contract
-test-skills-evaluator-contract: ## Runs the real skills-cassette to skills-evaluator HTTP contract.
+test-skills-evaluator-contract: ## Runs the real skills-cassette and skills-evaluator candidate and revision HTTP contracts.
 	$(call print-target)
 	./scripts/test-skills-evaluator-contract.sh
 

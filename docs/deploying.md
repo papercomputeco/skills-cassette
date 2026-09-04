@@ -5,9 +5,6 @@ sidebar:
   order: 3
 ---
 
-> Storage and migration details below describe the target unified-revision
-> lifecycle in `docs/features/0001-durable-skill-generation`.
-
 Tapes does not start cassettes. A deployment starts the process, supplies its
 configuration and credentials, and tells Tapes where to fetch its OpenAPI
 document.
@@ -99,8 +96,11 @@ generation_sessions
 generation_candidates
 candidate_evaluations
 generation_diagnostics
-revision_evaluations
 ```
+
+Durable user-requested evaluation history is owned by skills-evaluator and keyed
+by revision UUID; this cassette stores only the bounded candidate judgments a
+generation produced.
 
 `skills.latest_revision_id` is nullable and references `skill_revisions.id`.
 Revision content/provenance rows are immutable; visibility/audit metadata is
@@ -130,6 +130,20 @@ Without `TAPES_DATABASE_URL`, the cassette uses a non-durable in-memory store.
 That supports local development but loses skill identities, revisions,
 generations, and artifacts on restart. It must not be used where recovery or
 history matters.
+
+## Verifying the evaluator contract
+
+```bash
+make test-skills-evaluator-contract
+```
+
+The target starts this cassette's server binary with the in-memory store and
+generation disabled, then the skills-evaluator FastAPI application behind its
+deterministic test-only judge, pointed at that live cassette. It proves the
+stateless candidate contract and the exact-revision contract (private and public
+targets, latest never substituted, run visibility following the revision) over
+real HTTP with no mock of either service. It needs a sibling `skills-evaluator`
+checkout (or `SKILLS_EVALUATOR_DIR`) with `direnv` and `uv` available.
 
 ## Pointing Tapes at the cassette
 

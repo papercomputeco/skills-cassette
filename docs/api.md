@@ -5,10 +5,6 @@ sidebar:
   order: 2
 ---
 
-> This page describes the target unified-revision contract in
-> `docs/features/0001-durable-skill-generation`. Until its implementation plan is
-> complete, the branch may still contain predecessor draft/publication handlers.
-
 Paths below are on the cassette's own listener. Through Tapes, replace
 `/api/skills` with `/v1/cassettes/skills`.
 
@@ -133,7 +129,6 @@ Configured external attachment filters remain fail-closed after arming.
 {
   "basedOnRevisionId": "revision-uuid-or-null",
   "snapshot": {
-    "slug": "diagnose-flaky-tests",
     "name": "Diagnose flaky tests",
     "description": "Use when a test fails intermittently.",
     "type": "workflow",
@@ -148,8 +143,9 @@ Configured external attachment filters remain fail-closed after arming.
 ```
 
 The server assigns revision UUID, sequence, version, creator, timestamps, and
-private visibility. `basedOnRevisionId` may name any accessible revision in the
-same skill. Concurrent saves from one base all succeed with distinct sequences.
+private visibility. The snapshot carries no slug: slug is stable skill identity
+metadata resolved once by `POST /api/skills`. `basedOnRevisionId` may name any
+accessible revision in the same skill. Concurrent saves from one base all succeed with distinct sequences.
 The original remains unchanged.
 
 `sourceRevisionId` is used instead of `basedOnRevisionId` for a cross-skill
@@ -223,6 +219,35 @@ skills-evaluator. Skills-cassette deterministically ranks persisted results.
 Successful completion appends exactly one new private revision and returns its
 `resultRevisionId`. It never makes that revision public or latest. Cancellation
 retains artifacts and fences late worker writes.
+
+## Evaluation contracts
+
+Two evaluator contracts cross the boundary with skills-evaluator, in opposite
+directions.
+
+Stateless candidate judgment is a call from this cassette to
+`/v1/cassettes/skills-evaluator/candidate-evaluations`. The request carries the
+complete rendered candidate (and optional baseline), the immutable
+profile/version/criteria snapshot stored on the generation, author context, and
+explicit evidence session order; the creator subject travels only in the
+trusted header. The evaluator echoes the request `ref` verbatim. Its `ref`
+record also carries `revision` and `revision_sha256`, which candidate work never
+sets; the adapter accepts them as bounded opaque strings and still requires
+`source` and `id` to match. Nothing about a candidate evaluation is persisted by
+skills-evaluator.
+
+Durable user-requested evaluation is a call to skills-evaluator naming
+`skill_id` and an exact `skill_revision_id`. Skills-evaluator resolves that
+revision through `GET /api/skills/{skillId}/revisions/{revisionId}` (via the
+Tapes prefix) with the forwarded viewer subject, judges that immutable snapshot
+whether private or public, and persists the revision UUID on the run. It never
+re-resolves latest: an explicit candidate whose content differs from the named
+revision is a conflict. Evaluation-run reads re-check the live revision the same
+way, so runs are creator-only while the revision is private and
+organization-visible while it is public.
+
+Both contracts are verified against the real HTTP applications by
+`make test-skills-evaluator-contract`.
 
 ## Errors
 
