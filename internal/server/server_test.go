@@ -309,10 +309,18 @@ var _ = Describe("skill-scoped generation creation", func() {
 
 		memoryStore := storage.NewMemoryStore()
 		DeferCleanup(memoryStore.Close)
-		fixtures := []struct {
+		// Each fixture samples the clock its store stamps records with. The
+		// Postgres store reads created_at from clock_timestamp() inside the
+		// creation transaction, so bounding it with host time would only hold
+		// while the database (for example a Docker VM) clock agrees with the host.
+		type generationCreationFixture struct {
 			name  string
 			store generationCreationTestStore
-		}{{name: "memory", store: memoryStore}}
+			now   func() time.Time
+		}
+		fixtures := []generationCreationFixture{{
+			name: "memory", store: memoryStore, now: func() time.Time { return time.Now().UTC() },
+		}}
 
 		dsn := os.Getenv("TEST_POSTGRES_DSN")
 		if dsn == "" {
@@ -332,10 +340,14 @@ var _ = Describe("skill-scoped generation creation", func() {
 				_ = storagetest.DropSchema(context.Background(), admin, schema)
 				admin.Close()
 			})
-			fixtures = append(fixtures, struct {
-				name  string
-				store generationCreationTestStore
-			}{name: "postgres", store: postgresStore})
+			fixtures = append(fixtures, generationCreationFixture{
+				name: "postgres", store: postgresStore,
+				now: func() time.Time {
+					var now time.Time
+					Expect(admin.QueryRow(context.Background(), `SELECT clock_timestamp()`).Scan(&now)).To(Succeed())
+					return now.UTC()
+				},
+			})
 		}
 
 		for _, fixture := range fixtures {
@@ -460,12 +472,12 @@ var _ = Describe("skill-scoped generation creation", func() {
 				Expect(state.Diagnostics).To(BeEmpty())
 			})
 
-			requestStartedAt := time.Now().UTC()
+			requestStartedAt := fixture.now()
 			request := httptest.NewRequest(http.MethodPost, "/api/skills/"+target.ID+"/generations", bytes.NewReader(requestBody)).WithContext(requestContext)
 			request.Header.Set("Content-Type", "application/json")
 			request.Header.Set(authSubjectHeader, creator)
 			newSkillsServer(fixture.store).Handler().ServeHTTP(recorder, request)
-			requestFinishedAt := time.Now().UTC()
+			requestFinishedAt := fixture.now()
 
 			Expect(request.Context().Err()).To(MatchError(context.Canceled), "the response writer must cancel the request after accepting durable work")
 			Expect(recorder.headerWrites).To(Equal(1))
