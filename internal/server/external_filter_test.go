@@ -30,9 +30,9 @@ func rawGET(srv *server.Server, path string) (string, int) {
 }
 
 // externalFilterStore wraps another Store so the unit specs can arm (or
-// refuse) the startup probe and observe exactly what list options the handler
-// threads through. Delegated lists strip the external filters first — the
-// in-memory store deliberately refuses them.
+// refuse) the startup probe and observe exactly what effective-list options
+// the handler threads through. Delegated reads strip the external filters
+// first — the in-memory store deliberately refuses them.
 type externalFilterStore struct {
 	storage.Store
 	probeErr error
@@ -41,9 +41,9 @@ type externalFilterStore struct {
 	probeFn  func(ctx context.Context, view string) error
 	listErr  error
 	countErr error
-	lastOpts *storage.SkillListOpts
+	lastOpts *storage.EffectiveSkillListOpts
 	// lastCountOpts records what the handler threads into the totals query.
-	lastCountOpts *storage.SkillCountOpts
+	lastCountOpts *storage.EffectiveSkillCountOpts
 }
 
 func (s *externalFilterStore) ProbeExternalView(ctx context.Context, view string) error {
@@ -53,27 +53,67 @@ func (s *externalFilterStore) ProbeExternalView(ctx context.Context, view string
 	return s.probeErr
 }
 
-func (s *externalFilterStore) ListSkills(ctx context.Context, opts storage.SkillListOpts) ([]storage.SkillRecord, error) {
+func externalFilterSkillReader(store storage.Store) (storage.SkillReader, error) {
+	reader, ok := store.(storage.SkillReader)
+	if !ok {
+		return nil, fmt.Errorf("test store %T does not implement SkillReader", store)
+	}
+	return reader, nil
+}
+
+func (s *externalFilterStore) ResolveEffectiveRevision(ctx context.Context, opts storage.EffectiveRevisionReadOpts) (*storage.AccessibleRevisionRecord, error) {
+	reader, err := externalFilterSkillReader(s.Store)
+	if err != nil {
+		return nil, err
+	}
+	return reader.ResolveEffectiveRevision(ctx, opts)
+}
+
+func (s *externalFilterStore) GetEffectiveSkill(ctx context.Context, opts storage.EffectiveSkillReadOpts) (*storage.EffectiveSkillRecord, error) {
+	reader, err := externalFilterSkillReader(s.Store)
+	if err != nil {
+		return nil, err
+	}
+	return reader.GetEffectiveSkill(ctx, opts)
+}
+
+func (s *externalFilterStore) ListEffectiveSkills(ctx context.Context, opts storage.EffectiveSkillListOpts) ([]storage.EffectiveSkillRecord, error) {
 	captured := opts
 	s.lastOpts = &captured
 	if s.listErr != nil {
 		return nil, s.listErr
 	}
-	stripped := opts
-	stripped.External = nil
-	return s.Store.ListSkills(ctx, stripped)
+	reader, err := externalFilterSkillReader(s.Store)
+	if err != nil {
+		return nil, err
+	}
+	opts.External = nil
+	return reader.ListEffectiveSkills(ctx, opts)
 }
 
-func (s *externalFilterStore) CountSkills(ctx context.Context, opts storage.SkillCountOpts) (storage.SkillCounts, error) {
+func (s *externalFilterStore) CountEffectiveSkills(ctx context.Context, opts storage.EffectiveSkillCountOpts) (storage.SkillCounts, error) {
 	captured := opts
 	s.lastCountOpts = &captured
 	if s.countErr != nil {
 		return storage.SkillCounts{}, s.countErr
 	}
-	stripped := opts
-	stripped.External = nil
-	return s.Store.CountSkills(ctx, stripped)
+	reader, err := externalFilterSkillReader(s.Store)
+	if err != nil {
+		return storage.SkillCounts{}, err
+	}
+	opts.External = nil
+	return reader.CountEffectiveSkills(ctx, opts)
 }
+
+func (s *externalFilterStore) ListEffectiveSkillsBySession(ctx context.Context, opts storage.EffectiveSkillSessionListOpts) ([]storage.EffectiveSkillRecord, error) {
+	reader, err := externalFilterSkillReader(s.Store)
+	if err != nil {
+		return nil, err
+	}
+	return reader.ListEffectiveSkillsBySession(ctx, opts)
+}
+
+var _ storage.SkillReader = (*externalFilterStore)(nil)
 
 var _ = Describe("external attachment-view filters", func() {
 	// The param name and view name below are deployment-supplied VALUES from
@@ -216,10 +256,13 @@ var _ = Describe("external attachment-view filters (Postgres)", func() {
 	BeforeEach(func() {
 		dsn := os.Getenv("TEST_POSTGRES_DSN")
 		if dsn == "" {
+			dsn = os.Getenv("TAPES_TEST_POSTGRES_DSN")
+		}
+		if dsn == "" {
 			dsn = os.Getenv("TEST_DATABASE_URL")
 		}
 		if dsn == "" {
-			Skip("TEST_POSTGRES_DSN / TEST_DATABASE_URL is not set")
+			Skip("TEST_POSTGRES_DSN / TAPES_TEST_POSTGRES_DSN / TEST_DATABASE_URL is not set")
 		}
 		ctx = context.Background()
 
@@ -252,16 +295,33 @@ var _ = Describe("external attachment-view filters (Postgres)", func() {
 		}
 
 		now := time.Now().UTC().Truncate(time.Microsecond)
-		skillA, skillB, skillC = uuid.NewString(), uuid.NewString(), uuid.NewString()
-		for i, id := range []string{skillA, skillB, skillC} {
-			_, err := store.UpsertSkill(ctx, storage.SkillRecord{
-				ID: id, Slug: fmt.Sprintf("skill-%d", i), Name: fmt.Sprintf("Skill %d", i),
-				Type: "workflow", Version: "0.1.0", Visibility: "private",
-				CreatedAt: now.Add(time.Duration(i) * time.Second),
-				UpdatedAt: now.Add(time.Duration(i) * time.Second),
+		stableIDs := make([]string, 0, 3)
+		for i := range 3 {
+			createdAt := now.Add(time.Duration(i) * time.Second)
+			identity, resolveErr := store.ResolveSkill(ctx, storage.ResolveSkillInput{
+				ID: uuid.NewString(), Slug: fmt.Sprintf("skill-%d", i),
+				CreatorSubject: "fixture-owner", CreatedAt: createdAt,
 			})
-			Expect(err).NotTo(HaveOccurred())
+			Expect(resolveErr).NotTo(HaveOccurred())
+			revision, appendErr := store.AppendRevision(ctx, storage.AppendRevisionInput{
+				ID: uuid.NewString(), SkillID: identity.ID, CreatorSubject: "fixture-owner",
+				Origin: storage.RevisionOriginManual,
+				Snapshot: storage.SkillRevisionSnapshot{
+					Name: fmt.Sprintf("Skill %d", i), Description: "Public filter fixture",
+					Type: "workflow", Tags: []string{}, Content: fmt.Sprintf("# Skill %d", i),
+					SourceSessionIDs: []string{},
+				},
+				IdempotencyKey: fmt.Sprintf("fixture-revision-%d", i), CreatedAt: createdAt.Add(time.Millisecond),
+			})
+			Expect(appendErr).NotTo(HaveOccurred())
+			_, visibilityErr := store.SetRevisionVisibility(ctx, storage.SetRevisionVisibilityInput{
+				SkillID: identity.ID, RevisionID: revision.ID, CallerSubject: "fixture-owner",
+				IsPublic: true, ChangedAt: createdAt.Add(2 * time.Millisecond),
+			})
+			Expect(visibilityErr).NotTo(HaveOccurred())
+			stableIDs = append(stableIDs, identity.ID)
 		}
+		skillA, skillB, skillC = stableIDs[0], stableIDs[1], stableIDs[2]
 
 		// Attachment rows are fixture DATA: values arrive pre-folded, the way
 		// the view contract defines them.
@@ -331,15 +391,15 @@ var _ = Describe("external attachment-view filters (Postgres)", func() {
 		body, status = doJSON(srv, http.MethodGet, "/api/skills?label=no_such_value", "", "")
 		Expect(status).To(Equal(http.StatusOK))
 		Expect(ids(body)).To(BeEmpty())
-		Expect(body).NotTo(HaveKey("next_cursor"))
+		Expect(body).NotTo(HaveKey("nextCursor"))
 
 		// The filter composes with keyset pagination: page through the two
-		// matches one row at a time.
+		// stable skill cards one at a time.
 		body, status = doJSON(srv, http.MethodGet, "/api/skills?label=alpha&limit=1", "", "")
 		Expect(status).To(Equal(http.StatusOK))
 		firstPage := ids(body)
 		Expect(firstPage).To(HaveLen(1))
-		cursor, _ := body["next_cursor"].(string)
+		cursor, _ := body["nextCursor"].(string)
 		Expect(cursor).NotTo(BeEmpty())
 		body, status = doJSON(srv, http.MethodGet, "/api/skills?label=alpha&limit=1&cursor="+cursor, "", "")
 		Expect(status).To(Equal(http.StatusOK))
@@ -417,10 +477,13 @@ var _ = Describe("external attachment-view filters (Postgres)", func() {
 
 		// The totals query classifies the breakage the same way: the typed
 		// error, never counts computed as if the filter were not configured.
-		_, err = store.CountSkills(ctx, storage.SkillCountOpts{
-			External: []storage.ExternalAttachmentFilter{{
-				View: fixture + ".attachments", TypeValue: "skill", Values: []string{"alpha"},
-			}},
+		_, err = store.CountEffectiveSkills(ctx, storage.EffectiveSkillCountOpts{
+			SkillCountOpts: storage.SkillCountOpts{
+				External: []storage.ExternalAttachmentFilter{{
+					View: fixture + ".attachments", TypeValue: "skill", Values: []string{"alpha"},
+				}},
+			},
+			CallerSubject: "viewer",
 		})
 		Expect(err).To(MatchError(storage.ErrExternalViewUnavailable))
 	})
@@ -530,23 +593,55 @@ func (s *reprobeStore) ProbeExternalView(ctx context.Context, view string) error
 	return nil
 }
 
-func (s *reprobeStore) ListSkills(ctx context.Context, opts storage.SkillListOpts) ([]storage.SkillRecord, error) {
+func (s *reprobeStore) ResolveEffectiveRevision(ctx context.Context, opts storage.EffectiveRevisionReadOpts) (*storage.AccessibleRevisionRecord, error) {
+	reader, err := externalFilterSkillReader(s.Store)
+	if err != nil {
+		return nil, err
+	}
+	return reader.ResolveEffectiveRevision(ctx, opts)
+}
+
+func (s *reprobeStore) GetEffectiveSkill(ctx context.Context, opts storage.EffectiveSkillReadOpts) (*storage.EffectiveSkillRecord, error) {
+	reader, err := externalFilterSkillReader(s.Store)
+	if err != nil {
+		return nil, err
+	}
+	return reader.GetEffectiveSkill(ctx, opts)
+}
+
+func (s *reprobeStore) ListEffectiveSkills(ctx context.Context, opts storage.EffectiveSkillListOpts) ([]storage.EffectiveSkillRecord, error) {
 	s.mu.Lock()
 	s.lastExternal = opts.External
 	if len(opts.External) > 0 {
 		s.sawExternal = true
 	}
 	s.mu.Unlock()
-	stripped := opts
-	stripped.External = nil
-	return s.Store.ListSkills(ctx, stripped)
+	reader, err := externalFilterSkillReader(s.Store)
+	if err != nil {
+		return nil, err
+	}
+	opts.External = nil
+	return reader.ListEffectiveSkills(ctx, opts)
 }
 
-func (s *reprobeStore) CountSkills(ctx context.Context, opts storage.SkillCountOpts) (storage.SkillCounts, error) {
-	stripped := opts
-	stripped.External = nil
-	return s.Store.CountSkills(ctx, stripped)
+func (s *reprobeStore) CountEffectiveSkills(ctx context.Context, opts storage.EffectiveSkillCountOpts) (storage.SkillCounts, error) {
+	reader, err := externalFilterSkillReader(s.Store)
+	if err != nil {
+		return storage.SkillCounts{}, err
+	}
+	opts.External = nil
+	return reader.CountEffectiveSkills(ctx, opts)
 }
+
+func (s *reprobeStore) ListEffectiveSkillsBySession(ctx context.Context, opts storage.EffectiveSkillSessionListOpts) ([]storage.EffectiveSkillRecord, error) {
+	reader, err := externalFilterSkillReader(s.Store)
+	if err != nil {
+		return nil, err
+	}
+	return reader.ListEffectiveSkillsBySession(ctx, opts)
+}
+
+var _ storage.SkillReader = (*reprobeStore)(nil)
 
 // serveInBackground runs srv.Serve on a loopback listener so the background
 // re-probe loop is live, and returns a stop func that cancels the server and

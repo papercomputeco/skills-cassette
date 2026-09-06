@@ -5,298 +5,156 @@ import (
 	"strings"
 )
 
-// Version is the cassette release identity published in the manifest, the
-// manifest's image tag, and the OpenAPI info block.
-//
-// It is not maintained by hand: the release stamps the tag it is publishing
-// into this variable at link time (see .dagger/image.go), and a source tree
-// always reads Placeholder, because a source tree is not a release.
-// cassette.toml declares the same placeholder, so the manifest's two
-// encodings still canonicalize to one digest.
-//
-// It must stay a package-level var. `-ldflags -X` writes to variables only
-// and silently does nothing to a constant, which would ship every image
-// reporting the placeholder while the build, the tests, and the manifest
-// digest all stayed green. BuildPushImage proves the stamp landed.
 var Version = Placeholder
 
-// Placeholder is what an unstamped build reports. A version no release can
-// produce is the point: it reads as "this came from a source tree", where a
-// plausible number would read as a release that never happened.
 const Placeholder = "0.0.0"
 
-// openAPIDocument renders this cassette's OpenAPI document.
-//
-// Every path is written under /api/<name>, which is what core's prefix
-// admission requires: a fetched spec that declares an operation outside its
-// own prefix is refused whole. Building the document from the runtime name
-// rather than hardcoding "skills" means the same image installed under a
-// second name publishes a correct spec for that name too.
-//
-// The manifest core admits the cassette on rides inside the document as the
-// x-tapes-cassette root extension, so there is one artifact to fetch and one
-// thing to configure — and so a spec and the metadata describing it can never
-// be fetched at two different versions. cassette.toml is the authored twin of
-// the extension below; the two must stay in sync.
+const cassetteDescription = "Stores immutable skill revisions and orchestrates durable generation from Tapes sessions."
+
+// openAPIDocument renders the admitted local cassette surface. Every operation
+// remains beneath /api/<name>; core republishes the same paths beneath the
+// tenant-local cassette gateway.
 func openAPIDocument(name string) []byte {
 	prefix := "/api/" + name
-
+	paths := map[string]any{}
+	revisionPaths := revisionOpenAPIPaths(prefix, name)
+	// Creator identity is an authorization input, not public revision data.
+	// Keep it out of every reused revision schema.
+	removeOpenAPIProperty(revisionPaths, "creatorSubject")
+	for path, item := range revisionPaths {
+		paths[path] = item
+	}
 	document := map[string]any{
 		"openapi": "3.1.0",
 		"info": map[string]any{
-			"title":       "Skills cassette",
-			"description": "Generates, stores, versions, and serves reusable SKILL.md skills extracted from Tapes sessions.",
-			"version":     Version,
+			"title": "Skills cassette", "description": cassetteDescription, "version": Version,
 		},
 		"x-tapes-cassette": manifest(name),
-		"paths": map[string]any{
-			prefix: map[string]any{
-				"get": operation("listSkills", "List skills",
-					"One keyset page of skills, newest-edited first, plus per-tab counts for the "+
-						"active search. Pagination mirrors /v1/sessions: pass the returned next_cursor "+
-						"to continue; its absence means the last page.\n\nPassing session_id switches "+
-						"the route to the provenance reverse lookup: the skills generated from that "+
-						"session, unpaginated, in the legacy GET /v1/sessions/:id/skills envelope."+
-						"\n\nA deployment may wire additional repeatable filter params to external "+
-						"attachment views (the filters config). An armed param filters with AND "+
-						"semantics after the configured normalization, and the per-tab counts "+
-						"describe the same filtered set as the page; a view that stops being "+
-						"readable after startup fails the filtered request with 503 rather than "+
-						"serving unfiltered rows or totals.",
-					name,
-					withParameters(
-						queryParam("limit", "integer", "Page size (default 24, max 100)"),
-						queryParam("cursor", "string", "Opaque keyset cursor from a previous next_cursor. Reset it when changing sort."),
-						queryParam("q", "string", "Search over name, description, and tags"),
-						queryParam("scope", "string", "Which slice to return: all, mine, or team"),
-						queryParam("sort", "string", "Ordering; \"downloads\" for most-downloaded, defaults to most recently updated"),
-						queryParam("session_id", "string", "Return only the skills generated from this session (unpaginated)"),
-					),
-					withResponses(
-						jsonResponse("200", "One page of skills", skillsListSchema()),
-						jsonResponse("400", "Malformed cursor", errorSchema()),
-						jsonResponse("500", "Listing failed", errorSchema()),
-						jsonResponse("503", "A configured external filter view is missing or unreadable", errorSchema()),
-					)),
-				"post": operation("createSkill", "Create a skill",
-					"Creates a hand-authored skill and its immutable v0.1.0 publication "+
-						"atomically. The caller supplies the content; nothing is inferred.",
-					name,
-					withRequestBody("Skill to create", createSkillSchema()),
-					withResponses(
-						jsonResponse("201", "The created skill", skillSchema()),
-						jsonResponse("400", "Invalid body or unknown type", errorSchema()),
-						jsonResponse("500", "Create failed", errorSchema()),
-					)),
-			},
-			prefix + "/generate": map[string]any{
-				"post": operation("generateSkill", "Generate a skill from sessions",
-					"Runs the LLM skill generator over the nominated sessions and atomically "+
-						"publishes the result as v0.1.0. The client nominates sources and optional "+
-						"hints; the server is authoritative on the skill body.\n\nSource transcripts are read from the "+
-						"configured Tapes core over its trace API; the cassette holds no core "+
-						"database credential.",
-					name,
-					withRequestBody("Source sessions and optional hints", generateSkillSchema()),
-					withResponses(
-						jsonResponse("201", "The generated skill", skillSchema()),
-						jsonResponse("400", "Invalid body, or sessionIds missing/empty", errorSchema()),
-						jsonResponse("404", "One or more source sessions were not found", errorSchema()),
-						jsonResponse("422", "Sources carried nothing the generator could use, or no LLM key is configured", errorSchema()),
-						jsonResponse("500", "Generation or persistence failed", errorSchema()),
-						jsonResponse("501", "No core url is configured", errorSchema()),
-					)),
-			},
-			prefix + "/{id}": map[string]any{
-				"parameters": []any{idPathParam("Skill id")},
-				"get": operation("getSkill", "Get a skill",
-					"Returns one skill by its opaque id. The id is the route key; slug is a "+
-						"cosmetic display label and is not addressable.",
-					name,
-					withResponses(
-						jsonResponse("200", "The skill", skillSchema()),
-						jsonResponse("404", "Skill not found", errorSchema()),
-						jsonResponse("500", "Lookup failed", errorSchema()),
-					)),
-				"put": operation("updateSkill", "Update a skill",
-					"Partial owner-only update of the skill head. Every field is optional; omitted "+
-						"fields are left as they are. Editing the head does not publish — use the "+
-						"versions endpoint to snapshot.",
-					name,
-					withRequestBody("Fields to change", updateSkillSchema()),
-					withResponses(
-						jsonResponse("200", "The updated skill", skillSchema()),
-						jsonResponse("400", "Invalid body or unknown type", errorSchema()),
-						jsonResponse("403", "Only the creator can update this skill", errorSchema()),
-						jsonResponse("404", "Skill not found", errorSchema()),
-						jsonResponse("500", "Save failed", errorSchema()),
-					)),
-				"delete": operation("deleteSkill", "Delete a skill",
-					"Deletes the skill and its version history. Only the creator may delete; "+
-						"another caller gets 403 rather than 404, so the skill's existence is not "+
-						"hidden from someone who can already list it.",
-					name,
-					withResponses(
-						emptyResponse("204", "Deleted"),
-						jsonResponse("403", "Only the creator can delete this skill", errorSchema()),
-						jsonResponse("404", "Skill not found", errorSchema()),
-						jsonResponse("500", "Delete failed", errorSchema()),
-					)),
-			},
-			prefix + "/{id}/skill.md": map[string]any{
-				"parameters": []any{idPathParam("Skill id")},
-				"get": operation("getSkillMarkdown", "Download a skill as SKILL.md",
-					"Renders the skill as an on-disk SKILL.md, served as an attachment. The "+
-						"frontmatter name is the kebab slug, which is what a harness matches to the "+
-						"skill's directory — not the human display name.\n\nServing this counts a "+
-						"download, best-effort: a failed counter write never fails the download.",
-					name,
-					withResponses(
-						contentResponse("200", "SKILL.md document", "text/markdown", map[string]any{"type": "string"}),
-						jsonResponse("404", "Skill not found", errorSchema()),
-						jsonResponse("500", "Lookup failed", errorSchema()),
-					)),
-			},
-			prefix + "/{id}/versions": map[string]any{
-				"parameters": []any{idPathParam("Skill id")},
-				"get": operation("listSkillVersions", "List a skill's versions",
-					"Full published history for one skill, newest first. Returned whole rather "+
-						"than paged, so totalCount is always the length of versions.",
-					name,
-					withResponses(
-						jsonResponse("200", "The skill's versions", skillVersionsSchema()),
-						jsonResponse("500", "Listing failed", errorSchema()),
-					)),
-				"post": operation("publishSkill", "Publish a skill version",
-					"Owner-only immutable publication. expectedContent optionally compare-and-swaps "+
-						"the head; a retry after an ambiguous successful commit returns that latest "+
-						"version with 200 instead of publishing twice.",
-					name,
-					withRequestBody("Version metadata", publishSkillSchema()),
-					withResponses(
-						jsonResponse("200", "The version from an idempotent conditional retry", skillVersionSchema()),
-						jsonResponse("201", "The published version", skillVersionSchema()),
-						jsonResponse("400", "Invalid body", errorSchema()),
-						jsonResponse("403", "Only the creator can publish this skill", errorSchema()),
-						jsonResponse("404", "Skill not found", errorSchema()),
-						jsonResponse("409", "The skill head no longer matches expectedContent", errorSchema()),
-						jsonResponse("500", "Publish failed", errorSchema()),
-					)),
-			},
-			prefix + "/{id}/duplicate": map[string]any{
-				"parameters": []any{idPathParam("Skill id to duplicate")},
-				"post": operation("duplicateSkill", "Duplicate a skill",
-					"Forks and publishes a skill as v0.1.0 under a new id owned by the caller, "+
-						"with parentId set to the source. The source is untouched.",
-					name,
-					withResponses(
-						jsonResponse("201", "The duplicated skill", skillSchema()),
-						jsonResponse("404", "Skill not found", errorSchema()),
-						jsonResponse("500", "Duplicate failed", errorSchema()),
-					)),
-			},
-		},
+		"paths":            paths,
 	}
-
 	encoded, err := json.MarshalIndent(document, "", "  ")
 	if err != nil {
-		// Every value above is a literal that cannot fail to marshal — an error
-		// means this function is wrong, not that the request is. Serving an
-		// empty body would hide that; core reporting a cassette whose document
-		// does not parse is the louder and more useful failure.
 		return []byte(`{"error":"could not compile this cassette's OpenAPI document: ` +
 			strings.ReplaceAll(err.Error(), `"`, `'`) + `"}`)
 	}
 	return encoded
 }
 
-// manifest is the metadata core admits this cassette on: the JSON encoding of
-// the cassette/v1alpha1 schema whose authored twin is cassette.toml.
+// manifest is the served JSON twin of cassette.toml.
 func manifest(name string) map[string]any {
 	return map[string]any{
 		"kind": "cassette/v1alpha1",
 		"cassette": map[string]any{
-			"name":         name,
-			"version":      Version,
-			"display_name": "Skills",
-			"description":  "Generates, stores, versions, and serves reusable SKILL.md skills extracted from Tapes sessions.",
-			"license":      "MIT OR Apache-2.0",
-			"homepage":     "https://github.com/papercomputeco/skills-cassette",
-			"image":        "public.ecr.aws/g4e5l3z3/papercomputeco/skills-cassette:v" + Version,
-			"port":         9998,
+			"name": name, "version": Version, "display_name": "Skills",
+			"description": cassetteDescription,
+			"license":     "MIT OR Apache-2.0", "homepage": "https://github.com/papercomputeco/skills-cassette",
+			"image": "public.ecr.aws/g4e5l3z3/papercomputeco/skills-cassette:v" + Version,
+			"port":  9998,
 		},
-		"depends": map[string]any{
-			"core":  "v1",
-			"views": []string{},
-		},
+		"depends": map[string]any{"core": "v1", "views": []string{}},
 		"api": map[string]any{
-			"health":      "/ping",
-			"openapi":     "/openapi",
-			"prefix_path": "api",
+			"health": "/ping", "openapi": "/openapi", "prefix_path": "api",
 		},
 		"tables": []map[string]any{
 			{"name": "skills"},
-			{"name": "skill_versions"},
+			{"name": "skill_revisions"},
+			{"name": "skill_revision_visibility"},
+			{"name": "skill_generations"},
+			{"name": "generation_sessions"},
+			{"name": "generation_candidates"},
+			{"name": "candidate_evaluations"},
+			{"name": "generation_diagnostics"},
 		},
 		"config": []map[string]any{
 			{
-				"key":         "core.url",
-				"type":        "string",
-				"required":    true,
-				"description": "Tapes core API origin the generator reads trace transcripts from.",
+				"key": "core.url", "type": "string", "required": true,
+				"description": "Tapes core API origin used for trace reads and tenant-local skills-evaluator calls.",
 			},
 			{
-				"key":         "llm.provider",
-				"type":        "string",
-				"default":     "openai",
+				"key": "llm.provider", "type": "string", "default": "openai",
 				"enum":        []string{"openai", "anthropic", "ollama"},
-				"description": "LLM provider used to extract skills.",
+				"description": "LLM provider used to generate independent per-session candidates.",
 			},
 			{
-				"key":         "llm.model",
-				"type":        "string",
+				"key": "llm.model", "type": "string",
 				"description": "Model override; each provider has a sensible default.",
 			},
 			{
-				"key":         "llm.api_key",
-				"type":        "string",
-				"secret":      true,
+				"key": "llm.api_key", "type": "string", "secret": true,
 				"description": "Provider API key. Not required for ollama.",
 			},
 			{
-				"key":         "llm.base_url",
-				"type":        "string",
+				"key": "llm.base_url", "type": "string",
 				"description": "Provider base URL override for proxies and self-hosted endpoints.",
 			},
 			{
-				"key":         "filters",
-				"type":        "json",
+				"key": "generation.worker_concurrency", "type": "int", "default": 2, "min": 1, "max": 64,
+				"description": "Maximum concurrently claimed generations in this cassette process.",
+			},
+			{
+				"key": "generation.max_sessions", "type": "int", "default": 8, "min": 1, "max": 100,
+				"description": "Maximum selected sessions processed by one asynchronous generation.",
+			},
+			{
+				"key": "generation.candidate_concurrency", "type": "int", "default": 2, "min": 1, "max": 100,
+				"description": "Requested candidate-generation and candidate-evaluation external-call concurrency per generation; the effective value is deterministically min(candidate_concurrency, max_sessions).",
+			},
+			{
+				"key": "generation.poll_interval_ms", "type": "int", "default": 250, "min": 10, "max": 60000,
+				"description": "Initial empty-queue and polling failure delay in milliseconds.",
+			},
+			{
+				"key": "generation.max_poll_interval_ms", "type": "int", "default": 5000, "min": 10, "max": 300000,
+				"description": "Maximum exponential empty-queue and polling failure delay in milliseconds.",
+			},
+			{
+				"key": "generation.lease_duration_ms", "type": "int", "default": 120000, "min": 1000, "max": 3600000,
+				"description": "Generation claim lease duration in milliseconds.",
+			},
+			{
+				"key": "generation.heartbeat_interval_ms", "type": "int", "default": 30000, "min": 100, "max": 600000,
+				"description": "Claim renewal interval in milliseconds; it must remain shorter than the lease duration.",
+			},
+			{
+				"key": "generation.processing_timeout_ms", "type": "int", "default": 300000, "min": 1000, "max": 3600000,
+				"description": "Maximum wall time for one claimed generation attempt in milliseconds.",
+			},
+			{
+				"key": "generation.drain_timeout_ms", "type": "int", "default": 10000, "min": 1000, "max": 300000,
+				"description": "Maximum graceful worker drain wait in milliseconds after shutdown.",
+			},
+			{
+				"key": "generation.retry_backoff_ms", "type": "int", "default": 1000, "min": 10, "max": 300000,
+				"description": "Initial durable retry delay before bounded jitter in milliseconds.",
+			},
+			{
+				"key": "generation.max_retry_backoff_ms", "type": "int", "default": 30000, "min": 10, "max": 3600000,
+				"description": "Maximum durable retry delay before bounded jitter in milliseconds.",
+			},
+			{
+				"key": "generation.max_attempts", "type": "int", "default": 3, "min": 1, "max": 10,
+				"description": "Maximum durable claim attempts before terminal failure.",
+			},
+			{
+				"key": "generation.max_transcript_bytes", "type": "int", "default": 1048576, "min": 4096, "max": 1048576,
+				"description": "Maximum rendered bytes supplied to any one candidate inference.",
+			},
+			{
+				"key": "filters", "type": "json",
 				"description": "External attachment-view filters: a JSON list of {param, view, type_value, normalize} entries, each wiring one repeatable skills-list query param to a deployment-granted view of the canonical attachment shape (primitive_type, primitive_id, value). Normalize verbs: trim, nfc, casefold. Absent: the capability is off.",
 			},
 		},
-		// Entities this cassette offers, feeding the platform's entity
-		// registry. Pure self-description: the cassette declares what it is
-		// and knows nothing about who consumes the declaration.
-		"entities": []map[string]any{
-			{
-				"type":         "skill",
-				"id_kind":      "uuid",
-				"display_name": "Skill",
-			},
-		},
+		"entities": []map[string]any{{
+			"type": "skill", "id_kind": "uuid", "display_name": "Skill",
+		}},
 	}
 }
-
-// --- OpenAPI assembly helpers ---
 
 type operationOption func(map[string]any)
 
 func operation(id, summary, description, tag string, opts ...operationOption) map[string]any {
 	op := map[string]any{
-		"operationId": id,
-		"summary":     summary,
-		"description": description,
-		"tags":        []string{tag},
+		"operationId": id, "summary": summary, "description": description, "tags": []string{tag},
 	}
 	for _, opt := range opts {
 		opt(op)
@@ -311,11 +169,8 @@ func withParameters(params ...any) operationOption {
 func withRequestBody(description string, schema map[string]any) operationOption {
 	return func(op map[string]any) {
 		op["requestBody"] = map[string]any{
-			"description": description,
-			"required":    true,
-			"content": map[string]any{
-				"application/json": map[string]any{"schema": schema},
-			},
+			"description": description, "required": true,
+			"content": map[string]any{"application/json": map[string]any{"schema": schema}},
 		}
 	}
 }
@@ -342,158 +197,131 @@ func jsonResponse(status, description string, schema map[string]any) responseEnt
 func contentResponse(status, description, mediaType string, schema map[string]any) responseEntry {
 	return responseEntry{status: status, body: map[string]any{
 		"description": description,
-		"content": map[string]any{
-			mediaType: map[string]any{"schema": schema},
-		},
+		"content":     map[string]any{mediaType: map[string]any{"schema": schema}},
 	}}
 }
 
-func emptyResponse(status, description string) responseEntry {
-	return responseEntry{status: status, body: map[string]any{"description": description}}
-}
-
-func queryParam(name, schemaType, description string) map[string]any {
+func boundedStringQueryParam(name, description string, maxCodePoints int) map[string]any {
 	return map[string]any{
-		"name":        name,
-		"in":          "query",
-		"description": description,
-		"schema":      map[string]any{"type": schemaType},
+		"name": name, "in": "query", "description": description,
+		"schema": map[string]any{"type": "string", "maxLength": maxCodePoints},
 	}
 }
 
-// idPathParam declares the {id} segment every item route shares.
-func idPathParam(description string) map[string]any {
+func enumStringQueryParam(name, description string, values ...string) map[string]any {
 	return map[string]any{
-		"name":        "id",
-		"in":          "path",
-		"required":    true,
-		"description": description,
-		"schema":      map[string]any{"type": "string"},
+		"name": name, "in": "query", "description": description,
+		"schema": map[string]any{"type": "string", "enum": values},
 	}
 }
 
-// --- Schemas ---
-
-func errorSchema() map[string]any {
-	return objectSchema(map[string]any{
-		"error": stringProp("Human-readable failure description."),
-	})
+func pathParam(name, description string) map[string]any {
+	return map[string]any{
+		"name": name, "in": "path", "required": true, "description": description,
+		"schema": map[string]any{
+			"type": "string", "format": "uuid", "maxLength": maxUUIDRepresentationCodePoints,
+		},
+	}
 }
 
-func skillSchema() map[string]any {
-	schema := objectSchema(map[string]any{
-		"id":                    stringProp("Opaque, immutable identity — the route key."),
-		"slug":                  stringProp("Cosmetic kebab-case display label and SKILL.md filename."),
-		"parentId":              map[string]any{"type": []any{"string", "null"}, "description": "Source skill id when this is a duplicate/fork."},
-		"name":                  stringProp("Human display name."),
-		"description":           stringProp("Trigger description for when an agent should use this skill."),
-		"type":                  map[string]any{"type": "string", "enum": []string{"workflow", "domain-knowledge", "prompt-template"}},
-		"version":               stringProp("Current published semver."),
-		"visibility":            stringProp("private or team."),
-		"tags":                  stringArrayProp("Free-form tags."),
-		"content":               stringProp("Markdown body — the editable head."),
-		"isAiGenerated":         map[string]any{"type": "boolean"},
-		"originatingSessionIds": stringArrayProp("Source session provenance."),
-		"authorId":              stringProp("Gateway-trusted subject of the creator; empty when unattributed."),
-		"downloadCount":         map[string]any{"type": "integer", "description": "How many times the SKILL.md has been downloaded."},
-		"createdAt":             stringProp("RFC 3339 creation time."),
-		"updatedAt":             stringProp("RFC 3339 last-edit time."),
-	})
-	return schema
-}
-
-func skillsListSchema() map[string]any {
-	return objectSchema(map[string]any{
-		"items":       arrayOf(skillSchema()),
-		"next_cursor": stringProp("Opaque keyset cursor; absent on the last page."),
-		"counts": objectSchema(map[string]any{
-			"all":  map[string]any{"type": "integer"},
-			"mine": map[string]any{"type": "integer"},
-			"team": map[string]any{"type": "integer"},
-		}),
-	})
-}
-
-func skillVersionSchema() map[string]any {
-	return objectSchema(map[string]any{
-		"id":            stringProp("Synthetic id: <skillId>-v<versionNumber>."),
-		"skillId":       stringProp("Owning skill id."),
-		"versionNumber": map[string]any{"type": "integer", "description": "Monotonic publish counter starting at 1."},
-		"semver":        stringProp("Published semver, e.g. 0.1.2."),
-		"publishedAt":   stringProp("RFC 3339 publish time."),
-		"changelog":     stringProp("Publisher-supplied change note."),
-		"content":       stringProp("The immutable published snapshot."),
-		"authorId":      stringProp("Subject that published the version."),
-	})
-}
-
-func skillVersionsSchema() map[string]any {
-	return objectSchema(map[string]any{
-		"versions":   arrayOf(skillVersionSchema()),
-		"totalCount": map[string]any{"type": "integer"},
-	})
-}
-
-func createSkillSchema() map[string]any {
-	return objectSchema(map[string]any{
-		"name":        stringProp("Display name; defaults to \"New skill\"."),
-		"description": stringProp("Trigger description."),
-		"type":        map[string]any{"type": "string", "enum": []string{"workflow", "domain-knowledge", "prompt-template"}},
-		"tags":        stringArrayProp("Free-form tags."),
-		"content":     stringProp("Markdown body."),
-		"changelog":   stringProp("Change note recorded on the initial version."),
-	})
-}
-
-func updateSkillSchema() map[string]any {
-	return objectSchema(map[string]any{
-		"name":        stringProp("New display name; the slug follows it."),
-		"description": stringProp("New trigger description."),
-		"type":        map[string]any{"type": "string", "enum": []string{"workflow", "domain-knowledge", "prompt-template"}},
-		"visibility":  stringProp("private or team."),
-		"tags":        stringArrayProp("Replacement tag set."),
-		"content":     stringProp("New markdown body (does not publish)."),
-	})
-}
-
-func generateSkillSchema() map[string]any {
-	return objectSchema(map[string]any{
-		"sessionIds": stringArrayProp("Source session ids; at least one is required."),
-		"hint": objectSchema(map[string]any{
-			"name":        stringProp("Pin the skill name instead of letting the generator suggest one."),
-			"description": stringProp("Unused hint carried for wire compatibility."),
-			"type":        map[string]any{"type": "string", "enum": []string{"workflow", "domain-knowledge", "prompt-template"}},
-			"tags":        stringArrayProp("Unused hint carried for wire compatibility."),
-		}),
-	})
-}
-
-func publishSkillSchema() map[string]any {
-	return objectSchema(map[string]any{
-		"content":         stringProp("Content to snapshot; defaults to the skill's current head."),
-		"changelog":       stringProp("Change note recorded on the version."),
-		"expectedContent": stringProp("Optional current head required for compare-and-swap publication."),
-	})
+func lifecycleErrorSchema() map[string]any {
+	return closedObjectSchema(map[string]any{
+		"error": closedObjectSchema(map[string]any{
+			"code":       boundedStringProp("Stable machine-readable error code.", maxLifecycleCodeCodePoints),
+			"message":    boundedStringProp("Curated human-readable message.", maxLifecycleMessageCodePoints),
+			"resourceId": uuidProp("Safe resource UUID when the caller may know it."),
+		}, "code", "message"),
+	}, "error")
 }
 
 func objectSchema(properties map[string]any) map[string]any {
 	return map[string]any{"type": "object", "properties": properties}
 }
 
-func stringProp(description string) map[string]any {
-	return map[string]any{"type": "string", "description": description}
+func closedObjectSchema(properties map[string]any, required ...string) map[string]any {
+	schema := objectSchema(properties)
+	schema["additionalProperties"] = false
+	if len(required) > 0 {
+		schema["required"] = required
+	}
+	return schema
 }
 
-func stringArrayProp(description string) map[string]any {
+func dateTimeProp(description string) map[string]any {
 	return map[string]any{
-		"type":        "array",
+		"type": "string", "format": "date-time", "maxLength": 64,
 		"description": description,
-		"items":       map[string]any{"type": "string"},
 	}
 }
 
-func arrayOf(schema map[string]any) map[string]any {
-	return map[string]any{"type": "array", "items": schema}
+func nullableDateTimeProp(description string) map[string]any {
+	return map[string]any{
+		"type": []any{"string", "null"}, "format": "date-time", "maxLength": 64,
+		"description": description,
+	}
+}
+
+func boundedStringProp(description string, maxCodePoints int) map[string]any {
+	return map[string]any{"type": "string", "maxLength": maxCodePoints, "description": description}
+}
+
+func nonEmptyBoundedStringProp(description string, maxCodePoints int) map[string]any {
+	schema := boundedStringProp(description, maxCodePoints)
+	schema["minLength"] = 1
+	return schema
+}
+
+func uuidProp(description string) map[string]any {
+	return map[string]any{
+		"type": "string", "format": "uuid", "maxLength": maxUUIDRepresentationCodePoints,
+		"description": description,
+	}
+}
+
+func nullableUUIDProp(description string) map[string]any {
+	return map[string]any{
+		"type": []any{"string", "null"}, "format": "uuid", "maxLength": maxUUIDRepresentationCodePoints,
+		"description": description,
+	}
+}
+
+func removeOpenAPIProperty(value any, property string) {
+	switch typed := value.(type) {
+	case map[string]any:
+		if properties, ok := typed["properties"].(map[string]any); ok {
+			delete(properties, property)
+		}
+		if required, ok := typed["required"].([]string); ok {
+			filtered := required[:0]
+			for _, name := range required {
+				if name != property {
+					filtered = append(filtered, name)
+				}
+			}
+			typed["required"] = filtered
+		}
+		for _, child := range typed {
+			removeOpenAPIProperty(child, property)
+		}
+	case []any:
+		for _, child := range typed {
+			removeOpenAPIProperty(child, property)
+		}
+	}
+}
+
+func boundedStringArrayProp(description string, maxItems int) map[string]any {
+	return map[string]any{
+		"type": "array", "description": description, "maxItems": maxItems,
+		"uniqueItems": true,
+		"items": map[string]any{
+			"type": "string", "minLength": 1, "maxLength": maxLifecycleIdentityCodePoints,
+		},
+	}
+}
+
+func boundedArrayOf(schema map[string]any, maxItems int) map[string]any {
+	return map[string]any{"type": "array", "items": schema, "maxItems": maxItems}
 }
 
 // RoutePrefix is the prefix this cassette serves under, exported for tests.
