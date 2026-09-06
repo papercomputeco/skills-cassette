@@ -2,31 +2,66 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 // MemoryStore is the no-database Store. It exists so the cassette starts (and
 // its handlers test) without Postgres; it implements the same search, scope,
 // sort, and keyset-pagination semantics as the Postgres driver.
 type MemoryStore struct {
-	mu       sync.Mutex
-	skills   map[string]SkillRecord
-	versions map[string][]SkillVersionRecord
+	mu                         sync.Mutex
+	now                        func() time.Time
+	skills                     map[string]SkillRecord
+	versions                   map[string][]SkillVersionRecord
+	revisions                  map[string]SkillRevisionRecord
+	revisionVisibility         map[string]RevisionVisibilityRecord
+	generations                map[string]SkillGenerationRecord
+	generationSessions         map[string][]GenerationSessionRecord
+	generationCandidates       map[string][]GenerationCandidateRecord
+	candidateEvaluations       map[string][]CandidateEvaluationRecord
+	generationDiagnostics      map[string][]GenerationDiagnosticRecord
+	generationResultClaimToken map[string]string
 }
 
-// NewMemoryStore returns an empty in-memory store.
+// NewMemoryStore returns an empty in-memory store using the system clock.
 func NewMemoryStore() *MemoryStore {
+	return NewMemoryStoreWithClock(time.Now)
+}
+
+// NewMemoryStoreWithClock returns an empty store whose lease fencing uses now.
+// Supplying a clock keeps cancellation and lease-expiry races deterministic in
+// tests without treating caller-owned artifact timestamps as trusted time.
+func NewMemoryStoreWithClock(now func() time.Time) *MemoryStore {
+	if now == nil {
+		now = time.Now
+	}
 	return &MemoryStore{
-		skills:   map[string]SkillRecord{},
-		versions: map[string][]SkillVersionRecord{},
+		now:                        now,
+		skills:                     map[string]SkillRecord{},
+		versions:                   map[string][]SkillVersionRecord{},
+		revisions:                  map[string]SkillRevisionRecord{},
+		revisionVisibility:         map[string]RevisionVisibilityRecord{},
+		generations:                map[string]SkillGenerationRecord{},
+		generationSessions:         map[string][]GenerationSessionRecord{},
+		generationCandidates:       map[string][]GenerationCandidateRecord{},
+		candidateEvaluations:       map[string][]CandidateEvaluationRecord{},
+		generationDiagnostics:      map[string][]GenerationDiagnosticRecord{},
+		generationResultClaimToken: map[string]string{},
 	}
 }
 
-var _ Store = (*MemoryStore)(nil)
+var (
+	_ Store              = (*MemoryStore)(nil)
+	_ GenerationStore    = (*MemoryStore)(nil)
+	_ SkillIdentityStore = (*MemoryStore)(nil)
+	_ RevisionStore      = (*MemoryStore)(nil)
+)
 
 // Kind names the backing store, echoed by /ping so a demo can never be
 // misread as durable when it is not.
@@ -48,6 +83,15 @@ func (s *MemoryStore) UpsertSkill(_ context.Context, rec SkillRecord) (*SkillRec
 		rec.CreatedAt = existing.CreatedAt
 		rec.AuthorSubject = existing.AuthorSubject
 		rec.DownloadCount = existing.DownloadCount
+		rec.ExplicitLatestRevisionID = existing.ExplicitLatestRevisionID
+		rec.NextSequenceNumber = existing.NextSequenceNumber
+		rec.CreatedBySubject = existing.CreatedBySubject
+	} else {
+		// The predecessor upsert does not write unified identity metadata in
+		// Postgres; new legacy rows receive these schema defaults.
+		rec.ExplicitLatestRevisionID = ""
+		rec.NextSequenceNumber = 1
+		rec.CreatedBySubject = ""
 	}
 	s.skills[rec.ID] = rec
 	out := rec
@@ -68,6 +112,10 @@ func (s *MemoryStore) CreatePublishedSkill(_ context.Context, rec SkillRecord, v
 	rec.Version = version.Semver
 	rec.Content = version.Content
 	rec.UpdatedAt = version.PublishedAt
+	// Same schema defaults as a new legacy row through UpsertSkill.
+	rec.ExplicitLatestRevisionID = ""
+	rec.NextSequenceNumber = 1
+	rec.CreatedBySubject = ""
 	s.skills[rec.ID] = rec
 	s.versions[rec.ID] = []SkillVersionRecord{version}
 	out := rec
@@ -86,14 +134,18 @@ func (s *MemoryStore) GetSkill(_ context.Context, id string) (*SkillRecord, erro
 	return nil, nil
 }
 
-// DeleteSkill removes a skill and its version history, reporting whether a
-// skill row actually existed.
+// DeleteSkill removes a predecessor skill and its version history, reporting
+// whether a skill row actually existed. Saved unified revisions protect their
+// stable identity, matching the Postgres foreign-key restriction.
 func (s *MemoryStore) DeleteSkill(_ context.Context, id string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if _, ok := s.skills[id]; !ok {
 		return false, nil
+	}
+	if s.hasSavedRevisionLocked(id) {
+		return false, errors.New("delete skill: saved revisions exist")
 	}
 	delete(s.skills, id)
 	delete(s.versions, id)
@@ -121,6 +173,9 @@ func (s *MemoryStore) ListSkills(_ context.Context, opts SkillListOpts) ([]Skill
 
 	matched := make([]SkillRecord, 0, len(s.skills))
 	for _, rec := range s.skills {
+		if rec.CreatedBySubject != "" && !s.hasSavedRevisionLocked(rec.ID) {
+			continue
+		}
 		if !matchesQuery(rec, opts.Query) {
 			continue
 		}
@@ -214,6 +269,9 @@ func (s *MemoryStore) CountSkills(_ context.Context, opts SkillCountOpts) (Skill
 
 	var counts SkillCounts
 	for _, rec := range s.skills {
+		if rec.CreatedBySubject != "" && !s.hasSavedRevisionLocked(rec.ID) {
+			continue
+		}
 		if !matchesQuery(rec, opts.Query) {
 			continue
 		}
@@ -322,6 +380,15 @@ func matchesQuery(rec SkillRecord, query string) bool {
 	}
 	for _, tag := range rec.Tags {
 		if strings.Contains(strings.ToLower(tag), needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *MemoryStore) hasSavedRevisionLocked(skillID string) bool {
+	for _, revision := range s.revisions {
+		if revision.SkillID == skillID {
 			return true
 		}
 	}
