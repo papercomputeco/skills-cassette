@@ -2,6 +2,7 @@ package skill
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -11,6 +12,7 @@ type transcriptConfig struct {
 	timeFilter     *GenerateOptions
 	traceID        string // when non-empty, render only this turn
 	omitSpanDetail bool   // when true, drop the [tools] span-detail lines
+	maxBytes       int    // zero means unbounded
 }
 
 // TranscriptOption configures BuildSessionTranscript.
@@ -35,6 +37,18 @@ func WithTraceFilter(traceID string) TranscriptOption {
 	return func(c *transcriptConfig) { c.traceID = traceID }
 }
 
+// ErrTranscriptByteLimit is returned as soon as rendering the next transcript
+// line would exceed the configured byte budget. The renderer never appends a
+// partial line and does not fetch any later turn after the limit is reached.
+var ErrTranscriptByteLimit = errors.New("session transcript exceeds its byte limit")
+
+// WithTranscriptByteLimit bounds the rendered transcript. Enforcement happens
+// while turns are rendered, before fetching the next trace, rather than after
+// an oversized transcript has already been accumulated.
+func WithTranscriptByteLimit(maxBytes int) TranscriptOption {
+	return func(c *transcriptConfig) { c.maxBytes = maxBytes }
+}
+
 // BuildSessionTranscript renders the turn-grain transcript for one
 // product session (a /v1/sessions UUID). It walks the trace surface:
 // TraceSummaries for the session's user-visible turns, then Trace for
@@ -57,12 +71,20 @@ func BuildSessionTranscript(ctx context.Context, query Querier, sessionID string
 	for _, opt := range opts {
 		opt(cfg)
 	}
-
-	var b strings.Builder
-	for _, turn := range turns {
-		writeTurn(ctx, &b, query, turn, !cfg.omitSpanDetail)
+	if cfg.maxBytes < 0 {
+		return "", errors.New("transcript byte limit must not be negative")
 	}
-	return b.String(), nil
+
+	renderer := transcriptRenderer{maxBytes: cfg.maxBytes}
+	for _, turn := range turns {
+		if renderer.maxBytes > 0 && renderer.builder.Len() >= renderer.maxBytes {
+			return "", fmt.Errorf("%w: configured limit %d bytes", ErrTranscriptByteLimit, renderer.maxBytes)
+		}
+		if err := writeTurn(ctx, &renderer, query, turn, !cfg.omitSpanDetail); err != nil {
+			return "", err
+		}
+	}
+	return renderer.String(), nil
 }
 
 // SessionTurns returns the filtered, user-visible turns of a session
@@ -105,31 +127,60 @@ func SessionTurns(ctx context.Context, query Querier, sessionID string, opts ...
 // TurnTranscript renders the [user]/[assistant]/[tools] lines for a
 // single resolved turn, used when exporting one turn at a time.
 func TurnTranscript(ctx context.Context, query Querier, turn TraceSummary) string {
-	var b strings.Builder
-	writeTurn(ctx, &b, query, turn, true)
-	return b.String()
+	renderer := transcriptRenderer{}
+	_ = writeTurn(ctx, &renderer, query, turn, true)
+	return renderer.String()
 }
 
-// writeTurn renders one turn's prompt and spine responses into b. When a
-// turn's span detail is unavailable (or carries no spine text) the
-// derive-time response preview stands in, so the transcript always has
-// both halves of the exchange.
-func writeTurn(ctx context.Context, b *strings.Builder, query Querier, turn TraceSummary, includeSpanDetail bool) {
-	if turn.UserPrompt != "" {
-		fmt.Fprintf(b, "[user] %s\n", turn.UserPrompt)
-	}
+type transcriptRenderer struct {
+	builder  strings.Builder
+	maxBytes int
+}
 
+func (r *transcriptRenderer) String() string { return r.builder.String() }
+
+func (r *transcriptRenderer) writeParts(parts ...string) error {
+	total := 0
+	for _, part := range parts {
+		if len(part) > int(^uint(0)>>1)-total {
+			return fmt.Errorf("%w: configured limit %d bytes", ErrTranscriptByteLimit, r.maxBytes)
+		}
+		total += len(part)
+	}
+	if r.maxBytes > 0 && total > r.maxBytes-r.builder.Len() {
+		return fmt.Errorf("%w: configured limit %d bytes", ErrTranscriptByteLimit, r.maxBytes)
+	}
+	for _, part := range parts {
+		r.builder.WriteString(part)
+	}
+	return nil
+}
+
+// writeTurn renders one turn's prompt and spine responses. The user line is
+// budgeted before the trace fetch, so a prompt that exhausts the budget stops
+// iteration without fetching detail that can no longer be rendered.
+func writeTurn(ctx context.Context, renderer *transcriptRenderer, query Querier, turn TraceSummary, includeSpanDetail bool) error {
+	if turn.UserPrompt != "" {
+		if err := renderer.writeParts("[user] ", turn.UserPrompt, "\n"); err != nil {
+			return err
+		}
+	}
 	trace, err := query.Trace(ctx, turn.TraceID)
 	if err != nil || trace == nil {
 		if turn.ResponsePreview != "" {
-			fmt.Fprintf(b, "[assistant] %s\n", turn.ResponsePreview)
+			return renderer.writeParts("[assistant] ", turn.ResponsePreview, "\n")
 		}
-		return
+		return nil
 	}
 
-	if !writeSpineResponses(b, trace.Spans, includeSpanDetail) && turn.ResponsePreview != "" {
-		fmt.Fprintf(b, "[assistant] %s\n", turn.ResponsePreview)
+	wrote, err := writeSpineResponses(renderer, trace.Spans, includeSpanDetail)
+	if err != nil {
+		return err
 	}
+	if !wrote && turn.ResponsePreview != "" {
+		return renderer.writeParts("[assistant] ", turn.ResponsePreview, "\n")
+	}
+	return nil
 }
 
 // filterTurns drops synthetic turns (compaction seams, resume replays —
@@ -159,28 +210,34 @@ func filterTurns(turns []TraceSummary, opts *GenerateOptions) []TraceSummary {
 // text and a [tools] summary line for the tool calls in between.
 // Offshoot and injected call kinds, and subagent threads, are skipped.
 // Reports whether any assistant text was written.
-func writeSpineResponses(b *strings.Builder, spans []Span, includeSpanDetail bool) bool {
+func writeSpineResponses(renderer *transcriptRenderer, spans []Span, includeSpanDetail bool) (bool, error) {
 	wrote := false
 	pendingTools := map[string]int{}
 	var pendingOrder []string
 
-	flushTools := func() {
+	flushTools := func() error {
 		if !includeSpanDetail || len(pendingOrder) == 0 {
 			pendingTools = map[string]int{}
 			pendingOrder = nil
-			return
+			return nil
 		}
-		parts := make([]string, 0, len(pendingOrder))
-		for _, name := range pendingOrder {
+		parts := []string{"[tools] "}
+		for index, name := range pendingOrder {
+			if index > 0 {
+				parts = append(parts, ", ")
+			}
+			parts = append(parts, name)
 			if count := pendingTools[name]; count > 1 {
-				parts = append(parts, fmt.Sprintf("%s ×%d", name, count))
-			} else {
-				parts = append(parts, name)
+				parts = append(parts, fmt.Sprintf(" ×%d", count))
 			}
 		}
-		fmt.Fprintf(b, "[tools] %s\n", strings.Join(parts, ", "))
+		parts = append(parts, "\n")
+		if err := renderer.writeParts(parts...); err != nil {
+			return err
+		}
 		pendingTools = map[string]int{}
 		pendingOrder = nil
+		return nil
 	}
 
 	for _, sp := range spans {
@@ -197,28 +254,34 @@ func writeSpineResponses(b *strings.Builder, spans []Span, includeSpanDetail boo
 			if sp.CallKind != "main" || sp.ThreadID != "" {
 				continue
 			}
-			text := blocksText(sp.Output)
-			if text == "" {
+			visibleBlocks := make([]string, 0, len(sp.Output))
+			for _, block := range sp.Output {
+				if block.Type == "text" && block.Text != "" {
+					visibleBlocks = append(visibleBlocks, block.Text)
+				}
+			}
+			if len(visibleBlocks) == 0 {
 				continue
 			}
-			flushTools()
-			fmt.Fprintf(b, "[assistant] %s\n", text)
+			if err := flushTools(); err != nil {
+				return wrote, err
+			}
+			parts := []string{"[assistant] "}
+			for index, text := range visibleBlocks {
+				if index > 0 {
+					parts = append(parts, "\n")
+				}
+				parts = append(parts, text)
+			}
+			parts = append(parts, "\n")
+			if err := renderer.writeParts(parts...); err != nil {
+				return wrote, err
+			}
 			wrote = true
 		}
 	}
-	flushTools()
-	return wrote
-}
-
-// blocksText joins the visible text blocks of an llm span's output.
-// Thinking blocks are intentionally excluded: they are model-internal
-// and bloat the prompt without adding workflow signal.
-func blocksText(blocks []ContentBlock) string {
-	var texts []string
-	for _, block := range blocks {
-		if block.Type == "text" && block.Text != "" {
-			texts = append(texts, block.Text)
-		}
+	if err := flushTools(); err != nil {
+		return wrote, err
 	}
-	return strings.Join(texts, "\n")
+	return wrote, nil
 }

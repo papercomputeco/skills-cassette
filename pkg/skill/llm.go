@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -25,11 +24,16 @@ const (
 	llmCallTimeout = 30 * time.Second
 
 	// llmCallRetries is the number of additional attempts on a transient
-	// provider failure (HTTP 429/502/503/504 or a transport error). One
+	// provider failure (HTTP 408/429/5xx or a transport error). One
 	// retry is enough to ride out a brief rate-limit or upstream blip
 	// without risking the handler's overall time budget.
 	llmCallRetries  = 1
 	llmRetryBackoff = 500 * time.Millisecond
+
+	// maxProviderResponseBytes bounds the complete provider envelope at the
+	// network read boundary. It leaves room for JSON escaping around the
+	// independently bounded one-MiB candidate payload.
+	maxProviderResponseBytes = 2 << 20
 )
 
 // ErrNoAPIKey is returned by NewLLMCaller when no key resolves for the
@@ -172,15 +176,15 @@ func newOpenAICaller(apiKey, model, baseURL string) LLMCallFunc {
 
 		var result openAIResponse
 		if err := json.Unmarshal(body, &result); err != nil {
-			return "", fmt.Errorf("unmarshal response: %w", err)
+			return "", externalCallError(fmt.Errorf("unmarshal response: %w", err), false)
 		}
 
 		if result.Error != nil {
-			return "", fmt.Errorf("openai error: %s", result.Error.Message)
+			return "", externalCallError(fmt.Errorf("openai error: %s", result.Error.Message), false)
 		}
 
 		if len(result.Choices) == 0 {
-			return "", errors.New("openai returned no choices")
+			return "", externalCallError(errors.New("openai returned no choices"), false)
 		}
 
 		return result.Choices[0].Message.Content, nil
@@ -230,15 +234,15 @@ func newAnthropicCaller(apiKey, model, baseURL string) LLMCallFunc {
 
 		var result anthropicResponse
 		if err := json.Unmarshal(body, &result); err != nil {
-			return "", fmt.Errorf("unmarshal response: %w", err)
+			return "", externalCallError(fmt.Errorf("unmarshal response: %w", err), false)
 		}
 
 		if result.Error != nil {
-			return "", fmt.Errorf("anthropic error: %s", result.Error.Message)
+			return "", externalCallError(fmt.Errorf("anthropic error: %s", result.Error.Message), false)
 		}
 
 		if len(result.Content) == 0 {
-			return "", errors.New("anthropic returned no content")
+			return "", externalCallError(errors.New("anthropic returned no content"), false)
 		}
 
 		return result.Content[0].Text, nil
@@ -284,7 +288,7 @@ func newOllamaCaller(model, baseURL string) LLMCallFunc {
 
 		var result ollamaChatResponse
 		if err := json.Unmarshal(body, &result); err != nil {
-			return "", fmt.Errorf("unmarshal response: %w", err)
+			return "", externalCallError(fmt.Errorf("unmarshal response: %w", err), false)
 		}
 
 		return result.Message.Content, nil
@@ -292,14 +296,14 @@ func newOllamaCaller(model, baseURL string) LLMCallFunc {
 }
 
 // postJSON issues a JSON POST and returns the response body, retrying a
-// transient provider failure (429/502/503/504 or a transport blip) up to
+// transient provider failure (408/429/5xx or a transport blip) up to
 // llmCallRetries times. One timeout spans every attempt, so retries never
 // extend the handler's time budget past llmCallTimeout; a deadline or
 // cancellation stops retrying immediately.
 func postJSON(ctx context.Context, url string, reqBody any, headers map[string]string) ([]byte, error) {
 	data, err := json.Marshal(reqBody)
 	if err != nil {
-		return nil, fmt.Errorf("marshal request: %w", err)
+		return nil, externalCallError(fmt.Errorf("marshal request: %w", err), false)
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, llmCallTimeout)
@@ -310,26 +314,31 @@ func postJSON(ctx context.Context, url string, reqBody any, headers map[string]s
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				return nil, externalCallError(ctx.Err(), !errors.Is(ctx.Err(), context.Canceled))
 			case <-time.After(llmRetryBackoff):
 			}
 		}
 
 		body, status, err := doPostJSON(ctx, url, data, headers)
 		if err != nil {
-			lastErr = err
+			retryable := !errors.Is(err, errResponseBodyOverflow)
+			lastErr = externalCallError(err, retryable)
+			if !retryable {
+				return nil, lastErr
+			}
 			// A blown deadline or cancellation has no budget left to
 			// retry; a live-context transport blip does.
 			if ctx.Err() != nil {
-				return nil, err
+				return nil, externalCallError(err, !errors.Is(ctx.Err(), context.Canceled))
 			}
 			continue
 		}
 		if status == http.StatusOK {
 			return body, nil
 		}
-		lastErr = fmt.Errorf("API error (status %d): %s", status, string(body))
-		if !isRetryableStatus(status) {
+		retryable := isRetryableStatus(status)
+		lastErr = externalCallError(fmt.Errorf("API error (status %d): %s", status, string(body)), retryable)
+		if !retryable {
 			return nil, lastErr
 		}
 	}
@@ -354,20 +363,17 @@ func doPostJSON(ctx context.Context, url string, data []byte, headers map[string
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := readBounded(resp.Body, maxProviderResponseBytes)
 	if err != nil {
 		return nil, resp.StatusCode, fmt.Errorf("read response: %w", err)
 	}
 	return body, resp.StatusCode, nil
 }
 
-// isRetryableStatus reports whether an HTTP status is a transient
-// provider condition worth one more attempt.
+// isRetryableStatus reports whether an HTTP status is a transient upstream
+// condition worth another bounded attempt by provider clients and resumable
+// source processing by the Tapes client.
 func isRetryableStatus(status int) bool {
-	switch status {
-	case http.StatusTooManyRequests, http.StatusBadGateway,
-		http.StatusServiceUnavailable, http.StatusGatewayTimeout:
-		return true
-	}
-	return false
+	return status == http.StatusRequestTimeout || status == http.StatusTooManyRequests ||
+		status >= http.StatusInternalServerError
 }

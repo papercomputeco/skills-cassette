@@ -33,6 +33,52 @@ var ErrNotFound = errors.New("not found")
 // could use. Mapped to a 422 by the generate handler.
 var ErrNoTurns = errors.New("no turns in session after applying filters")
 
+// errResponseBodyOverflow marks a deterministic response-contract violation.
+// Unlike a transport read failure, repeating the same bounded request cannot
+// make an already oversized response admissible.
+var errResponseBodyOverflow = errors.New("response body exceeds configured limit")
+
+// ExternalCallError carries retry policy through Tapes and provider wrappers
+// without requiring generation orchestration to inspect raw error strings.
+// Error text remains for local diagnostics only; durable generation records use
+// curated bounded messages.
+type ExternalCallError struct {
+	Retryable bool
+	cause     error
+}
+
+func (e *ExternalCallError) Error() string {
+	if e == nil || e.cause == nil {
+		return "external call failed"
+	}
+	return e.cause.Error()
+}
+
+func (e *ExternalCallError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+// IsRetryableExternalError reports the typed retry policy attached by the
+// Tapes API or configured LLM provider boundary.
+func IsRetryableExternalError(err error) bool {
+	var callError *ExternalCallError
+	return errors.As(err, &callError) && callError.Retryable
+}
+
+func externalCallError(err error, retryable bool) error {
+	if err == nil {
+		return nil
+	}
+	var existing *ExternalCallError
+	if errors.As(err, &existing) {
+		return err
+	}
+	return &ExternalCallError{Retryable: retryable, cause: err}
+}
+
 // Querier is the read surface skill generation needs from the tapes
 // trace API: turn summaries for a session, and span payloads for one
 // turn. The HTTP client below implements it; tests substitute a fake.
@@ -230,29 +276,34 @@ func (c *APIClient) Trace(ctx context.Context, traceID string) (*Trace, error) {
 func (c *APIClient) getJSON(ctx context.Context, rawURL string, out any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return fmt.Errorf("creating request: %w", err)
+		return externalCallError(fmt.Errorf("creating request: %w", err), false)
 	}
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("request failed: %w", err)
+		return externalCallError(fmt.Errorf("request failed: %w", err), true)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusNotFound {
-		return ErrNotFound
+		return externalCallError(ErrNotFound, false)
 	}
 	if resp.StatusCode != http.StatusOK {
+		retryable := isRetryableStatus(resp.StatusCode)
 		body, readErr := readBounded(resp.Body, maxErrorResponseBytes)
 		if readErr != nil {
-			return fmt.Errorf("api returned status %d: %w", resp.StatusCode, readErr)
+			// Overflow is deterministic even when the status itself would be
+			// retryable. Actual response-body read failures remain transient.
+			retryable = retryable && !errors.Is(readErr, errResponseBodyOverflow)
+			return externalCallError(fmt.Errorf("api returned status %d: %w", resp.StatusCode, readErr), retryable)
 		}
-		return fmt.Errorf("api returned status %d: %s", resp.StatusCode, string(body))
+		return externalCallError(fmt.Errorf("api returned status %d: %s", resp.StatusCode, string(body)), retryable)
 	}
 	body, err := readBounded(resp.Body, maxTraceResponseBytes)
 	if err != nil {
-		return fmt.Errorf("reading response: %w", err)
+		retryable := !errors.Is(err, errResponseBodyOverflow)
+		return externalCallError(fmt.Errorf("reading response: %w", err), retryable)
 	}
 	if err := json.Unmarshal(body, out); err != nil {
-		return fmt.Errorf("decoding response: %w", err)
+		return externalCallError(fmt.Errorf("decoding response: %w", err), false)
 	}
 	return nil
 }
@@ -263,7 +314,7 @@ func readBounded(reader io.Reader, limit int64) ([]byte, error) {
 		return nil, err
 	}
 	if int64(len(body)) > limit {
-		return nil, fmt.Errorf("response body exceeds %d bytes", limit)
+		return nil, fmt.Errorf("%w: response body exceeds %d bytes", errResponseBodyOverflow, limit)
 	}
 	return body, nil
 }
