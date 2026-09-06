@@ -26,7 +26,21 @@ type PostgresStore struct {
 	schema string
 }
 
-var _ Store = (*PostgresStore)(nil)
+type postgresQuerier interface {
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+var (
+	_ Store              = (*PostgresStore)(nil)
+	_ SkillIdentityStore = (*PostgresStore)(nil)
+	_ RevisionStore      = (*PostgresStore)(nil)
+)
+
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation
+}
 
 // OpenPostgresStore connects to dsn, runs the cassette-owned migrations in
 // the schema named after the cassette, and returns the store.
@@ -49,95 +63,325 @@ func (s *PostgresStore) Kind() string { return "postgres" }
 // Close releases the connection pool.
 func (s *PostgresStore) Close() { s.pool.Close() }
 
-// migrate is the cassette's own migration, run at startup. This is the final
-// two-table form of the four historical Tapes migration steps (skills,
-// skill_versions + author_subject, download_count, id keys), re-homed without
-// org_id and without core foreign keys. It also publishes any legacy skill
-// with no history as v0.1.0; the insert trigger closes the same gap for older
-// writers during a rolling deployment. Identifiers are quoted because a
-// cassette name may legally contain a hyphen.
-func (s *PostgresStore) migrate(ctx context.Context) error {
-	schema := quoteIdentifier(s.schema)
-	statements := []string{
-		`CREATE SCHEMA IF NOT EXISTS ` + schema,
-		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s.skills (
-			id                         UUID NOT NULL,
-			slug                       TEXT NOT NULL,
-			name                       TEXT NOT NULL,
-			description                TEXT NOT NULL DEFAULT '',
-			type                       TEXT NOT NULL DEFAULT 'workflow',
-			version                    TEXT NOT NULL DEFAULT '0.1.0',
-			visibility                 TEXT NOT NULL DEFAULT 'private',
-			tags                       TEXT[] NOT NULL DEFAULT '{}',
-			content                    TEXT NOT NULL DEFAULT '',
-			is_ai_generated            BOOLEAN NOT NULL DEFAULT FALSE,
-			generated_from_session_ids TEXT[] NOT NULL DEFAULT '{}',
-			parent_id                  UUID,
-			author_subject             TEXT NOT NULL DEFAULT '',
-			download_count             BIGINT NOT NULL DEFAULT 0,
-			created_at                 TIMESTAMPTZ NOT NULL,
-			updated_at                 TIMESTAMPTZ NOT NULL,
-
-			CONSTRAINT skills_pkey PRIMARY KEY (id)
-		)`, schema),
-		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS skills_updated_idx
-			ON %s.skills (updated_at DESC, id DESC)`, schema),
-		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s.skill_versions (
-			skill_id       UUID NOT NULL,
-			version_number INT  NOT NULL,
-			semver         TEXT NOT NULL,
-			changelog       TEXT NOT NULL DEFAULT '',
-			content         TEXT NOT NULL DEFAULT '',
-			expected_content TEXT,
-			author_subject  TEXT NOT NULL DEFAULT '',
-			published_at   TIMESTAMPTZ NOT NULL,
-
-			CONSTRAINT skill_versions_pkey PRIMARY KEY (skill_id, version_number)
-		)`, schema),
-		fmt.Sprintf(`ALTER TABLE %s.skill_versions
-			ADD COLUMN IF NOT EXISTS expected_content TEXT`, schema),
-		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS skill_versions_skill_idx
-			ON %s.skill_versions (skill_id, version_number DESC)`, schema),
-		fmt.Sprintf(`CREATE OR REPLACE FUNCTION %s.publish_initial_skill_version()
-			RETURNS trigger LANGUAGE plpgsql AS $$
-			BEGIN
-				INSERT INTO %s.skill_versions (
-					skill_id, version_number, semver, changelog, content,
-					author_subject, published_at
-				) VALUES (NEW.id, 1, '0.1.0', '', NEW.content, NEW.author_subject, NEW.updated_at)
-				ON CONFLICT DO NOTHING;
-				RETURN NEW;
-			END
-			$$`, schema, schema),
-		fmt.Sprintf(`DROP TRIGGER IF EXISTS publish_initial_skill_version ON %s.skills`, schema),
-		fmt.Sprintf(`CREATE TRIGGER publish_initial_skill_version
-			AFTER INSERT ON %s.skills
-			FOR EACH ROW EXECUTE FUNCTION %s.publish_initial_skill_version()`, schema, schema),
-		fmt.Sprintf(`INSERT INTO %s.skill_versions (
-			skill_id, version_number, semver, changelog, content,
-			author_subject, published_at
-		)
-		SELECT id, 1, '0.1.0', '', content, author_subject, updated_at
-		FROM %s.skills skill
-		WHERE NOT EXISTS (
-			SELECT 1 FROM %s.skill_versions version WHERE version.skill_id = skill.id
-		)
-		ON CONFLICT DO NOTHING`, schema, schema, schema),
+// ResolveSkill normalizes a slug and atomically resolves it to one stable
+// identity. The conflict branch projects identity columns only: resolving a
+// slug owned by another creator cannot materialize that creator's revisions.
+func (s *PostgresStore) ResolveSkill(ctx context.Context, input ResolveSkillInput) (*SkillRecord, error) {
+	if !validUUID(input.ID) {
+		return nil, errors.New("resolve skill: id is required")
 	}
+	slug := normalizeSkillSlug(input.Slug)
+	if slug == "" {
+		return nil, errors.New("resolve skill: slug is required")
+	}
+	if input.CreatorSubject == "" {
+		return nil, errors.New("resolve skill: creator subject is required")
+	}
+
+	schema := quoteIdentifier(s.schema)
+	row := s.pool.QueryRow(ctx, fmt.Sprintf(`INSERT INTO %s.skills (
+			id, slug, name, author_subject, created_by_subject, created_at, updated_at
+		) VALUES ($1, $2, '', $3, $3, $4, $4)
+		ON CONFLICT (slug) WHERE migration_alias_of_skill_id IS NULL
+		DO UPDATE SET slug = EXCLUDED.slug
+		RETURNING id::text, slug, COALESCE(explicit_latest_revision_id::text, ''),
+			next_sequence_number,
+			CASE WHEN created_by_subject = $3 THEN created_by_subject ELSE '' END,
+			created_at, updated_at`, schema),
+		input.ID, slug, input.CreatorSubject, input.CreatedAt.UTC())
+
+	var record SkillRecord
+	if err := row.Scan(&record.ID, &record.Slug, &record.ExplicitLatestRevisionID,
+		&record.NextSequenceNumber, &record.CreatedBySubject, &record.CreatedAt,
+		&record.UpdatedAt); err != nil {
+		return nil, fmt.Errorf("resolve skill: %w", err)
+	}
+	return &record, nil
+}
+
+// AppendRevision allocates the next per-skill sequence and inserts one
+// complete immutable snapshot plus its creator-private visibility row in the
+// same short transaction. The skill-row lock also serializes idempotency-key
+// checks, so a retry never consumes another sequence.
+func (s *PostgresStore) AppendRevision(ctx context.Context, input AppendRevisionInput) (*SkillRevisionRecord, error) {
+	if !validUUID(input.ID) {
+		return nil, errors.New("append revision: id is required")
+	}
+	if !validUUID(input.SkillID) {
+		return nil, ErrSkillNotFound
+	}
+	if input.CreatorSubject == "" {
+		return nil, errors.New("append revision: creator subject is required")
+	}
+	if input.BasedOnRevisionID != "" && !validUUID(input.BasedOnRevisionID) {
+		return nil, ErrRevisionLineageInvalid
+	}
+	if input.SourceRevisionID != "" && !validUUID(input.SourceRevisionID) {
+		return nil, ErrRevisionLineageInvalid
+	}
+	if input.GenerationID != "" && !validUUID(input.GenerationID) {
+		return nil, ErrRevisionLineageInvalid
+	}
+	switch input.Origin {
+	case RevisionOriginManual, RevisionOriginGeneration, RevisionOriginDuplicate, RevisionOriginMigrated:
+	default:
+		return nil, errors.New("append revision: invalid origin")
+	}
+	var err error
+	input.Snapshot, err = normalizeAppendRevisionSnapshot(input.Origin, input.Snapshot)
+	if err != nil {
+		return nil, fmt.Errorf("append revision: %w", err)
+	}
+	createdAt := input.CreatedAt.UTC()
+	schema := quoteIdentifier(s.schema)
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return fmt.Errorf("begin skills migration tx: %w", err)
+		return nil, fmt.Errorf("begin append revision: %w", err)
 	}
-	defer tx.Rollback(ctx) //nolint:errcheck
-	for _, statement := range statements {
-		if _, err := tx.Exec(ctx, statement); err != nil {
-			return fmt.Errorf("migrating skills tables: %w", err)
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var lockedSkillID string
+	if err := tx.QueryRow(ctx, fmt.Sprintf(`SELECT id::text FROM %s.skills
+		WHERE id = $1 AND migration_alias_of_skill_id IS NULL FOR UPDATE`, schema), input.SkillID).Scan(&lockedSkillID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrSkillNotFound
+		}
+		return nil, fmt.Errorf("lock skill for revision append: %w", err)
+	}
+
+	existing, err := findAppendIdentity(ctx, tx, schema, input)
+	if err != nil {
+		return nil, err
+	}
+	if existing != nil {
+		if !revisionMatchesAppend(*existing, input) {
+			return nil, ErrRevisionConflict
+		}
+		return existing, nil
+	}
+
+	if input.BasedOnRevisionID != "" {
+		exists, lineageErr := revisionIsAccessibleLineage(ctx, tx, schema,
+			input.BasedOnRevisionID, input.SkillID, input.CreatorSubject, true)
+		if lineageErr != nil {
+			return nil, lineageErr
+		}
+		if !exists {
+			return nil, ErrRevisionLineageInvalid
 		}
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit skills migration tx: %w", err)
+	if input.SourceRevisionID != "" {
+		exists, lineageErr := revisionIsAccessibleLineage(ctx, tx, schema,
+			input.SourceRevisionID, input.SkillID, input.CreatorSubject, false)
+		if lineageErr != nil {
+			return nil, lineageErr
+		}
+		if !exists {
+			return nil, ErrRevisionLineageInvalid
+		}
 	}
-	return nil
+
+	var sequence int
+	if err := tx.QueryRow(ctx, fmt.Sprintf(`UPDATE %s.skills
+		SET next_sequence_number = next_sequence_number + 1, updated_at = GREATEST(updated_at, $2)
+		WHERE id = $1 RETURNING next_sequence_number - 1`, schema), input.SkillID, createdAt).Scan(&sequence); err != nil {
+		return nil, fmt.Errorf("allocate revision sequence: %w", err)
+	}
+
+	record := SkillRevisionRecord{
+		ID: input.ID, SkillID: input.SkillID, SequenceNumber: sequence,
+		Version: fmt.Sprintf("%d", sequence), CreatorSubject: input.CreatorSubject,
+		BasedOnRevisionID: input.BasedOnRevisionID, SourceRevisionID: input.SourceRevisionID,
+		Origin: input.Origin, Snapshot: input.Snapshot,
+		ContentSHA256: skillRevisionSnapshotSHA256(input.Snapshot), ChangeNote: input.ChangeNote,
+		GenerationID: input.GenerationID, IdempotencyKey: input.IdempotencyKey,
+		LegacyReference: input.LegacyReference, CreatedAt: createdAt,
+	}
+	_, err = tx.Exec(ctx, fmt.Sprintf(`INSERT INTO %s.skill_revisions (
+			id, skill_id, sequence_number, version, creator_subject,
+			based_on_revision_id, source_revision_id, origin, name, description,
+			type, tags, content, is_ai_generated, source_session_ids,
+			content_sha256, change_note, generation_id, idempotency_key,
+			legacy_reference, created_at
+		) VALUES (
+			$1, $2, $3, $4, $5, NULLIF($6, '')::uuid, NULLIF($7, '')::uuid,
+			$8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
+			NULLIF($18, '')::uuid, $19, NULLIF($20, ''), $21
+		)`, schema), record.ID, record.SkillID, record.SequenceNumber, record.Version,
+		record.CreatorSubject, record.BasedOnRevisionID, record.SourceRevisionID,
+		record.Origin, record.Snapshot.Name, record.Snapshot.Description,
+		record.Snapshot.Type, nonNilStrings(record.Snapshot.Tags), record.Snapshot.Content,
+		record.Snapshot.IsAIGenerated, nonNilStrings(record.Snapshot.SourceSessionIDs),
+		record.ContentSHA256, record.ChangeNote, record.GenerationID,
+		record.IdempotencyKey, record.LegacyReference, record.CreatedAt)
+	if err != nil {
+		return nil, appendRevisionError(err)
+	}
+	if _, err = tx.Exec(ctx, fmt.Sprintf(`INSERT INTO %s.skill_revision_visibility (
+			revision_id, is_public, changed_by_subject, changed_at
+		) VALUES ($1, FALSE, $2, $3)`, schema), record.ID, record.CreatorSubject, record.CreatedAt); err != nil {
+		return nil, fmt.Errorf("insert revision visibility: %w", err)
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit revision append: %w", err)
+	}
+	return &record, nil
+}
+
+func normalizeSkillSlug(slug string) string {
+	return strings.ToLower(strings.TrimSpace(slug))
+}
+
+const skillRevisionColumns = `r.id::text, r.skill_id::text, r.sequence_number, r.version,
+	r.creator_subject, COALESCE(r.based_on_revision_id::text, ''),
+	r.source_revision_id::text, r.origin, r.name, r.description, r.type, r.tags,
+	r.content, r.is_ai_generated, r.source_session_ids, r.content_sha256,
+	r.change_note, COALESCE(r.generation_id::text, ''), r.idempotency_key,
+	COALESCE(r.legacy_reference, ''), r.created_at`
+
+func findAppendIdentity(ctx context.Context, tx pgx.Tx, schema string, input AppendRevisionInput) (*SkillRevisionRecord, error) {
+	// Identity lookup deliberately has no visibility predicate. UUID,
+	// generation, legacy, and per-skill idempotency identities must conflict
+	// even when the existing revision is private to another creator. Only the
+	// bounded identity/access columns are read until accessibility is known.
+	rows, err := tx.Query(ctx, fmt.Sprintf(`SELECT r.id::text, r.creator_subject, visibility.is_public
+		FROM %s.skill_revisions r
+		JOIN %s.skill_revision_visibility visibility ON visibility.revision_id = r.id
+		WHERE r.id = $1
+		   OR ($2 <> '' AND r.skill_id = $3 AND r.idempotency_key = $2)
+		   OR ($4 <> '' AND r.generation_id = $4::uuid)
+		   OR ($5 <> '' AND r.legacy_reference = $5)
+		FOR UPDATE OF r`, schema, schema), input.ID, input.IdempotencyKey,
+		input.SkillID, input.GenerationID, input.LegacyReference)
+	if err != nil {
+		return nil, fmt.Errorf("find revision append identity: %w", err)
+	}
+	defer rows.Close()
+
+	var foundID string
+	var accessible bool
+	for rows.Next() {
+		var id, creator string
+		var isPublic bool
+		if err := rows.Scan(&id, &creator, &isPublic); err != nil {
+			return nil, fmt.Errorf("scan revision append identity: %w", err)
+		}
+		if foundID != "" && foundID != id {
+			return nil, ErrRevisionConflict
+		}
+		foundID = id
+		accessible = isPublic || creator == input.CreatorSubject
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("find revision append identity: %w", err)
+	}
+	rows.Close()
+	if foundID == "" {
+		return nil, nil
+	}
+	if !accessible {
+		return nil, ErrRevisionConflict
+	}
+
+	row := tx.QueryRow(ctx, fmt.Sprintf(`SELECT %s FROM %s.skill_revisions r
+		JOIN %s.skill_revision_visibility visibility ON visibility.revision_id = r.id
+		WHERE r.id = $1 AND (visibility.is_public OR r.creator_subject = $2)`,
+		skillRevisionColumns, schema, schema), foundID, input.CreatorSubject)
+	record, err := scanSkillRevision(row)
+	if err != nil {
+		return nil, fmt.Errorf("read accessible revision append identity: %w", err)
+	}
+	return &record, nil
+}
+
+func revisionIsAccessibleLineage(
+	ctx context.Context,
+	tx pgx.Tx,
+	schema string,
+	revisionID string,
+	targetSkillID string,
+	callerSubject string,
+	sameSkill bool,
+) (bool, error) {
+	skillPredicate := "r.skill_id = $2::uuid"
+	if !sameSkill {
+		skillPredicate = "r.skill_id <> $2::uuid"
+	}
+	var exists bool
+	if err := tx.QueryRow(ctx, fmt.Sprintf(`SELECT EXISTS (
+		SELECT 1 FROM %s.skill_revisions r
+		JOIN %s.skill_revision_visibility visibility ON visibility.revision_id = r.id
+		WHERE r.id = $1
+		  AND %s
+		  AND (visibility.is_public OR r.creator_subject = $3)
+	)`, schema, schema, skillPredicate), revisionID, targetSkillID, callerSubject).Scan(&exists); err != nil {
+		return false, fmt.Errorf("verify accessible revision lineage: %w", err)
+	}
+	return exists, nil
+}
+
+func scanSkillRevision(row interface{ Scan(...any) error }) (SkillRevisionRecord, error) {
+	var record SkillRevisionRecord
+	var sourceRevisionID pgtype.Text
+	err := row.Scan(&record.ID, &record.SkillID, &record.SequenceNumber, &record.Version,
+		&record.CreatorSubject, &record.BasedOnRevisionID, &sourceRevisionID,
+		&record.Origin, &record.Snapshot.Name, &record.Snapshot.Description,
+		&record.Snapshot.Type, &record.Snapshot.Tags, &record.Snapshot.Content,
+		&record.Snapshot.IsAIGenerated, &record.Snapshot.SourceSessionIDs,
+		&record.ContentSHA256, &record.ChangeNote, &record.GenerationID,
+		&record.IdempotencyKey, &record.LegacyReference, &record.CreatedAt)
+	if sourceRevisionID.Valid {
+		record.SourceRevisionID = sourceRevisionID.String
+	}
+	if err == nil {
+		record.Snapshot = canonicalSkillRevisionSnapshot(record.Snapshot)
+		record.CreatedAt = record.CreatedAt.UTC()
+	}
+	return record, err
+}
+
+func revisionMatchesAppend(record SkillRevisionRecord, input AppendRevisionInput) bool {
+	return record.SkillID == input.SkillID &&
+		record.CreatorSubject == input.CreatorSubject &&
+		record.BasedOnRevisionID == input.BasedOnRevisionID &&
+		record.SourceRevisionID == input.SourceRevisionID &&
+		record.Origin == input.Origin &&
+		record.Snapshot.Name == input.Snapshot.Name &&
+		record.Snapshot.Description == input.Snapshot.Description &&
+		record.Snapshot.Type == input.Snapshot.Type &&
+		equalStrings(record.Snapshot.Tags, input.Snapshot.Tags) &&
+		record.Snapshot.Content == input.Snapshot.Content &&
+		record.Snapshot.IsAIGenerated == input.Snapshot.IsAIGenerated &&
+		equalStrings(record.Snapshot.SourceSessionIDs, input.Snapshot.SourceSessionIDs) &&
+		record.ChangeNote == input.ChangeNote && record.GenerationID == input.GenerationID &&
+		record.IdempotencyKey == input.IdempotencyKey &&
+		record.LegacyReference == input.LegacyReference &&
+		record.ContentSHA256 == skillRevisionSnapshotSHA256(input.Snapshot)
+}
+
+func equalStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func appendRevisionError(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		switch pgErr.Code {
+		case pgUniqueViolation:
+			return ErrRevisionConflict
+		case "23503":
+			return ErrRevisionLineageInvalid
+		}
+	}
+	return fmt.Errorf("insert revision: %w", err)
 }
 
 // skillColumns is the SELECT list every skill read shares. UUIDs are projected
@@ -196,7 +440,9 @@ func (s *PostgresStore) UpsertSkill(ctx context.Context, rec SkillRecord) (*Skil
 }
 
 // CreatePublishedSkill inserts a skill and its first immutable version in one
-// transaction, so readers never observe a skill without version history.
+// transaction, so readers never observe a skill without version history. It is
+// part of the retained predecessor surface: the row it creates is a legacy
+// content head that the next migration pass recovers as a public revision.
 func (s *PostgresStore) CreatePublishedSkill(ctx context.Context, rec SkillRecord, version SkillVersionRecord) (*SkillRecord, error) {
 	if !validUUID(rec.ID) || version.SkillID != rec.ID || version.VersionNumber != 1 {
 		return nil, errors.New("create published skill: invalid initial version")
@@ -207,6 +453,11 @@ func (s *PostgresStore) CreatePublishedSkill(ctx context.Context, rec SkillRecor
 	rec.Version = version.Semver
 	rec.Content = version.Content
 	rec.UpdatedAt = version.PublishedAt
+	snapshot := canonicalPredecessorSkillSnapshot(predecessorSkillSnapshot{
+		Slug: rec.Slug, Name: rec.Name, Description: rec.Description, Type: rec.Type,
+		Tags: rec.Tags, Content: rec.Content, IsAIGenerated: rec.IsAIGenerated,
+		SourceSessionIDs: rec.GeneratedFromSessionIDs, ParentID: rec.ParentID,
+	})
 	schema := quoteIdentifier(s.schema)
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
@@ -214,30 +465,36 @@ func (s *PostgresStore) CreatePublishedSkill(ctx context.Context, rec SkillRecor
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
-	// skill_versions deliberately has no cross-table foreign key, so inserting
-	// the version first lets the skills INSERT trigger remain a safety net for
-	// older writers without duplicating this caller's changelog-bearing row.
+	// skill_versions deliberately has no cross-table foreign key, so the version
+	// is inserted first and a duplicate skill id rolls both rows back together.
 	insertVersion := fmt.Sprintf(`INSERT INTO %s.skill_versions (
-			skill_id, version_number, semver, changelog, content, expected_content,
+			skill_id, version_number, semver, changelog, slug, name, description,
+			type, visibility, tags, content, is_ai_generated,
+			generated_from_session_ids, parent_id, content_sha256, expected_content,
 			author_subject, published_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`, schema)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+			$13, NULLIF($14, '')::uuid, $15, $16, $17, $18)`, schema)
 	if _, err := tx.Exec(ctx, insertVersion,
 		version.SkillID, version.VersionNumber, version.Semver, version.Changelog,
-		version.Content, version.ExpectedContent, version.AuthorSubject, version.PublishedAt); err != nil {
+		snapshot.Slug, snapshot.Name, snapshot.Description, snapshot.Type,
+		rec.Visibility, nonNilStrings(snapshot.Tags), version.Content,
+		snapshot.IsAIGenerated, nonNilStrings(snapshot.SourceSessionIDs),
+		snapshot.ParentID, predecessorSkillSnapshotSHA256(snapshot), version.ExpectedContent,
+		version.AuthorSubject, version.PublishedAt); err != nil {
 		return nil, fmt.Errorf("insert initial skill version: %w", err)
 	}
 
 	insertSkill := fmt.Sprintf(`INSERT INTO %s.skills (
 			id, slug, name, description, type, version, visibility, tags, content,
 			is_ai_generated, generated_from_session_ids, parent_id, author_subject,
-			created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NULLIF($12, '')::uuid, $13, $14, $15)
+			current_version_number, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NULLIF($12, '')::uuid, $13, $14, $15, $16)
 		RETURNING `+skillColumns, schema)
 	out, err := scanSkill(tx.QueryRow(ctx, insertSkill,
 		rec.ID, rec.Slug, rec.Name, rec.Description, rec.Type, rec.Version, rec.Visibility,
 		nonNilStrings(rec.Tags), rec.Content, rec.IsAIGenerated,
 		nonNilStrings(rec.GeneratedFromSessionIDs), rec.ParentID, rec.AuthorSubject,
-		rec.CreatedAt, rec.UpdatedAt))
+		version.VersionNumber, rec.CreatedAt, rec.UpdatedAt))
 	if err != nil {
 		return nil, fmt.Errorf("insert published skill: %w", err)
 	}
@@ -303,12 +560,13 @@ func (s *PostgresStore) DeleteSkill(ctx context.Context, id string) (bool, error
 	return tag.RowsAffected() > 0, nil
 }
 
-// searchPredicate mirrors the pre-cutover ILIKE search over name, description,
-// and tags. $1 is the nullable query text in every list/count statement.
+// searchPredicate mirrors the pre-cutover case-insensitive substring search
+// over name, description, and tags. $1 is a nullable literal ILIKE pattern;
+// callers escape wildcard and escape characters before binding it.
 const searchPredicate = `($1::text IS NULL
-	OR name ILIKE '%' || $1::text || '%'
-	OR description ILIKE '%' || $1::text || '%'
-	OR EXISTS (SELECT 1 FROM unnest(tags) tag WHERE tag ILIKE '%' || $1::text || '%'))`
+	OR name ILIKE $1::text ESCAPE E'\\'
+	OR description ILIKE $1::text ESCAPE E'\\'
+	OR EXISTS (SELECT 1 FROM unnest(tags) tag WHERE tag ILIKE $1::text ESCAPE E'\\'))`
 
 // ListSkills returns one keyset page honoring the optional search/scope
 // filters, any armed external attachment-view filters, the requested sort,
@@ -321,10 +579,14 @@ func (s *PostgresStore) ListSkills(ctx context.Context, opts SkillListOpts) ([]S
 	}
 	schema := quoteIdentifier(s.schema)
 
-	selectHead := fmt.Sprintf(`SELECT %s FROM %s.skills WHERE `, skillColumns, schema)
+	selectHead := fmt.Sprintf(`SELECT %s FROM %s.skills WHERE
+		migration_alias_of_skill_id IS NULL AND
+		(created_by_subject = '' OR EXISTS (
+			SELECT 1 FROM %s.skill_revisions revision WHERE revision.skill_id = skills.id
+		)) AND `, skillColumns, schema, schema)
 
 	var where, orderBy string
-	args := []any{nullText(opts.Query), nullText(opts.Author), nullText(opts.NotAuthor)}
+	args := []any{literalILikePattern(opts.Query), nullText(opts.Author), nullText(opts.NotAuthor)}
 	if opts.Sort == SkillSortDownloads {
 		where = searchPredicate + `
 			  AND ($2::text IS NULL OR author_subject = $2::text)
@@ -348,7 +610,7 @@ func (s *PostgresStore) ListSkills(ctx context.Context, opts SkillListOpts) ([]S
 		orderBy = `ORDER BY updated_at DESC, id DESC`
 		args = append(args, opts.CursorTs, nullText(opts.CursorID))
 	}
-	where, args = appendExternalFilterPredicates(where, args, opts.External)
+	where, args = appendExternalFilterPredicates(where, args, schema, opts.External)
 	args = append(args, limit)
 	query := selectHead + where + fmt.Sprintf(`
 			%s
@@ -381,11 +643,17 @@ func listSkillsError(err error, opts SkillListOpts) error {
 
 // appendExternalFilterPredicates renders one EXISTS per configured filter
 // value against the deployment-granted external view, ANDed onto the where
-// clause. The view identifier passes through the quoting helper (config
-// validation constrains its grammar upstream; quoting is belt and braces),
-// and the type discriminator and every value bind as positional args — no
-// configured string is ever interpolated as data.
-func appendExternalFilterPredicates(where string, args []any, filters []ExternalAttachmentFilter) (string, []any) {
+// clause. Attachments to predecessor IDs coalesced by migration also match the
+// one canonical outer identity; aliases themselves remain excluded by each
+// caller's outer predicate. The view identifier passes through the quoting
+// helper (config validation constrains its grammar upstream; quoting is belt
+// and braces), and all configured data binds as positional arguments.
+func appendExternalFilterPredicates(
+	where string,
+	args []any,
+	schema string,
+	filters []ExternalAttachmentFilter,
+) (string, []any) {
 	for _, filter := range filters {
 		view := quoteQualifiedIdentifier(filter.View)
 		for _, value := range filter.Values {
@@ -394,9 +662,16 @@ func appendExternalFilterPredicates(where string, args []any, filters []External
 			  AND EXISTS (
 			    SELECT 1 FROM %s ext
 			    WHERE ext.primitive_type = $%d
-			      AND ext.primitive_id = skills.id::text
 			      AND ext.value = $%d
-			  )`, view, len(args)-1, len(args))
+			      AND (
+			        ext.primitive_id = skills.id::text
+			        OR EXISTS (
+			          SELECT 1 FROM %s.skills attachment_alias
+			          WHERE attachment_alias.id::text = ext.primitive_id
+			            AND attachment_alias.migration_alias_of_skill_id = skills.id
+			        )
+			      )
+			  )`, view, len(args)-1, len(args), schema)
 		}
 	}
 	return where, args
@@ -465,14 +740,18 @@ func (s *PostgresStore) ListSkillsBySession(ctx context.Context, sessionID strin
 // surfaces as ErrExternalViewUnavailable, the same loud degradation as the
 // page query, never silently unfiltered totals.
 func (s *PostgresStore) CountSkills(ctx context.Context, opts SkillCountOpts) (SkillCounts, error) {
+	schema := quoteIdentifier(s.schema)
 	where := searchPredicate
-	args := []any{nullText(opts.Query), opts.Author}
-	where, args = appendExternalFilterPredicates(where, args, opts.External)
+	args := []any{literalILikePattern(opts.Query), opts.Author}
+	where, args = appendExternalFilterPredicates(where, args, schema, opts.External)
 	statement := fmt.Sprintf(`SELECT
 			COUNT(*)::bigint AS total,
 			COUNT(*) FILTER (WHERE author_subject = $2)::bigint AS mine
 		FROM %s.skills
-		WHERE `, quoteIdentifier(s.schema)) + where
+		WHERE migration_alias_of_skill_id IS NULL AND
+		(created_by_subject = '' OR EXISTS (
+			SELECT 1 FROM %s.skill_revisions revision WHERE revision.skill_id = skills.id
+		)) AND `, schema, schema) + where
 	var counts SkillCounts
 	if err := s.pool.QueryRow(ctx, statement, args...).
 		Scan(&counts.Total, &counts.Mine); err != nil {
@@ -518,11 +797,19 @@ func (s *PostgresStore) PublishSkillVersion(ctx context.Context, rec SkillVersio
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
-	var current string
+	var (
+		current    string
+		snapshot   predecessorSkillSnapshot
+		visibility string
+	)
 	err = tx.QueryRow(ctx,
-		fmt.Sprintf(`SELECT content FROM %s.skills WHERE id = $1 FOR UPDATE`, schema),
+		fmt.Sprintf(`SELECT slug, name, description, type, visibility, tags, content,
+			is_ai_generated, generated_from_session_ids, COALESCE(parent_id::text, '')
+			FROM %s.skills WHERE id = $1 FOR UPDATE`, schema),
 		rec.SkillID,
-	).Scan(&current)
+	).Scan(&snapshot.Slug, &snapshot.Name, &snapshot.Description, &snapshot.Type,
+		&visibility, &snapshot.Tags, &current, &snapshot.IsAIGenerated,
+		&snapshot.SourceSessionIDs, &snapshot.ParentID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrSkillChanged
 	}
@@ -537,17 +824,25 @@ func (s *PostgresStore) PublishSkillVersion(ctx context.Context, rec SkillVersio
 		return nil, ErrSkillChanged
 	}
 
+	snapshot.Content = rec.Content
 	insert := fmt.Sprintf(`INSERT INTO %s.skill_versions (
-			skill_id, version_number, semver, changelog, content, expected_content,
+			skill_id, version_number, semver, changelog, slug, name, description,
+			type, visibility, tags, content, is_ai_generated,
+			generated_from_session_ids, parent_id, content_sha256, expected_content,
 			author_subject, published_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+			$13, NULLIF($14, '')::uuid, $15, $16, $17, $18)
 		RETURNING skill_id::text, version_number, semver, changelog, content,
 			expected_content, author_subject, published_at`, schema)
 	var out SkillVersionRecord
 	var expectedContent pgtype.Text
 	err = tx.QueryRow(ctx, insert,
-		rec.SkillID, rec.VersionNumber, rec.Semver, rec.Changelog, rec.Content,
-		rec.ExpectedContent, rec.AuthorSubject, rec.PublishedAt).
+		rec.SkillID, rec.VersionNumber, rec.Semver, rec.Changelog,
+		snapshot.Slug, snapshot.Name, snapshot.Description, snapshot.Type,
+		visibility, nonNilStrings(snapshot.Tags), rec.Content,
+		snapshot.IsAIGenerated, nonNilStrings(snapshot.SourceSessionIDs),
+		snapshot.ParentID, predecessorSkillSnapshotSHA256(snapshot), rec.ExpectedContent,
+		rec.AuthorSubject, rec.PublishedAt).
 		Scan(&out.SkillID, &out.VersionNumber, &out.Semver, &out.Changelog,
 			&out.Content, &expectedContent, &out.AuthorSubject, &out.PublishedAt)
 	if err != nil {
@@ -564,7 +859,7 @@ func (s *PostgresStore) PublishSkillVersion(ctx context.Context, rec SkillVersio
 	}
 
 	bump := fmt.Sprintf(`UPDATE %s.skills
-		SET version = $1, content = $2, updated_at = $3
+		SET version = $1, content = $2, updated_at = $3, current_version_number = $5
 		WHERE id = $4
 		  AND NOT EXISTS (
 		    SELECT 1 FROM %s.skill_versions
@@ -646,8 +941,25 @@ func collectSkills(rows pgx.Rows) ([]SkillRecord, error) {
 	return out, rows.Err()
 }
 
-// nullText maps the empty string to SQL NULL so the optional query/scope
-// predicates disable, mirroring the pre-cutover pgtype.Text behavior.
+// literalILikePattern turns a user query into a case-insensitive literal
+// substring pattern. Percent, underscore, and the escape character itself
+// must be escaped so Postgres matches the same strings.Contains semantics as
+// the memory store. An empty query remains SQL NULL and disables the filter.
+func literalILikePattern(query string) *string {
+	if query == "" {
+		return nil
+	}
+	escaped := strings.NewReplacer(
+		`\`, `\\`,
+		`%`, `\%`,
+		`_`, `\_`,
+	).Replace(query)
+	pattern := "%" + escaped + "%"
+	return &pattern
+}
+
+// nullText maps the empty string to SQL NULL so optional scope predicates
+// disable, mirroring the pre-cutover pgtype.Text behavior.
 func nullText(s string) *string {
 	if s == "" {
 		return nil
