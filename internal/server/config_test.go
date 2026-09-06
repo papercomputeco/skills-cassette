@@ -65,8 +65,11 @@ var _ = Describe("config from env", func() {
 	})
 
 	It("defaults the name when the environment is empty", func() {
-		GinkgoT().Setenv("CASSETTE_NAME", "")
-		Expect(server.ConfigFromEnv().Name).To(Equal(server.DefaultName))
+		for _, key := range []string{"CASSETTE_NAME", "CASSETTE_CORE_URL"} {
+			GinkgoT().Setenv(key, "")
+		}
+		cfg := server.ConfigFromEnv()
+		Expect(cfg.Name).To(Equal(server.DefaultName))
 	})
 })
 

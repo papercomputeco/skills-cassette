@@ -26,7 +26,7 @@ name = "skills"
 # of any given image is the tag it was released under. See internal/server.
 version = "0.0.0"
 display_name = "Skills"
-description = "Generates, stores, versions, and serves reusable SKILL.md skills extracted from Tapes sessions."
+description = "Stores immutable skill revisions and orchestrates durable generation from Tapes sessions."
 license = "MIT OR Apache-2.0"
 homepage = "https://github.com/papercomputeco/skills-cassette"
 image = "public.ecr.aws/g4e5l3z3/papercomputeco/skills-cassette:v0.0.0"
@@ -54,7 +54,25 @@ prefix_path = "api"
 name = "skills"
 
 [[tables]]
-name = "skill_versions"
+name = "skill_revisions"
+
+[[tables]]
+name = "skill_revision_visibility"
+
+[[tables]]
+name = "skill_generations"
+
+[[tables]]
+name = "generation_sessions"
+
+[[tables]]
+name = "generation_candidates"
+
+[[tables]]
+name = "candidate_evaluations"
+
+[[tables]]
+name = "generation_diagnostics"
 
 # Configuration this cassette accepts, published as schema so a deployment can
 # render a form or validate values. Tapes never supplies these; the deployment
@@ -65,14 +83,14 @@ name = "skill_versions"
 key = "core.url"
 type = "string"
 required = true
-description = "Tapes core API origin the generator reads trace transcripts from."
+description = "Tapes core API origin used for trace reads and tenant-local skills-evaluator calls."
 
 [[config]]
 key = "llm.provider"
 type = "string"
 default = "openai"
 enum = ["openai", "anthropic", "ollama"]
-description = "LLM provider used to extract skills."
+description = "LLM provider used to generate independent per-session candidates."
 
 [[config]]
 key = "llm.model"
@@ -89,6 +107,110 @@ description = "Provider API key. Not required for ollama."
 key = "llm.base_url"
 type = "string"
 description = "Provider base URL override for proxies and self-hosted endpoints."
+
+[[config]]
+key = "generation.worker_concurrency"
+type = "int"
+default = 2
+min = 1
+max = 64
+description = "Maximum concurrently claimed generations in this cassette process."
+
+[[config]]
+key = "generation.max_sessions"
+type = "int"
+default = 8
+min = 1
+max = 100
+description = "Maximum selected sessions processed by one asynchronous generation."
+
+[[config]]
+key = "generation.candidate_concurrency"
+type = "int"
+default = 2
+min = 1
+max = 100
+description = "Requested candidate-generation and candidate-evaluation external-call concurrency per generation; the effective value is deterministically min(candidate_concurrency, max_sessions)."
+
+[[config]]
+key = "generation.poll_interval_ms"
+type = "int"
+default = 250
+min = 10
+max = 60000
+description = "Initial empty-queue and polling failure delay in milliseconds."
+
+[[config]]
+key = "generation.max_poll_interval_ms"
+type = "int"
+default = 5000
+min = 10
+max = 300000
+description = "Maximum exponential empty-queue and polling failure delay in milliseconds."
+
+[[config]]
+key = "generation.lease_duration_ms"
+type = "int"
+default = 120000
+min = 1000
+max = 3600000
+description = "Generation claim lease duration in milliseconds."
+
+[[config]]
+key = "generation.heartbeat_interval_ms"
+type = "int"
+default = 30000
+min = 100
+max = 600000
+description = "Claim renewal interval in milliseconds; it must remain shorter than the lease duration."
+
+[[config]]
+key = "generation.processing_timeout_ms"
+type = "int"
+default = 300000
+min = 1000
+max = 3600000
+description = "Maximum wall time for one claimed generation attempt in milliseconds."
+
+[[config]]
+key = "generation.drain_timeout_ms"
+type = "int"
+default = 10000
+min = 1000
+max = 300000
+description = "Maximum graceful worker drain wait in milliseconds after shutdown."
+
+[[config]]
+key = "generation.retry_backoff_ms"
+type = "int"
+default = 1000
+min = 10
+max = 300000
+description = "Initial durable retry delay before bounded jitter in milliseconds."
+
+[[config]]
+key = "generation.max_retry_backoff_ms"
+type = "int"
+default = 30000
+min = 10
+max = 3600000
+description = "Maximum durable retry delay before bounded jitter in milliseconds."
+
+[[config]]
+key = "generation.max_attempts"
+type = "int"
+default = 3
+min = 1
+max = 10
+description = "Maximum durable claim attempts before terminal failure."
+
+[[config]]
+key = "generation.max_transcript_bytes"
+type = "int"
+default = 1048576
+min = 4096
+max = 1048576
+description = "Maximum rendered bytes supplied to any one candidate inference."
 
 # External attachment-view filters. The manifest declares only this generic
 # schema; every VALUE — which params exist, which views they read, which

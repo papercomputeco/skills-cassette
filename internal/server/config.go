@@ -29,8 +29,8 @@ const DefaultName = "skills"
 type Config struct {
 	// Name is the installed cassette name (route prefix and schema).
 	Name string
-	// CoreURL is the Tapes core API origin the generator reads trace
-	// transcripts from (GET /v1/traces?session_id= and GET /v1/traces/{id}).
+	// CoreURL is the tenant-local Tapes core origin used for trace reads and
+	// calls to the skills-evaluator cassette.
 	CoreURL string
 	// LLM configures the provider used by POST generate.
 	LLM skill.LLMCallerConfig

@@ -1,7 +1,7 @@
 package server
 
 import (
-	"context"
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
@@ -19,979 +20,512 @@ import (
 )
 
 const (
-	defaultSkillsLimit = 24
-	maxSkillsLimit     = 100
+	defaultSkillsLimit       = 24
+	maxSkillsLimit           = 100
+	maxSkillSlugCodePoints   = 128
+	maxSkillQueryCodePoints  = 1024
+	maxSkillCursorCodePoints = 1024
+	maxExternalFilterValues  = 100
+	// The worst accepted rendering is below 11 MiB: at most 6 MiB for the
+	// JSON-escaped description, 4 MiB for raw content, and 256 KiB for all
+	// other bounded frontmatter plus framing. Twelve MiB leaves fixed headroom
+	// without making the response unbounded.
+	maxSkillMarkdownOutputCodePoints = 12 << 20
+	maxSkillMarkdownOutputBytes      = 12 << 20
 )
 
-// errorResponse is the uniform error envelope, matching the shape the Tapes
-// skills API served ({"error": "..."}).
-type errorResponse struct {
-	Error string `json:"error"`
+var errListAuthenticationRequired = errors.New("authenticated list scope required")
+
+// resolveSkillRequest resolves a normalized tenant-local slug. Creator
+// attribution comes only from authContext.
+type resolveSkillRequest struct {
+	Slug *string `json:"slug"`
 }
 
-// skillsCursor is the opaque keyset cursor for the skills list. It carries the
-// last row's id plus both possible sort keys (updated_at and download_count);
-// the active sort decides which one the next page filters on. Same base64(JSON)
-// encoding sessions use. The console resets the cursor when the sort changes, so
-// a cursor is only ever decoded under the sort that produced it.
-type skillsCursor struct {
-	UpdatedAt time.Time `json:"ts"`
-	Downloads int64     `json:"dc"`
-	ID        string    `json:"id"`
+// skillIdentityResponse contains stable identity metadata only. Resolving a
+// slug never returns another creator's private revision metadata.
+type skillIdentityResponse struct {
+	ID                       string  `json:"id"`
+	Slug                     string  `json:"slug"`
+	ExplicitLatestRevisionID *string `json:"explicitLatestRevisionId"`
+	CreatedAt                string  `json:"createdAt"`
 }
 
-func encodeSkillsCursor(c skillsCursor) string {
-	b, err := json.Marshal(c)
-	if err != nil {
-		panic(fmt.Sprintf("encoding skills cursor: %v", err))
-	}
-	return base64.RawURLEncoding.EncodeToString(b)
+// effectiveSkillResponse is the bounded viewer-aware card/detail projection.
+// EffectiveRevision is public; NewestPrivateRevision can only belong to the
+// current viewer; CardRevision selects one of those two without another read.
+type effectiveSkillResponse struct {
+	ID                       string            `json:"id"`
+	Slug                     string            `json:"slug"`
+	ExplicitLatestRevisionID *string           `json:"explicitLatestRevisionId"`
+	EffectiveRevision        *revisionResponse `json:"effectiveRevision"`
+	NewestPrivateRevision    *revisionResponse `json:"newestPrivateRevision"`
+	CardRevision             *revisionResponse `json:"cardRevision"`
+	HasNewerPrivateRevision  bool              `json:"hasNewerPrivateRevision"`
+	DownloadCount            int64             `json:"downloadCount"`
+	CreatedAt                string            `json:"createdAt"`
+	UpdatedAt                string            `json:"updatedAt"`
 }
 
-func decodeSkillsCursor(token string) (skillsCursor, error) {
-	if token == "" {
-		return skillsCursor{}, nil
-	}
-	raw, err := base64.RawURLEncoding.DecodeString(token)
-	if err != nil {
-		return skillsCursor{}, fmt.Errorf("invalid cursor: %w", err)
-	}
-	var c skillsCursor
-	if err := json.Unmarshal(raw, &c); err != nil {
-		return skillsCursor{}, fmt.Errorf("invalid cursor: %w", err)
-	}
-	if c.ID == "" {
-		return skillsCursor{}, errors.New("invalid cursor: missing id")
-	}
-	return c, nil
+type effectiveSkillsListResponse struct {
+	Items      []effectiveSkillResponse `json:"items"`
+	NextCursor string                   `json:"nextCursor,omitempty"`
+	Counts     skillCountsResponse      `json:"counts"`
 }
 
-// authSubjectHeader carries the gateway-trusted user id (JWT sub). We trust it
-// the same way the core does: the edge gateway stamps it from a validated JWT
-// (and strips any client-sent value); in the local clearing the console sets
-// it directly since it reaches the cassette without the gateway in path.
-const authSubjectHeader = "x-paper-auth-subject"
-
-func authSubjectFromRequest(r *http.Request) string {
-	return strings.TrimSpace(r.Header.Get(authSubjectHeader))
-}
-
-// decodeJSONBody parses the whole request body as exactly one JSON value.
-// Unmarshalling the full body (rather than a streaming Decode of the first
-// value) refuses trailing data — `{"a":1}{"b":2}` is a malformed request, not
-// the first object — matching the pre-cutover fiber BodyParser semantics. An
-// empty body returns io.EOF so callers that accept one (publish) can allow it.
-func decodeJSONBody(r *http.Request, out any) error {
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		return err
-	}
-	if len(body) == 0 {
-		return io.EOF
-	}
-	return json.Unmarshal(body, out)
-}
-
-func writeJSON(w http.ResponseWriter, status int, body any) {
-	data, err := json.Marshal(body)
-	if err != nil {
-		// Every body written here is a struct of plain fields; failure means
-		// the handler is wrong, not the request.
-		http.Error(w, `{"error":"encoding response failed"}`, http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_, _ = w.Write(data)
-}
-
-// generateSkillRequest is the POST generate body. It mirrors the console's
-// GenerateSkillInput: the client nominates source sessions plus optional
-// hints, and the server is authoritative on the skill body. Wire shape is
-// camelCase to match the console's skills schemas (which predate and diverge
-// from the snake_case convention the rest of tapes uses).
-type generateSkillRequest struct {
-	SessionIDs []string `json:"sessionIds"`
-	Hint       *struct {
-		Name        string   `json:"name"`
-		Description string   `json:"description"`
-		Type        string   `json:"type"`
-		Tags        []string `json:"tags"`
-	} `json:"hint"`
-}
-
-// skillResponse is the unified Skill shape the console expects (camelCase). id
-// is the opaque identity / route key; slug is a cosmetic display label. content
-// always lives on the skill row (versions are history only); parentId is null
-// unless the skill is a duplicate/fork.
-type skillResponse struct {
-	ID                    string   `json:"id"`
-	Slug                  string   `json:"slug"`
-	ParentID              *string  `json:"parentId"`
-	Name                  string   `json:"name"`
-	Description           string   `json:"description"`
-	Type                  string   `json:"type"`
-	Version               string   `json:"version"`
-	Visibility            string   `json:"visibility"`
-	Tags                  []string `json:"tags"`
-	Content               string   `json:"content"`
-	IsAIGenerated         bool     `json:"isAiGenerated"`
-	OriginatingSessionIDs []string `json:"originatingSessionIds"`
-	AuthorID              string   `json:"authorId"`
-	DownloadCount         int64    `json:"downloadCount"`
-	CreatedAt             string   `json:"createdAt"`
-	UpdatedAt             string   `json:"updatedAt"`
-}
-
-// skillVersionResponse is one immutable published snapshot.
-type skillVersionResponse struct {
-	ID            string `json:"id"`
-	SkillID       string `json:"skillId"`
-	VersionNumber int    `json:"versionNumber"`
-	Semver        string `json:"semver"`
-	PublishedAt   string `json:"publishedAt"`
-	Changelog     string `json:"changelog"`
-	Content       string `json:"content"`
-	AuthorID      string `json:"authorId"`
-}
-
-// skillsListResponse is the paginated list envelope: one keyset page plus the
-// opaque next_cursor and the per-tab counts for the active search.
-type skillsListResponse struct {
-	Items      []skillResponse `json:"items"`
-	NextCursor string          `json:"next_cursor,omitempty"`
-	Counts     skillCountsResp `json:"counts"`
-}
-
-// skillCountsResp are the tab counts for the current search: all matching,
-// authored by the caller (mine), and everyone else's (team = all - mine).
-type skillCountsResp struct {
+type skillCountsResponse struct {
 	All  int64 `json:"all"`
 	Mine int64 `json:"mine"`
 	Team int64 `json:"team"`
 }
 
-// sessionSkillsResponse is the envelope for the skills attributed to one
-// session (?session_id=). Unpaginated: a session's skill count is bounded by
-// what was generated from it. It matches the shape legacy
-// GET /v1/sessions/:id/skills callers received.
 type sessionSkillsResponse struct {
-	Items []skillResponse `json:"items"`
+	Items []effectiveSkillResponse `json:"items"`
 }
 
-// skillVersionsResponse is the full version history for one skill, newest
-// first. TotalCount is the length of Versions — the history is returned whole
-// rather than paged, so the two never disagree.
-type skillVersionsResponse struct {
-	Versions   []skillVersionResponse `json:"versions"`
-	TotalCount int                    `json:"totalCount"`
-}
-
-// handleGenerateSkill runs the pkg/skill LLM generator over the requested
-// sessions, atomically publishes the result as v0.1.0, and returns it.
+// skillsCursor is the opaque keyset cursor for effective skill lists. UpdatedAt
+// is the selected card revision creation time; downloads is the alternate sort
+// key; ID is the stable tiebreak.
 //
-// The generator reads session transcripts through the cassette's HTTP trace
-// client bound to the configured core URL (GET /v1/traces?session_id= and
-// GET /v1/traces/{id}) — the cassette holds no core database credential.
-func (s *Server) handleGenerateSkill(w http.ResponseWriter, r *http.Request) {
-	var req generateSkillRequest
-	if err := decodeJSONBody(r, &req); err != nil {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid request body"})
-		return
-	}
-	if len(req.SessionIDs) == 0 {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "sessionIds is required and must be non-empty"})
-		return
-	}
-
-	skillType := "workflow"
-	if req.Hint != nil && strings.TrimSpace(req.Hint.Type) != "" {
-		skillType = strings.TrimSpace(req.Hint.Type)
-	}
-	if !skill.ValidSkillType(skillType) {
-		writeJSON(w, http.StatusBadRequest, errorResponse{
-			Error: fmt.Sprintf("invalid type %q; valid types: %s", skillType, strings.Join(skill.SkillTypes, ", ")),
-		})
-		return
-	}
-
-	// name may be empty — the generator then suggests a descriptive name from
-	// the transcript rather than a generic skill-from-<id> placeholder.
-	name := ""
-	if req.Hint != nil {
-		name = strings.TrimSpace(req.Hint.Name)
-	}
-
-	if s.querier == nil {
-		writeJSON(w, http.StatusNotImplemented, errorResponse{
-			Error: "skill generation requires a configured core url (CASSETTE_CORE_URL)",
-		})
-		return
-	}
-
-	llmCfg := s.llm
-	if strings.TrimSpace(llmCfg.Provider) == "" {
-		llmCfg.Provider = "openai"
-	}
-	llmCaller, err := skill.NewLLMCaller(llmCfg)
-	if err != nil {
-		// A missing provider key is a deployment configuration gap, not a
-		// server fault. Surface it as an actionable 422 rather than a 500.
-		if errors.Is(err, skill.ErrNoAPIKey) {
-			writeJSON(w, http.StatusUnprocessableEntity, errorResponse{
-				Error: "skill generation requires a configured LLM provider API key",
-			})
-			return
-		}
-		s.logger.Error("configure llm for skill generation", "error", err)
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "llm provider not configured"})
-		return
-	}
-
-	sk, err := skill.NewGenerator(s.querier, llmCaller).Generate(r.Context(), req.SessionIDs, name, skillType, nil)
-	if err != nil {
-		// A source session the core answered 404 for is a 404 here, not a
-		// server fault; a session with no usable turns is a 422.
-		if errors.Is(err, skill.ErrNotFound) {
-			writeJSON(w, http.StatusNotFound, errorResponse{Error: "one or more source sessions were not found"})
-			return
-		}
-		if errors.Is(err, skill.ErrNoTurns) {
-			writeJSON(w, http.StatusUnprocessableEntity, errorResponse{
-				Error: "the source sessions carried nothing the generator could use",
-			})
-			return
-		}
-		s.logger.Error("generate skill", "error", err)
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: fmt.Sprintf("failed to generate skill: %v", err)})
-		return
-	}
-
-	now := time.Now().UTC()
-	displayName := strings.TrimSpace(sk.Name)
-	slug := slugifySkillName(displayName)
-	if slug == "" {
-		slug = fallbackSkillName(req.SessionIDs[0])
-		displayName = slug
-	}
-	// Skills are keyed on an opaque id, so slug no longer has to be unique — two
-	// generations whose names slugify the same coexist as distinct ids. Mint the
-	// id here so the client can navigate to the new skill.
-	rec := storage.SkillRecord{
-		ID:                      uuid.NewString(),
-		Slug:                    slug,
-		Name:                    displayName,
-		Description:             sk.Description,
-		Type:                    sk.Type,
-		Version:                 sk.Version,
-		Visibility:              "private",
-		Tags:                    sk.Tags,
-		Content:                 sk.Content,
-		IsAIGenerated:           true,
-		GeneratedFromSessionIDs: sk.Sessions,
-		AuthorSubject:           authSubjectFromRequest(r),
-		CreatedAt:               now,
-		UpdatedAt:               now,
-	}
-
-	saved, err := s.store.CreatePublishedSkill(r.Context(), rec, initialVersion(rec, ""))
-	if err != nil {
-		s.logger.Error("persist generated skill", "error", err)
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "failed to persist generated skill"})
-		return
-	}
-
-	writeJSON(w, http.StatusCreated, skillFromRecord(*saved))
+// The JSON shape {ts, dc, id} is a wire contract shared across a rolling
+// deployment: decoders reject unknown keys, so a new key would break paging
+// between replicas of different releases in both directions. A keyset boundary
+// is only meaningful under the sort it was cut from, so the producing sort is
+// recorded inside that shape instead: a recent-order cursor omits dc, and a
+// downloads-order cursor carries the sentinel downloadsCursorTimestamp as ts.
+// Both stay decodable by earlier releases, which only require ts to be non-zero
+// and dc to be non-negative. A cursor carrying a real ts and a dc is a legacy
+// cursor from a replica that did not record its sort; it is accepted under
+// whichever sort is requested, exactly as every cursor was before binding.
+type skillsCursor struct {
+	UpdatedAt time.Time `json:"ts"`
+	Downloads *int64    `json:"dc,omitempty"`
+	ID        string    `json:"id"`
 }
 
-// handleGetSkill returns a persisted skill by id.
+const skillSortRecent = "recent"
+
+// downloadsCursorTimestamp marks a downloads-order cursor. It is non-zero so
+// earlier decoders accept it, and no revision is created at the Unix epoch, so
+// it can never collide with a real recent-order boundary.
+var downloadsCursorTimestamp = time.Unix(0, 0).UTC()
+
+// skillsCursorSort names the sort of a list request for its cursors.
+func skillsCursorSort(sort string) string {
+	if sort == storage.SkillSortDownloads {
+		return storage.SkillSortDownloads
+	}
+	return skillSortRecent
+}
+
+// newSkillsCursor cuts a boundary for the given sort in the shape described on
+// skillsCursor.
+func newSkillsCursor(sort string, updatedAt time.Time, downloads int64, id string) skillsCursor {
+	if skillsCursorSort(sort) == storage.SkillSortDownloads {
+		return skillsCursor{UpdatedAt: downloadsCursorTimestamp, Downloads: &downloads, ID: id}
+	}
+	return skillsCursor{UpdatedAt: updatedAt, ID: id}
+}
+
+// boundSort reports the sort a cursor was cut under, or "" for a legacy cursor
+// that recorded none.
+func (cursor skillsCursor) boundSort() string {
+	switch {
+	case cursor.Downloads == nil:
+		return skillSortRecent
+	case cursor.UpdatedAt.Equal(downloadsCursorTimestamp):
+		return storage.SkillSortDownloads
+	default:
+		return ""
+	}
+}
+
+func encodeSkillsCursor(cursor skillsCursor) string {
+	value, err := json.Marshal(cursor)
+	if err != nil {
+		panic(fmt.Sprintf("encoding skills cursor: %v", err))
+	}
+	return base64.RawURLEncoding.EncodeToString(value)
+}
+
+func decodeSkillsCursor(token string) (skillsCursor, error) {
+	if token == "" || len(token) > maxSkillCursorCodePoints {
+		return skillsCursor{}, errors.New("invalid cursor")
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil {
+		return skillsCursor{}, fmt.Errorf("invalid cursor: %w", err)
+	}
+	var cursor skillsCursor
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err = decoder.Decode(&cursor); err != nil {
+		return skillsCursor{}, fmt.Errorf("invalid cursor: %w", err)
+	}
+	var trailing any
+	if err = decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return skillsCursor{}, errors.New("invalid cursor")
+	}
+	canonicalID, err := canonicalUUID(cursor.ID)
+	if err != nil || cursor.UpdatedAt.IsZero() || (cursor.Downloads != nil && *cursor.Downloads < 0) {
+		return skillsCursor{}, errors.New("invalid cursor")
+	}
+	cursor.ID = canonicalID
+	return cursor, nil
+}
+
+// handleResolveSkill creates or resolves a hidden-capable stable identity by
+// normalized slug.
+func (s *Server) handleResolveSkill(w http.ResponseWriter, r *http.Request) {
+	auth, ok := requireAuthContext(w, r)
+	if !ok || !s.requireSkillIdentityStore(w) {
+		return
+	}
+	var request resolveSkillRequest
+	if err := decodeLifecycleJSONBody(w, r, &request); err != nil || request.Slug == nil {
+		writeLifecycleError(w, http.StatusBadRequest, errorCodeInvalidRequest, "The request body is invalid.", "")
+		return
+	}
+	slug := strings.ToLower(strings.TrimSpace(*request.Slug))
+	if slug == "" || !validBoundedIdentityText(*request.Slug, maxSkillSlugCodePoints) ||
+		!validBoundedIdentityText(slug, maxSkillSlugCodePoints) {
+		writeLifecycleError(w, http.StatusBadRequest, errorCodeInvalidRequest, "slug must be a non-empty string of at most 128 Unicode code points.", "")
+		return
+	}
+	record, err := s.skillIdentityStore.ResolveSkill(r.Context(), storage.ResolveSkillInput{
+		ID: uuid.NewString(), Slug: slug, CreatorSubject: auth.Subject, CreatedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		s.writeLifecycleStorageError(w, "resolve skill identity", err)
+		return
+	}
+	if record == nil {
+		s.writeLifecycleStorageError(w, "resolve skill identity", errors.New("identity store returned no skill"))
+		return
+	}
+	writeJSON(w, http.StatusOK, skillIdentityWire(*record))
+}
+
+// handleGetSkill returns one viewer-aware effective projection.
 func (s *Server) handleGetSkill(w http.ResponseWriter, r *http.Request) {
-	rec, err := s.store.GetSkill(r.Context(), r.PathValue("id"))
+	if !s.requireSkillReader(w) {
+		return
+	}
+	skillID, err := canonicalUUID(r.PathValue("skillId"))
 	if err != nil {
-		s.logger.Error("get skill", "error", err)
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "failed to fetch skill"})
+		writeLifecycleError(w, http.StatusNotFound, errorCodeSkillNotFound, "The requested skill was not found.", "")
 		return
 	}
-	if rec == nil {
-		writeJSON(w, http.StatusNotFound, errorResponse{Error: "skill not found"})
+	record, err := s.skillReader.GetEffectiveSkill(r.Context(), storage.EffectiveSkillReadOpts{
+		SkillID: skillID, CallerSubject: authContextFromRequest(r).Subject,
+	})
+	if err != nil {
+		s.writeLifecycleStorageError(w, "get effective skill", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, skillFromRecord(*rec))
+	if record == nil {
+		writeLifecycleError(w, http.StatusNotFound, errorCodeSkillNotFound, "The requested skill was not found.", "")
+		return
+	}
+	writeJSON(w, http.StatusOK, effectiveSkillWire(*record))
 }
 
-// handleListSkills returns one keyset page of skills (newest-edited first)
-// plus the per-tab counts for the active search. Query params mirror the
-// pre-cutover /v1/skills: limit, cursor (opaque), q (name/description/tag
-// search), scope (all|mine|team), sort (downloads).
-//
-// session_id switches the route to the provenance reverse lookup — the
-// skills generated from that session, unpaginated — replacing the legacy
-// GET /v1/sessions/:id/skills route, whose path the cassette cannot own.
+// handleListSkills retains keyset pagination, search/scope/download sorting,
+// deployment-armed external filters, and the session_id provenance mode while
+// sourcing every card from SkillReader.
 func (s *Server) handleListSkills(w http.ResponseWriter, r *http.Request) {
-	if sessionID := strings.TrimSpace(r.URL.Query().Get("session_id")); sessionID != "" {
-		s.listSessionSkills(w, r, sessionID)
+	if !s.requireSkillReader(w) {
 		return
 	}
-
-	subject := authSubjectFromRequest(r)
-
-	limit := defaultSkillsLimit
-	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
-		if parsed, err := strconv.Atoi(raw); err == nil && parsed >= 1 {
-			limit = parsed
-		}
-		if limit > maxSkillsLimit {
-			limit = maxSkillsLimit
-		}
-	}
-
-	query := strings.TrimSpace(r.URL.Query().Get("q"))
-	opts := storage.SkillListOpts{Query: query, Limit: limit + 1} // +1 to detect has_more
-	if r.URL.Query().Get("sort") == storage.SkillSortDownloads {
-		opts.Sort = storage.SkillSortDownloads
-	}
-	switch r.URL.Query().Get("scope") {
-	case "mine":
-		opts.Author = subject
-	case "team":
-		opts.NotAuthor = subject
-	}
-	if raw := r.URL.Query().Get("cursor"); raw != "" {
-		cur, err := decodeSkillsCursor(raw)
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, errorResponse{Error: err.Error()})
+	sessionValues, sessionPresent := r.URL.Query()["session_id"]
+	if sessionPresent {
+		if len(sessionValues) != 1 {
+			writeLifecycleError(w, http.StatusBadRequest, errorCodeInvalidRequest, "session_id must be supplied at most once.", "")
 			return
 		}
-		opts.CursorID = cur.ID
-		if opts.Sort == storage.SkillSortDownloads {
-			dc := cur.Downloads
-			opts.CursorDownloads = &dc
-		} else {
-			ts := cur.UpdatedAt
-			opts.CursorTs = &ts
+		rawSessionID := sessionValues[0]
+		sessionID := strings.TrimSpace(rawSessionID)
+		if !validBoundedIdentityText(rawSessionID, maxLifecycleIdentityCodePoints) ||
+			!validBoundedIdentityText(sessionID, maxLifecycleIdentityCodePoints) {
+			writeLifecycleError(w, http.StatusBadRequest, errorCodeInvalidRequest, "session_id is invalid or too long.", "")
+			return
+		}
+		if sessionID != "" {
+			s.listSessionSkills(w, r, sessionID)
+			return
 		}
 	}
 
-	// Deployment-configured external filters. Only armed params — probed
-	// readable at startup or by the background re-probe loop — are parsed at
-	// all; an unconfigured or unarmed param is ignored byte-identically to
-	// its absence. Each armed param is repeatable; values are normalized per
-	// the configured verbs and ANDed in storage as one EXISTS per value,
-	// inside the same paginating query.
-	for _, filter := range s.armedFilters() {
-		values := r.URL.Query()[filter.Param]
-		if len(values) == 0 {
-			continue
-		}
-		normalized := make([]string, len(values))
-		for i, value := range values {
-			normalized[i] = NormalizeFilterValue(value, filter.Normalize)
-		}
-		opts.External = append(opts.External, storage.ExternalAttachmentFilter{
-			View:      filter.View,
-			TypeValue: filter.TypeValue,
-			Values:    normalized,
-		})
-	}
-
-	recs, err := s.store.ListSkills(r.Context(), opts)
+	auth := authContextFromRequest(r)
+	opts, err := s.effectiveSkillListOptions(r, auth)
 	if err != nil {
-		if errors.Is(err, storage.ErrExternalViewUnavailable) {
-			// An armed filter broke after its startup probe. The
-			// missing-relation convention applies: answer 503 naming the
-			// cause, and never serve unfiltered rows as if filtered.
-			s.logger.Error("list skills external filter", "error", err)
-			writeJSON(w, http.StatusServiceUnavailable, errorResponse{
-				Error: "a configured external filter view is missing or unreadable; the filtered list cannot be served",
-			})
-			return
+		if errors.Is(err, errListAuthenticationRequired) {
+			writeLifecycleError(w, http.StatusUnauthorized, errorCodeUnauthenticated, "Authentication is required.", "")
+		} else {
+			writeLifecycleError(w, http.StatusBadRequest, errorCodeInvalidRequest, validationMessage(err), "")
 		}
-		s.logger.Error("list skills", "error", err)
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "failed to list skills"})
+		return
+	}
+	pageLimit := opts.Limit - 1
+	records, err := s.skillReader.ListEffectiveSkills(r.Context(), opts)
+	if err != nil {
+		s.writeEffectiveSkillListError(w, "list effective skills", err)
 		return
 	}
 
 	var nextCursor string
-	if len(recs) > limit {
-		recs = recs[:limit]
-		last := recs[len(recs)-1]
-		nextCursor = encodeSkillsCursor(skillsCursor{
-			UpdatedAt: last.UpdatedAt,
-			Downloads: last.DownloadCount,
-			ID:        last.ID,
-		})
+	if len(records) > pageLimit {
+		records = records[:pageLimit]
+		last := records[len(records)-1]
+		nextCursor = encodeSkillsCursor(newSkillsCursor(
+			opts.Sort, last.CardRevision.Revision.CreatedAt, last.Skill.DownloadCount, last.Skill.ID,
+		))
 	}
-
-	// The per-tab totals honor the same armed external filters as the page:
-	// counting the unfiltered table would report tabs for skills the filtered
-	// listing excludes. The same degradation convention applies too — a view
-	// broken mid-count is a loud 503, never silently unfiltered totals.
-	counts, err := s.store.CountSkills(r.Context(), storage.SkillCountOpts{
-		Query:    query,
-		Author:   subject,
-		External: opts.External,
+	counts, err := s.skillReader.CountEffectiveSkills(r.Context(), storage.EffectiveSkillCountOpts{
+		SkillCountOpts: storage.SkillCountOpts{
+			Query: opts.Query, Author: auth.Subject, External: opts.External,
+		},
+		CallerSubject: auth.Subject,
 	})
 	if err != nil {
-		if errors.Is(err, storage.ErrExternalViewUnavailable) {
-			s.logger.Error("count skills external filter", "error", err)
-			writeJSON(w, http.StatusServiceUnavailable, errorResponse{
-				Error: "a configured external filter view is missing or unreadable; the filtered list cannot be served",
-			})
-			return
-		}
-		s.logger.Error("count skills", "error", err)
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "failed to list skills"})
+		s.writeEffectiveSkillListError(w, "count effective skills", err)
 		return
 	}
-
-	items := make([]skillResponse, len(recs))
-	for i, r := range recs {
-		items[i] = skillFromRecord(r)
+	items := make([]effectiveSkillResponse, len(records))
+	for index, record := range records {
+		items[index] = effectiveSkillWire(record)
 	}
-	writeJSON(w, http.StatusOK, skillsListResponse{
-		Items:      items,
-		NextCursor: nextCursor,
-		Counts: skillCountsResp{
-			All:  counts.Total,
-			Mine: counts.Mine,
-			Team: counts.Total - counts.Mine,
-		},
+	team := counts.Total - counts.Mine
+	if team < 0 {
+		team = 0
+	}
+	writeJSON(w, http.StatusOK, effectiveSkillsListResponse{
+		Items: items, NextCursor: nextCursor,
+		Counts: skillCountsResponse{All: counts.Total, Mine: counts.Mine, Team: team},
 	})
 }
 
-// listSessionSkills returns the skills generated from a given session
-// (reverse lookup over provenance). Small result set, so it's unpaginated —
-// the "Skills from this session" panel renders them directly.
 func (s *Server) listSessionSkills(w http.ResponseWriter, r *http.Request, sessionID string) {
-	recs, err := s.store.ListSkillsBySession(r.Context(), sessionID)
+	records, err := s.skillReader.ListEffectiveSkillsBySession(r.Context(), storage.EffectiveSkillSessionListOpts{
+		SessionID: sessionID, CallerSubject: authContextFromRequest(r).Subject, Limit: maxSkillsLimit,
+	})
 	if err != nil {
-		s.logger.Error("list session skills", "error", err)
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "failed to list skills"})
+		s.writeLifecycleStorageError(w, "list effective skills by session", err)
 		return
 	}
-	items := make([]skillResponse, len(recs))
-	for i, r := range recs {
-		items[i] = skillFromRecord(r)
+	if len(records) > maxSkillsLimit {
+		records = records[:maxSkillsLimit]
+	}
+	items := make([]effectiveSkillResponse, len(records))
+	for index, record := range records {
+		items[index] = effectiveSkillWire(record)
 	}
 	writeJSON(w, http.StatusOK, sessionSkillsResponse{Items: items})
 }
 
-// updateSkillRequest is the PUT body — all fields optional; only present
-// fields are applied onto the existing record.
-type updateSkillRequest struct {
-	Name        *string  `json:"name"`
-	Description *string  `json:"description"`
-	Type        *string  `json:"type"`
-	Visibility  *string  `json:"visibility"`
-	Tags        []string `json:"tags"`
-	Content     *string  `json:"content"`
-}
-
-// handleUpdateSkill saves edits to a skill's working content/metadata. The
-// upsert preserves created_at and author_subject (original creator stays
-// authoritative).
-func (s *Server) handleUpdateSkill(w http.ResponseWriter, r *http.Request) {
-	existing, err := s.store.GetSkill(r.Context(), r.PathValue("id"))
-	if err != nil {
-		s.logger.Error("get skill for update", "error", err)
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "failed to fetch skill"})
-		return
-	}
-	if existing == nil {
-		writeJSON(w, http.StatusNotFound, errorResponse{Error: "skill not found"})
-		return
-	}
-	if !mayMutateSkill(r, existing) {
-		writeJSON(w, http.StatusForbidden, errorResponse{Error: "only the creator can edit this skill"})
-		return
-	}
-
-	var req updateSkillRequest
-	if err := decodeJSONBody(r, &req); err != nil {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid request body"})
-		return
-	}
-
-	rec := *existing
-	if req.Name != nil {
-		rec.Name = *req.Name
-		// slug is cosmetic now (the id is identity), so keep it in sync with the
-		// name on rename — the SKILL.md filename then tracks the current name.
-		if derived := slugifySkillName(rec.Name); derived != "" {
-			rec.Slug = derived
-		}
-	}
-	if req.Description != nil {
-		rec.Description = *req.Description
-	}
-	if req.Type != nil {
-		if !skill.ValidSkillType(*req.Type) {
-			writeJSON(w, http.StatusBadRequest, errorResponse{Error: fmt.Sprintf("invalid type %q", *req.Type)})
-			return
-		}
-		rec.Type = *req.Type
-	}
-	if req.Visibility != nil {
-		rec.Visibility = *req.Visibility
-	}
-	if req.Tags != nil {
-		rec.Tags = req.Tags
-	}
-	if req.Content != nil {
-		rec.Content = *req.Content
-	}
-	rec.UpdatedAt = time.Now().UTC()
-
-	saved, err := s.store.UpsertSkill(r.Context(), rec)
-	if err != nil {
-		s.logger.Error("update skill", "error", err)
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "failed to save skill"})
-		return
-	}
-	writeJSON(w, http.StatusOK, skillFromRecord(*saved))
-}
-
-func mayMutateSkill(r *http.Request, skill *storage.SkillRecord) bool {
-	return skill.AuthorSubject == "" || authSubjectFromRequest(r) == skill.AuthorSubject
-}
-
-// handleDeleteSkill removes a skill and its version history. Owner-gated: only
-// the recorded author may delete (unattributed skills are deletable by anyone,
-// matching the edit affordance).
-func (s *Server) handleDeleteSkill(w http.ResponseWriter, r *http.Request) {
-	existing, err := s.store.GetSkill(r.Context(), r.PathValue("id"))
-	if err != nil {
-		s.logger.Error("get skill for delete", "error", err)
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "failed to fetch skill"})
-		return
-	}
-	if existing == nil {
-		writeJSON(w, http.StatusNotFound, errorResponse{Error: "skill not found"})
-		return
-	}
-
-	// Only the creator may delete. An empty author_subject means unattributed
-	// (legacy/demo) — deletable by anyone, mirroring the edit gate.
-	if !mayMutateSkill(r, existing) {
-		writeJSON(w, http.StatusForbidden, errorResponse{Error: "only the creator can delete this skill"})
-		return
-	}
-
-	if _, err := s.store.DeleteSkill(r.Context(), existing.ID); err != nil {
-		s.logger.Error("delete skill", "error", err)
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "failed to delete skill"})
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-// createSkillRequest is the POST body for an authored-from-scratch skill —
-// only a name is required; the rest default to an empty private skill.
-type createSkillRequest struct {
-	Name        string   `json:"name"`
-	Description string   `json:"description"`
-	Type        string   `json:"type"`
-	Tags        []string `json:"tags"`
-	Content     string   `json:"content"`
-	Changelog   string   `json:"changelog"`
-}
-
-// handleCreateSkill atomically writes and publishes a new authored skill
-// (empty provenance), attributed to the caller. Generate is the AI path; this
-// is the create-from-scratch path. The id is minted here; slug is a cosmetic
-// label derived from the name (no longer unique).
-func (s *Server) handleCreateSkill(w http.ResponseWriter, r *http.Request) {
-	var req createSkillRequest
-	if err := decodeJSONBody(r, &req); err != nil {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid request body"})
-		return
-	}
-
-	displayName := strings.TrimSpace(req.Name)
-	if displayName == "" {
-		displayName = "New skill"
-	}
-	skillType := strings.TrimSpace(req.Type)
-	if skillType == "" {
-		skillType = "workflow"
-	}
-	if !skill.ValidSkillType(skillType) {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: fmt.Sprintf("invalid type %q", skillType)})
-		return
-	}
-
-	slug := slugifySkillName(displayName)
-	if slug == "" {
-		slug = "new-skill"
-	}
-
-	now := time.Now().UTC()
-	rec := storage.SkillRecord{
-		ID:                      uuid.NewString(),
-		Slug:                    slug,
-		Name:                    displayName,
-		Description:             req.Description,
-		Type:                    skillType,
-		Version:                 "0.1.0",
-		Visibility:              "private",
-		Tags:                    req.Tags,
-		Content:                 req.Content,
-		IsAIGenerated:           false,
-		GeneratedFromSessionIDs: nil,
-		AuthorSubject:           authSubjectFromRequest(r),
-		CreatedAt:               now,
-		UpdatedAt:               now,
-	}
-	saved, err := s.store.CreatePublishedSkill(r.Context(), rec, initialVersion(rec, req.Changelog))
-	if err != nil {
-		s.logger.Error("create skill", "error", err)
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "failed to create skill"})
-		return
-	}
-	writeJSON(w, http.StatusCreated, skillFromRecord(*saved))
-}
-
-func initialVersion(rec storage.SkillRecord, changelog string) storage.SkillVersionRecord {
-	return storage.SkillVersionRecord{
-		SkillID:       rec.ID,
-		VersionNumber: 1,
-		Semver:        "0.1.0",
-		Changelog:     changelog,
-		Content:       rec.Content,
-		AuthorSubject: rec.AuthorSubject,
-		PublishedAt:   rec.UpdatedAt,
-	}
-}
-
-// publishSkillRequest is the POST versions body.
-type publishSkillRequest struct {
-	Content         string  `json:"content"`
-	Changelog       string  `json:"changelog"`
-	ExpectedContent *string `json:"expectedContent"`
-}
-
-// maxPublishAttempts bounds the retry loop that resolves a concurrent
-// version-number collision when two publishes of the same skill race.
-const maxPublishAttempts = 4
-
-// handlePublishSkill snapshots the skill's content into an immutable version
-// and bumps the skill's current semver (first publish 0.1.0, then patch).
-func (s *Server) handlePublishSkill(w http.ResponseWriter, r *http.Request) {
-	existing, err := s.store.GetSkill(r.Context(), r.PathValue("id"))
-	if err != nil {
-		s.logger.Error("get skill for publish", "error", err)
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "failed to fetch skill"})
-		return
-	}
-	if existing == nil {
-		writeJSON(w, http.StatusNotFound, errorResponse{Error: "skill not found"})
-		return
-	}
-	if !mayMutateSkill(r, existing) {
-		writeJSON(w, http.StatusForbidden, errorResponse{Error: "only the creator can publish this skill"})
-		return
-	}
-	skillID := existing.ID
-
-	// An empty body is a valid publish — it snapshots the skill's current head.
-	// Malformed or truncated JSON is not: rejecting it here keeps a garbled
-	// request from minting an unintended version.
-	var req publishSkillRequest
-	if err := decodeJSONBody(r, &req); err != nil && !errors.Is(err, io.EOF) {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid request body"})
-		return
-	}
-	content := req.Content
-	if strings.TrimSpace(content) == "" {
-		content = existing.Content
-	}
-	casContent := req.ExpectedContent
-	if req.ExpectedContent != nil {
-		version, latestHasContent, err := inspectPublishedVersions(
-			r.Context(), s.store, skillID, content, req.Changelog, req.ExpectedContent,
-		)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "failed to inspect skill versions"})
-			return
-		}
-		if version != nil {
-			writeJSON(w, http.StatusOK, skillVersionFromRecord(*version))
-			return
-		}
-		if existing.Content != *req.ExpectedContent {
-			if latestHasContent {
-				writeJSON(w, http.StatusConflict, errorResponse{Error: "a different publish already changed this skill"})
-				return
-			}
-			if existing.Content != content {
-				writeJSON(w, http.StatusConflict, errorResponse{Error: "skill changed since this publish was proposed"})
-				return
-			}
-			// The desired text was saved without publication. Snapshot that current
-			// head while still protecting against another edit before the transaction.
-			// Keep the request's original expectedContent as its retry identity.
-			casContent = &existing.Content
-		}
-	}
-
-	now := time.Now().UTC()
-
-	// Assigning the next version number (a MAX read) and inserting it are two
-	// round-trips, so two concurrent publishes of the same skill can pick the
-	// same number — the second insert then hits the (skill_id, version_number)
-	// unique constraint. Retry on that conflict: the next MAX read sees the
-	// committed competitor, so a bounded loop converges instead of 500-ing.
-	//
-	// The store publishes atomically: the version row and the head bump land
-	// together, and the head only advances when this is the highest published
-	// number — of two overlapping publishes, the older one can never regress
-	// the head the newer one already set.
-	var ver *storage.SkillVersionRecord
-	for attempt := range maxPublishAttempts {
-		n, err := s.store.NextSkillVersionNumber(r.Context(), skillID)
-		if err != nil {
-			s.logger.Error("next skill version", "error", err)
-			writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "failed to version skill"})
-			return
-		}
-		semver := fmt.Sprintf("0.1.%d", n-1) // n=1 -> 0.1.0, n=2 -> 0.1.1, …
-
-		ver, err = s.store.PublishSkillVersion(r.Context(), storage.SkillVersionRecord{
-			SkillID:         skillID,
-			VersionNumber:   n,
-			Semver:          semver,
-			Changelog:       req.Changelog,
-			Content:         content,
-			ExpectedContent: req.ExpectedContent,
-			CASContent:      casContent,
-			AuthorSubject:   authSubjectFromRequest(r),
-			PublishedAt:     now,
-		})
-		if err == nil {
-			break
-		}
-		if errors.Is(err, storage.ErrSkillVersionConflict) && attempt < maxPublishAttempts-1 {
-			continue // a concurrent publish took this number; recompute and retry
-		}
-		if errors.Is(err, storage.ErrSkillChanged) {
-			version, _, lookupErr := inspectPublishedVersions(
-				r.Context(), s.store, skillID, content, req.Changelog, req.ExpectedContent,
-			)
-			if lookupErr != nil {
-				s.logger.Error("inspect skill versions after publish conflict", "error", lookupErr)
-				writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "failed to inspect skill versions"})
-				return
-			}
-			if version != nil {
-				writeJSON(w, http.StatusOK, skillVersionFromRecord(*version))
-				return
-			}
-			writeJSON(w, http.StatusConflict, errorResponse{Error: "skill changed since this publish was proposed"})
-			return
-		}
-		s.logger.Error("publish skill version", "error", err)
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "failed to publish skill"})
-		return
-	}
-
-	writeJSON(w, http.StatusCreated, skillVersionFromRecord(*ver))
-}
-
-func inspectPublishedVersions(
-	ctx context.Context,
-	store storage.Store,
-	skillID string,
-	content string,
-	changelog string,
-	expectedContent *string,
-) (exact *storage.SkillVersionRecord, latestHasContent bool, err error) {
-	versions, err := store.ListSkillVersions(ctx, skillID)
-	if err != nil {
-		return nil, false, err
-	}
-	for i := range versions {
-		if versions[i].Content == content && versions[i].Changelog == changelog &&
-			sameOptionalString(versions[i].ExpectedContent, expectedContent) {
-			return &versions[i], len(versions) > 0 && versions[0].Content == content, nil
-		}
-	}
-	return nil, len(versions) > 0 && versions[0].Content == content, nil
-}
-
-func sameOptionalString(a, b *string) bool {
-	if a == nil || b == nil {
-		return a == nil && b == nil
-	}
-	return *a == *b
-}
-
-// handleListSkillVersions returns a skill's published version history.
-func (s *Server) handleListSkillVersions(w http.ResponseWriter, r *http.Request) {
-	vers, err := s.store.ListSkillVersions(r.Context(), r.PathValue("id"))
-	if err != nil {
-		s.logger.Error("list skill versions", "error", err)
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "failed to list versions"})
-		return
-	}
-	items := make([]skillVersionResponse, len(vers))
-	for i, v := range vers {
-		items[i] = skillVersionFromRecord(v)
-	}
-	writeJSON(w, http.StatusOK, skillVersionsResponse{Versions: items, TotalCount: len(items)})
-}
-
-// handleDuplicateSkill copies and publishes a skill under a fresh id,
-// attributed to the duplicating user. Because slug is no longer an identity it
-// can be shared with the parent freely — no "-copy" suffix is needed.
-func (s *Server) handleDuplicateSkill(w http.ResponseWriter, r *http.Request) {
-	existing, err := s.store.GetSkill(r.Context(), r.PathValue("id"))
-	if err != nil {
-		s.logger.Error("get skill for duplicate", "error", err)
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "failed to fetch skill"})
-		return
-	}
-	if existing == nil {
-		writeJSON(w, http.StatusNotFound, errorResponse{Error: "skill not found"})
-		return
-	}
-
-	now := time.Now().UTC()
-	rec := *existing
-	rec.ID = uuid.NewString()
-	rec.Name = existing.Name + " (copy)"
-	rec.Slug = existing.Slug // slug is cosmetic; sharing the parent's reads fine
-	rec.Visibility = "private"
-	rec.Version = "0.1.0"
-	rec.ParentID = existing.ID
-	rec.AuthorSubject = authSubjectFromRequest(r)
-	rec.DownloadCount = 0
-	rec.CreatedAt = now
-	rec.UpdatedAt = now
-
-	saved, err := s.store.CreatePublishedSkill(r.Context(), rec, initialVersion(rec, ""))
-	if err != nil {
-		s.logger.Error("duplicate skill", "error", err)
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "failed to duplicate skill"})
-		return
-	}
-	writeJSON(w, http.StatusCreated, skillFromRecord(*saved))
-}
-
-// handleSkillMarkdown renders a drop-in SKILL.md (frontmatter + body) for the
-// "Use this skill" download, via the same renderer the CLI uses.
+// handleSkillMarkdown resolves only the effective public revision, renders the
+// existing SKILL.md distribution format, and keeps download counting best
+// effort. It never falls back to viewer-private content.
 func (s *Server) handleSkillMarkdown(w http.ResponseWriter, r *http.Request) {
-	rec, err := s.store.GetSkill(r.Context(), r.PathValue("id"))
+	if !s.requireSkillReader(w) {
+		return
+	}
+	skillID, err := canonicalUUID(r.PathValue("skillId"))
 	if err != nil {
-		s.logger.Error("get skill for markdown", "error", err)
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "failed to fetch skill"})
+		writeLifecycleError(w, http.StatusNotFound, errorCodeSkillNotFound, "The requested skill was not found.", "")
 		return
 	}
-	if rec == nil {
-		writeJSON(w, http.StatusNotFound, errorResponse{Error: "skill not found"})
+	projection, err := s.skillReader.GetEffectiveSkill(r.Context(), storage.EffectiveSkillReadOpts{
+		SkillID: skillID, CallerSubject: authContextFromRequest(r).Subject,
+	})
+	if err != nil {
+		s.writeLifecycleStorageError(w, "resolve skill markdown", err)
+		return
+	}
+	if projection == nil {
+		writeLifecycleError(w, http.StatusNotFound, errorCodeSkillNotFound, "The requested skill was not found.", "")
+		return
+	}
+	if projection.EffectiveRevision == nil {
+		if projection.NewestPrivateRevision != nil {
+			writeLifecycleError(w, http.StatusConflict, errorCodeRevisionPrivate, "A private revision cannot be used by this public operation.", "")
+			return
+		}
+		writeLifecycleError(w, http.StatusNotFound, errorCodeSkillNotFound, "The requested skill was not found.", "")
 		return
 	}
 
-	// Count the download as a real usage signal (best-effort — never fail the
-	// download over a counter write).
-	if err := s.store.IncrementSkillDownloads(r.Context(), rec.ID); err != nil {
-		s.logger.Warn("increment skill downloads", "error", err)
-	}
-
-	// The SKILL.md frontmatter `name` must be the kebab slug (Claude Code
-	// matches it to the skill's directory), not the human display name; the
-	// display name carries no meaning in the on-disk file.
-	sk := &skill.Skill{
-		Name:        rec.Slug,
-		Description: rec.Description,
-		Version:     rec.Version,
-		Tags:        rec.Tags,
-		Type:        rec.Type,
-		Content:     rec.Content,
-		Sessions:    rec.GeneratedFromSessionIDs,
-		CreatedAt:   rec.CreatedAt,
+	revision := projection.EffectiveRevision.Revision
+	rendered := skill.RenderSkillMD(&skill.Skill{
+		Name: projection.Skill.Slug, Description: revision.Snapshot.Description,
+		Version: revision.Version, Tags: nonNilWireStrings(revision.Snapshot.Tags),
+		Type: revision.Snapshot.Type, Content: revision.Snapshot.Content,
+		Sessions: nonNilWireStrings(revision.Snapshot.SourceSessionIDs), CreatedAt: revision.CreatedAt,
+	})
+	if len(rendered) > maxSkillMarkdownOutputBytes ||
+		utf8.RuneCountInString(rendered) > maxSkillMarkdownOutputCodePoints {
+		s.writeLifecycleStorageError(w, "render skill markdown", errors.New("rendered skill markdown exceeds response limit"))
+		return
 	}
 	w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", rec.Slug+".md"))
-	_, _ = w.Write([]byte(skill.RenderSkillMD(sk)))
-}
-
-// skillFromRecord maps the storage row to the camelCase Skill wire shape,
-// normalizing nil slices to empty arrays and an empty parent id to JSON null.
-func skillFromRecord(rec storage.SkillRecord) skillResponse {
-	tags := rec.Tags
-	if tags == nil {
-		tags = []string{}
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", projection.Skill.Slug+".md"))
+	body := []byte(rendered)
+	written, writeErr := w.Write(body)
+	if writeErr != nil || written != len(body) {
+		s.logger.Warn("write skill markdown", "written_bytes", written, "body_bytes", len(body), "error", writeErr)
+		return
 	}
-	sessions := rec.GeneratedFromSessionIDs
-	if sessions == nil {
-		sessions = []string{}
-	}
-	var parent *string
-	if rec.ParentID != "" {
-		p := rec.ParentID
-		parent = &p
-	}
-	return skillResponse{
-		ID:                    rec.ID,
-		Slug:                  rec.Slug,
-		ParentID:              parent,
-		Name:                  rec.Name,
-		Description:           rec.Description,
-		Type:                  rec.Type,
-		Version:               rec.Version,
-		Visibility:            rec.Visibility,
-		Tags:                  tags,
-		Content:               rec.Content,
-		IsAIGenerated:         rec.IsAIGenerated,
-		OriginatingSessionIDs: sessions,
-		AuthorID:              rec.AuthorSubject,
-		DownloadCount:         rec.DownloadCount,
-		CreatedAt:             rec.CreatedAt.UTC().Format(time.RFC3339),
-		UpdatedAt:             rec.UpdatedAt.UTC().Format(time.RFC3339),
+	if err = s.distributions.IncrementSkillDownloads(r.Context(), projection.Skill.ID); err != nil {
+		s.logger.Warn("increment skill downloads", "error", err)
 	}
 }
 
-func skillVersionFromRecord(rec storage.SkillVersionRecord) skillVersionResponse {
-	return skillVersionResponse{
-		ID:            fmt.Sprintf("%s-v%d", rec.SkillID, rec.VersionNumber),
-		SkillID:       rec.SkillID,
-		VersionNumber: rec.VersionNumber,
-		Semver:        rec.Semver,
-		PublishedAt:   rec.PublishedAt.UTC().Format(time.RFC3339),
-		Changelog:     rec.Changelog,
-		Content:       rec.Content,
-		AuthorID:      rec.AuthorSubject,
-	}
-}
-
-// fallbackSkillName derives a kebab-case name when the client supplies no
-// hint name, e.g. "skill-from-1a2b3c4d".
-func fallbackSkillName(sessionID string) string {
-	short := strings.ToLower(sessionID)
-	short = strings.ReplaceAll(short, "-", "")
-	if len(short) > 8 {
-		short = short[:8]
-	}
-	if short == "" {
-		short = "session"
-	}
-	return "skill-from-" + short
-}
-
-// slugifySkillName lowercases and hyphenates an arbitrary name into the
-// kebab-case slug the console uses as the URL segment.
-func slugifySkillName(name string) string {
-	var b strings.Builder
-	prevHyphen := false
-	for _, r := range strings.ToLower(strings.TrimSpace(name)) {
-		switch {
-		case (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'):
-			b.WriteRune(r)
-			prevHyphen = false
-		case b.Len() > 0 && !prevHyphen:
-			b.WriteByte('-')
-			prevHyphen = true
+// effectiveSkillListOptions builds storage-level effective list filters. Every
+// armed attachment filter is passed to both list and count storage operations.
+func (s *Server) effectiveSkillListOptions(r *http.Request, auth authContext) (storage.EffectiveSkillListOpts, error) {
+	query := r.URL.Query()
+	for _, name := range []string{"limit", "cursor", "q", "scope", "sort"} {
+		if len(query[name]) > 1 {
+			return storage.EffectiveSkillListOpts{}, fmt.Errorf("%s must be supplied at most once", name)
 		}
 	}
-	return strings.Trim(b.String(), "-")
+
+	limit := defaultSkillsLimit
+	if values, present := query["limit"]; present {
+		raw := strings.TrimSpace(values[0])
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > maxSkillsLimit {
+			return storage.EffectiveSkillListOpts{}, errors.New("limit must be an integer from 1 through 100")
+		}
+		limit = parsed
+	}
+	rawSearch := query.Get("q")
+	search := strings.TrimSpace(rawSearch)
+	if !validBoundedText(rawSearch, maxSkillQueryCodePoints) ||
+		!validBoundedText(search, maxSkillQueryCodePoints) {
+		return storage.EffectiveSkillListOpts{}, errors.New("q is invalid or too long")
+	}
+	opts := storage.EffectiveSkillListOpts{
+		SkillListOpts: storage.SkillListOpts{Query: search, Limit: limit + 1},
+		CallerSubject: auth.Subject,
+	}
+	switch query.Get("scope") {
+	case "", "all":
+	case "mine":
+		if auth.Subject == "" {
+			return storage.EffectiveSkillListOpts{}, errListAuthenticationRequired
+		}
+		opts.Author = auth.Subject
+	case "team":
+		if auth.Subject == "" {
+			return storage.EffectiveSkillListOpts{}, errListAuthenticationRequired
+		}
+		opts.NotAuthor = auth.Subject
+	default:
+		return storage.EffectiveSkillListOpts{}, errors.New("scope must be all, mine, or team")
+	}
+	switch query.Get("sort") {
+	case "", "recent":
+	case storage.SkillSortDownloads:
+		opts.Sort = storage.SkillSortDownloads
+	default:
+		return storage.EffectiveSkillListOpts{}, errors.New("sort must be recent or downloads")
+	}
+	if values, present := query["cursor"]; present {
+		cursor, err := decodeSkillsCursor(strings.TrimSpace(values[0]))
+		if err != nil {
+			return storage.EffectiveSkillListOpts{}, errors.New("the skills cursor is invalid")
+		}
+		// A cursor that recorded its sort is only valid under that sort; a
+		// legacy cursor recorded none and is accepted under either, as before.
+		if bound := cursor.boundSort(); bound != "" && bound != skillsCursorSort(opts.Sort) {
+			return storage.EffectiveSkillListOpts{}, errors.New("the skills cursor is invalid")
+		}
+		opts.CursorID = cursor.ID
+		if opts.Sort == storage.SkillSortDownloads {
+			downloads := *cursor.Downloads
+			opts.CursorDownloads = &downloads
+		} else {
+			updatedAt := cursor.UpdatedAt
+			opts.CursorTs = &updatedAt
+		}
+	}
+	for _, filter := range s.armedFilters() {
+		values := query[filter.Param]
+		if len(values) == 0 {
+			continue
+		}
+		if len(values) > maxExternalFilterValues {
+			return storage.EffectiveSkillListOpts{}, fmt.Errorf("%s has too many values", filter.Param)
+		}
+		normalized := make([]string, len(values))
+		for index, value := range values {
+			normalized[index] = NormalizeFilterValue(value, filter.Normalize)
+			if !validBoundedIdentityText(value, maxLifecycleIdentityCodePoints) ||
+				!validBoundedIdentityText(normalized[index], maxLifecycleIdentityCodePoints) {
+				return storage.EffectiveSkillListOpts{}, fmt.Errorf("%s contains an invalid or oversized value", filter.Param)
+			}
+		}
+		opts.External = append(opts.External, storage.ExternalAttachmentFilter{
+			View: filter.View, TypeValue: filter.TypeValue, Values: normalized,
+		})
+	}
+	return opts, nil
+}
+
+func (s *Server) writeEffectiveSkillListError(w http.ResponseWriter, operation string, err error) {
+	if errors.Is(err, storage.ErrExternalViewUnavailable) {
+		s.logger.Error(operation, "error", err)
+		writeLifecycleError(w, http.StatusServiceUnavailable, "external_view_unavailable", "A configured external filter is temporarily unavailable.", "")
+		return
+	}
+	s.writeLifecycleStorageError(w, operation, err)
+}
+
+func effectiveSkillWire(record storage.EffectiveSkillRecord) effectiveSkillResponse {
+	response := effectiveSkillResponse{
+		ID: record.Skill.ID, Slug: record.Skill.Slug,
+		ExplicitLatestRevisionID: optionalString(record.Skill.ExplicitLatestRevisionID),
+		HasNewerPrivateRevision:  record.HasNewerPrivateRevision,
+		DownloadCount:            record.Skill.DownloadCount,
+		CreatedAt:                record.Skill.CreatedAt.UTC().Format(time.RFC3339Nano),
+		UpdatedAt:                record.Skill.UpdatedAt.UTC().Format(time.RFC3339Nano),
+	}
+	if record.EffectiveRevision != nil {
+		value := revisionWire(*record.EffectiveRevision)
+		response.EffectiveRevision = &value
+	}
+	if record.NewestPrivateRevision != nil {
+		value := revisionWire(*record.NewestPrivateRevision)
+		response.NewestPrivateRevision = &value
+	}
+	if record.CardRevision != nil {
+		value := revisionWire(*record.CardRevision)
+		response.CardRevision = &value
+	}
+	return response
+}
+
+func skillIdentityWire(record storage.SkillRecord) skillIdentityResponse {
+	return skillIdentityResponse{
+		ID: record.ID, Slug: record.Slug,
+		ExplicitLatestRevisionID: optionalString(record.ExplicitLatestRevisionID),
+		CreatedAt:                record.CreatedAt.UTC().Format(time.RFC3339Nano),
+	}
+}
+
+func (s *Server) requireSkillReader(w http.ResponseWriter) bool {
+	if s.skillReader != nil {
+		return true
+	}
+	writeLifecycleError(w, http.StatusNotImplemented, errorCodePersistenceNotConfigured, "Skill revision reads are not configured.", "")
+	return false
+}
+
+func (s *Server) requireSkillIdentityStore(w http.ResponseWriter) bool {
+	if s.skillIdentityStore != nil {
+		return true
+	}
+	writeLifecycleError(w, http.StatusNotImplemented, errorCodePersistenceNotConfigured, "Skill identity persistence is not configured.", "")
+	return false
 }

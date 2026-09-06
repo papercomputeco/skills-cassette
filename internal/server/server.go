@@ -31,16 +31,25 @@ var externalFilterProbeTimeout = 5 * time.Second
 // server runs. It is a var only so tests can shrink it.
 var externalFilterReprobeInterval = 30 * time.Second
 
-// Server is the whole cassette: an identity, a store for skills, a querier
-// for reading trace transcripts off the core, and an LLM configuration for
-// the generator.
+// distributionStore is the narrow predecessor capability still required by
+// revision-backed distribution reads. Skill identity, revision, metadata, and
+// generation handlers depend on their dedicated storage capabilities instead.
+type distributionStore interface {
+	Kind() string
+	IncrementSkillDownloads(ctx context.Context, skillID string) error
+}
+
+// Server is the whole cassette: stable skill/revision storage behind the
+// identity, revision, metadata, and distribution capabilities.
 type Server struct {
-	name    string
-	store   storage.Store
-	querier skill.Querier
-	llm     skill.LLMCallerConfig
-	logger  *slog.Logger
-	openapi []byte
+	name                  string
+	distributions         distributionStore
+	skillReader           storage.SkillReader
+	skillIdentityStore    storage.SkillIdentityStore
+	revisionStore         storage.RevisionStore
+	revisionMetadataStore storage.RevisionMetadataStore
+	logger                *slog.Logger
+	openapi               []byte
 	// mu guards filters and pending: request handlers read the armed set
 	// on every list, while the background re-probe loop arms filters after
 	// startup. Writers swap in fresh slices, never mutate published ones,
@@ -58,9 +67,9 @@ type Server struct {
 	prober storage.ExternalViewProber
 }
 
-// New builds the cassette server. querier may be nil when no core URL is
-// configured — generation then answers 501 while the rest of the API serves.
-func New(cfg Config, store storage.Store, querier skill.Querier, logger *slog.Logger) *Server {
+// New builds the cassette server. querier is reserved for source-transcript
+// reads and may be nil.
+func New(cfg Config, store distributionStore, _ skill.Querier, logger *slog.Logger) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -69,16 +78,16 @@ func New(cfg Config, store storage.Store, querier skill.Querier, logger *slog.Lo
 		name = DefaultName
 	}
 	armed, pending, prober := armExternalFilters(cfg.Filters, store, logger)
+	skillReader, _ := store.(storage.SkillReader)
+	skillIdentityStore, _ := store.(storage.SkillIdentityStore)
+	revisionStore, _ := store.(storage.RevisionStore)
+	revisionMetadataStore, _ := store.(storage.RevisionMetadataStore)
 	return &Server{
-		name:    name,
-		store:   store,
-		querier: querier,
-		llm:     cfg.LLM,
-		logger:  logger,
-		openapi: openAPIDocument(name),
-		filters: armed,
-		pending: pending,
-		prober:  prober,
+		name: name, distributions: store,
+		skillReader: skillReader, skillIdentityStore: skillIdentityStore,
+		revisionStore: revisionStore, revisionMetadataStore: revisionMetadataStore,
+		logger: logger, openapi: openAPIDocument(name),
+		filters: armed, pending: pending, prober: prober,
 	}
 }
 
@@ -93,14 +102,18 @@ func New(cfg Config, store storage.Store, querier skill.Querier, logger *slog.Lo
 // case — a view that breaks after arming — stays loud at request time
 // (ErrExternalViewUnavailable, 503); per-request behavior is unchanged:
 // there is no per-request re-probe and no fallback.
-func armExternalFilters(filters []ExternalFilter, store storage.Store, logger *slog.Logger) (armed, pending []ExternalFilter, prober storage.ExternalViewProber) {
+func armExternalFilters(filters []ExternalFilter, store distributionStore, logger *slog.Logger) (armed, pending []ExternalFilter, prober storage.ExternalViewProber) {
 	if len(filters) == 0 {
 		return nil, nil, nil
 	}
 	prober, ok := store.(storage.ExternalViewProber)
 	if !ok {
+		storeKind := "unconfigured"
+		if store != nil {
+			storeKind = store.Kind()
+		}
 		logger.Warn("external filters configured but the store reads no external views; the capability is off",
-			"store", store.Kind())
+			"store", storeKind)
 		return nil, nil, nil
 	}
 	for _, filter := range filters {
@@ -220,35 +233,37 @@ func (s *Server) Handler() http.Handler {
 	})
 
 	// The API itself, under the prefix clients call through tapes:
-	// /api/<name>/... republishes as /v1/cassettes/<name>/...
+	// /api/<name>/... republishes as /v1/cassettes/<name>/.... Content saves,
+	// visibility transitions, and latest movement are separate operations.
 	prefix := "/api/" + s.name
-	mux.HandleFunc("GET "+prefix, s.handleListSkills)
-	mux.HandleFunc("POST "+prefix, s.handleCreateSkill)
-	mux.HandleFunc("POST "+prefix+"/generate", s.handleGenerateSkill)
-	mux.HandleFunc("GET "+prefix+"/{id}", s.handleGetSkill)
-	mux.HandleFunc("PUT "+prefix+"/{id}", s.handleUpdateSkill)
-	mux.HandleFunc("DELETE "+prefix+"/{id}", s.handleDeleteSkill)
-	mux.HandleFunc("GET "+prefix+"/{id}/skill.md", s.handleSkillMarkdown)
-	mux.HandleFunc("GET "+prefix+"/{id}/versions", s.handleListSkillVersions)
-	mux.HandleFunc("POST "+prefix+"/{id}/versions", s.handlePublishSkill)
-	mux.HandleFunc("POST "+prefix+"/{id}/duplicate", s.handleDuplicateSkill)
-
+	skillsMux := http.NewServeMux()
+	skillsMux.HandleFunc("GET "+prefix, s.handleListSkills)
+	skillsMux.HandleFunc("POST "+prefix, s.handleResolveSkill)
+	skillsMux.HandleFunc("GET "+prefix+"/{skillId}", s.handleGetSkill)
+	skillsMux.HandleFunc("GET "+prefix+"/{skillId}/skill.md", s.handleSkillMarkdown)
+	skillsMux.HandleFunc("GET "+prefix+"/{skillId}/revisions", s.handleListRevisions)
+	skillsMux.HandleFunc("POST "+prefix+"/{skillId}/revisions", s.handleAppendRevision)
+	skillsMux.HandleFunc("GET "+prefix+"/{skillId}/revisions/{revisionId}", s.handleGetRevision)
+	skillsMux.HandleFunc("PUT "+prefix+"/{skillId}/revisions/{revisionId}/visibility", s.handleSetRevisionVisibility)
+	skillsMux.HandleFunc("PUT "+prefix+"/{skillId}/latest", s.handleSetLatest)
+	skillsMux.HandleFunc("DELETE "+prefix+"/{skillId}/latest", s.handleClearLatest)
+	mux.Handle(prefix, skillsMux)
+	mux.Handle(prefix+"/", skillsMux)
 	return mux
 }
 
 // Serve runs the cassette server on listener until ctx is canceled.
 func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
-	// The background re-probe loop shares the server's lifecycle: it starts
-	// with serving and is canceled — and fully drained — before Serve
-	// returns, so no probe outlives the server.
-	reprobeCtx, stopReprobe := context.WithCancel(ctx)
+	// Background probes share the server lifecycle and are fully drained
+	// before Serve returns.
+	backgroundCtx, stopBackground := context.WithCancel(ctx)
 	reprobeDone := make(chan struct{})
 	go func() {
 		defer close(reprobeDone)
-		s.reprobeExternalFilters(reprobeCtx)
+		s.reprobeExternalFilters(backgroundCtx)
 	}()
 	defer func() {
-		stopReprobe()
+		stopBackground()
 		<-reprobeDone
 	}()
 
