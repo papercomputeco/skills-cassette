@@ -57,10 +57,12 @@ func NewMemoryStoreWithClock(now func() time.Time) *MemoryStore {
 }
 
 var (
-	_ Store              = (*MemoryStore)(nil)
-	_ GenerationStore    = (*MemoryStore)(nil)
-	_ SkillIdentityStore = (*MemoryStore)(nil)
-	_ RevisionStore      = (*MemoryStore)(nil)
+	_ Store                 = (*MemoryStore)(nil)
+	_ GenerationStore       = (*MemoryStore)(nil)
+	_ SkillIdentityStore    = (*MemoryStore)(nil)
+	_ SkillReader           = (*MemoryStore)(nil)
+	_ RevisionStore         = (*MemoryStore)(nil)
+	_ RevisionMetadataStore = (*MemoryStore)(nil)
 )
 
 // Kind names the backing store, echoed by /ping so a demo can never be
