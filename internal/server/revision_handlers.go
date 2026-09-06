@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/papercomputeco/skills-cassette/internal/generation"
 	"github.com/papercomputeco/skills-cassette/internal/storage"
 	"github.com/papercomputeco/skills-cassette/pkg/skill"
 )
@@ -203,13 +204,16 @@ func (s *Server) handleAppendRevision(w http.ResponseWriter, r *http.Request) {
 		IdempotencyKey: idempotencyKey, CreatedAt: time.Now().UTC(),
 	})
 	if err != nil {
+		s.generationMetrics.ObserveRevisionAppend(revisionAppendMetricOrigin(origin), revisionAppendMetricOutcome(err))
 		s.writeLifecycleStorageError(w, "append revision", err)
 		return
 	}
 	if created == nil {
+		s.generationMetrics.ObserveRevisionAppend(revisionAppendMetricOrigin(origin), generation.RevisionAppendOutcomeError)
 		s.writeLifecycleStorageError(w, "append revision", errors.New("revision store returned no revision"))
 		return
 	}
+	s.generationMetrics.ObserveRevisionAppend(revisionAppendMetricOrigin(origin), generation.RevisionAppendOutcomeSuccess)
 	accessible, err := s.revisionStore.GetRevision(r.Context(), storage.RevisionReadOpts{
 		SkillID: skillID, RevisionID: created.ID, CallerSubject: auth.Subject,
 	})
@@ -345,13 +349,28 @@ func (s *Server) handleSetRevisionVisibility(w http.ResponseWriter, r *http.Requ
 		IsPublic: *request.IsPublic, ChangedAt: time.Now().UTC(),
 	})
 	if err != nil {
+		s.generationMetrics.ObserveRevisionVisibility(
+			generation.RevisionVisibilityTransitionUnknown, revisionVisibilityMetricOutcome(err),
+		)
 		s.writeLifecycleStorageError(w, "set revision visibility", err)
 		return
 	}
 	if visibility == nil || visibility.RevisionID != revisionID {
+		s.generationMetrics.ObserveRevisionVisibility(
+			generation.RevisionVisibilityTransitionUnknown, generation.RevisionVisibilityOutcomeError,
+		)
 		s.writeLifecycleStorageError(w, "set revision visibility", errors.New("metadata store returned invalid visibility"))
 		return
 	}
+	transition := generation.RevisionVisibilityTransitionUnchanged
+	if visibility.Changed {
+		if visibility.PreviousIsPublic {
+			transition = generation.RevisionVisibilityTransitionPublicToPrivate
+		} else {
+			transition = generation.RevisionVisibilityTransitionPrivateToPublic
+		}
+	}
+	s.generationMetrics.ObserveRevisionVisibility(transition, generation.RevisionVisibilityOutcomeSuccess)
 	writeJSON(w, http.StatusOK, revisionVisibilityMutationWire(*visibility))
 }
 
@@ -461,6 +480,47 @@ func revisionVisibilityMutationWire(record storage.RevisionVisibilityRecord) rev
 	return revisionVisibilityMutationResponse{
 		RevisionID: record.RevisionID, IsPublic: record.IsPublic,
 		ChangedAt: record.ChangedAt.UTC().Format(time.RFC3339Nano),
+	}
+}
+
+func revisionAppendMetricOrigin(origin storage.RevisionOrigin) generation.RevisionAppendOrigin {
+	switch origin {
+	case storage.RevisionOriginManual:
+		return generation.RevisionAppendOriginManual
+	case storage.RevisionOriginGeneration:
+		return generation.RevisionAppendOriginGeneration
+	case storage.RevisionOriginDuplicate:
+		return generation.RevisionAppendOriginDuplicate
+	case storage.RevisionOriginMigrated:
+		return generation.RevisionAppendOriginMigrated
+	default:
+		return generation.RevisionAppendOriginUnknown
+	}
+}
+
+func revisionAppendMetricOutcome(err error) generation.RevisionAppendOutcome {
+	switch {
+	case errors.Is(err, storage.ErrRevisionConflict), errors.Is(err, storage.ErrSkillVersionConflict):
+		return generation.RevisionAppendOutcomeConflict
+	case errors.Is(err, storage.ErrRevisionLineageInvalid):
+		return generation.RevisionAppendOutcomeInvalid
+	case errors.Is(err, storage.ErrRevisionNotFound), errors.Is(err, storage.ErrSkillNotFound):
+		return generation.RevisionAppendOutcomeNotFound
+	case errors.Is(err, storage.ErrGenerationClaimLost):
+		return generation.RevisionAppendOutcomeClaimLost
+	default:
+		return generation.RevisionAppendOutcomeError
+	}
+}
+
+func revisionVisibilityMetricOutcome(err error) generation.RevisionVisibilityOutcome {
+	switch {
+	case errors.Is(err, storage.ErrRevisionNotFound), errors.Is(err, storage.ErrSkillNotFound):
+		return generation.RevisionVisibilityOutcomeNotFound
+	case errors.Is(err, storage.ErrRevisionIsExplicitLatest):
+		return generation.RevisionVisibilityOutcomeLatestConflict
+	default:
+		return generation.RevisionVisibilityOutcomeError
 	}
 }
 

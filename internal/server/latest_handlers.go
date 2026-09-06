@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/papercomputeco/skills-cassette/internal/generation"
 	"github.com/papercomputeco/skills-cassette/internal/storage"
 )
 
@@ -44,13 +45,16 @@ func (s *Server) handleSetLatest(w http.ResponseWriter, r *http.Request) {
 		SkillID: skillID, RevisionID: revisionID, CallerSubject: auth.Subject, ChangedAt: time.Now().UTC(),
 	})
 	if err != nil {
+		s.generationMetrics.ObserveLatestMutation(generation.LatestMutationOperationSet, latestMutationMetricOutcome(err))
 		s.writeLifecycleStorageError(w, "set explicit latest revision", err)
 		return
 	}
 	if record == nil {
+		s.generationMetrics.ObserveLatestMutation(generation.LatestMutationOperationSet, generation.LatestMutationOutcomeError)
 		s.writeLifecycleStorageError(w, "set explicit latest revision", errors.New("metadata store returned no latest projection"))
 		return
 	}
+	s.generationMetrics.ObserveLatestMutation(generation.LatestMutationOperationSet, generation.LatestMutationOutcomeSuccess)
 	writeJSON(w, http.StatusOK, latestWire(*record))
 }
 
@@ -68,14 +72,28 @@ func (s *Server) handleClearLatest(w http.ResponseWriter, r *http.Request) {
 		SkillID: skillID, CallerSubject: auth.Subject, ChangedAt: time.Now().UTC(),
 	})
 	if err != nil {
+		s.generationMetrics.ObserveLatestMutation(generation.LatestMutationOperationClear, latestMutationMetricOutcome(err))
 		s.writeLifecycleStorageError(w, "clear explicit latest revision", err)
 		return
 	}
 	if record == nil {
+		s.generationMetrics.ObserveLatestMutation(generation.LatestMutationOperationClear, generation.LatestMutationOutcomeError)
 		s.writeLifecycleStorageError(w, "clear explicit latest revision", errors.New("metadata store returned no latest projection"))
 		return
 	}
+	s.generationMetrics.ObserveLatestMutation(generation.LatestMutationOperationClear, generation.LatestMutationOutcomeSuccess)
 	writeJSON(w, http.StatusOK, latestWire(*record))
+}
+
+func latestMutationMetricOutcome(err error) generation.LatestMutationOutcome {
+	switch {
+	case errors.Is(err, storage.ErrRevisionNotFound), errors.Is(err, storage.ErrSkillNotFound):
+		return generation.LatestMutationOutcomeRevisionNotFound
+	case errors.Is(err, storage.ErrRevisionNotPublic):
+		return generation.LatestMutationOutcomeRevisionNotPublic
+	default:
+		return generation.LatestMutationOutcomeError
+	}
 }
 
 func latestWire(record storage.SkillLatestRecord) latestResponse {

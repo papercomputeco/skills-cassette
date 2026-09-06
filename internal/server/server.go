@@ -13,6 +13,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/papercomputeco/skills-cassette/internal/evaluator"
+	"github.com/papercomputeco/skills-cassette/internal/generation"
 	"github.com/papercomputeco/skills-cassette/internal/storage"
 	"github.com/papercomputeco/skills-cassette/pkg/skill"
 )
@@ -39,18 +41,21 @@ type distributionStore interface {
 	IncrementSkillDownloads(ctx context.Context, skillID string) error
 }
 
-// Server is the whole cassette: stable skill/revision storage and durable
-// skill-anchored generation storage.
+// Server is the whole cassette: stable skill/revision storage, durable
+// generation storage, and the self-contained generation worker.
 type Server struct {
-	name                  string
-	distributions         distributionStore
-	skillReader           storage.SkillReader
-	skillIdentityStore    storage.SkillIdentityStore
-	revisionStore         storage.RevisionStore
-	revisionMetadataStore storage.RevisionMetadataStore
-	generationStore       storage.GenerationStore
-	logger                *slog.Logger
-	openapi               []byte
+	name                   string
+	distributions          distributionStore
+	skillReader            storage.SkillReader
+	skillIdentityStore     storage.SkillIdentityStore
+	revisionStore          storage.RevisionStore
+	revisionMetadataStore  storage.RevisionMetadataStore
+	generationStore        storage.GenerationStore
+	logger                 *slog.Logger
+	openapi                []byte
+	generationWorker       *generation.Worker
+	generationQueueMonitor *generation.QueueMonitor
+	generationMetrics      *generation.Metrics
 	// mu guards filters and pending: request handlers read the armed set
 	// on every list, while the background re-probe loop arms filters after
 	// startup. Writers swap in fresh slices, never mutate published ones,
@@ -68,9 +73,9 @@ type Server struct {
 	prober storage.ExternalViewProber
 }
 
-// New builds the cassette server. querier is reserved for source-transcript
-// reads and may be nil.
-func New(cfg Config, store distributionStore, _ skill.Querier, logger *slog.Logger) *Server {
+// New builds the cassette server. querier may be nil when no core URL is
+// configured; the generation worker then stays disabled while the rest serves.
+func New(cfg Config, store distributionStore, querier skill.Querier, logger *slog.Logger) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -84,14 +89,53 @@ func New(cfg Config, store distributionStore, _ skill.Querier, logger *slog.Logg
 	revisionStore, _ := store.(storage.RevisionStore)
 	revisionMetadataStore, _ := store.(storage.RevisionMetadataStore)
 	generationStore, _ := store.(storage.GenerationStore)
-	return &Server{
+	metrics := generation.NewMetrics()
+	result := &Server{
 		name: name, distributions: store,
 		skillReader: skillReader, skillIdentityStore: skillIdentityStore,
 		revisionStore: revisionStore, revisionMetadataStore: revisionMetadataStore,
 		generationStore: generationStore, logger: logger,
-		openapi: openAPIDocument(name),
+		openapi: openAPIDocument(name), generationMetrics: metrics,
 		filters: armed, pending: pending, prober: prober,
 	}
+	result.generationWorker = buildGenerationWorker(cfg, generationStore, querier, metrics, logger)
+	if generationStore != nil && result.generationWorker == nil {
+		result.generationQueueMonitor = generation.NewQueueMonitor(
+			generationStore, cfg.Generation, metrics, logger,
+		)
+	}
+	return result
+}
+
+func buildGenerationWorker(cfg Config, store storage.GenerationStore, querier skill.Querier, metrics *generation.Metrics, logger *slog.Logger) *generation.Worker {
+	if store == nil || querier == nil || cfg.CandidateEvaluatorURL() == "" {
+		return nil
+	}
+	llmCall, err := skill.NewLLMCaller(cfg.LLM)
+	if err != nil {
+		logger.Warn("asynchronous generation worker is disabled because its LLM is not configured")
+		return nil
+	}
+	workerConfig := cfg.Generation
+	defaults := generation.DefaultWorkerConfig()
+	if workerConfig.MaxTranscriptBytes <= 0 {
+		workerConfig.MaxTranscriptBytes = defaults.MaxTranscriptBytes
+	}
+	if workerConfig.ProcessingTimeout <= 0 {
+		workerConfig.ProcessingTimeout = defaults.ProcessingTimeout
+	}
+	loader := generation.TranscriptLoaderFunc(func(ctx context.Context, sessionID string) (string, error) {
+		return skill.BuildSessionTranscript(ctx, querier, sessionID,
+			skill.WithTranscriptByteLimit(workerConfig.MaxTranscriptBytes))
+	})
+	generator := skill.NewGenerator(querier, llmCall)
+	evaluatorClient := evaluator.NewHTTPClient(cfg.CandidateEvaluatorURL(), &http.Client{Timeout: workerConfig.ProcessingTimeout})
+	processor := generation.NewProcessorWithConfig(store, loader, generator, evaluatorClient, generation.ProcessorConfig{
+		CandidateConcurrency: generation.EffectiveCandidateConcurrency(
+			workerConfig.CandidateConcurrency, workerConfig.MaxSessions,
+		),
+	}, metrics)
+	return generation.NewWorker(store, processor, workerConfig, metrics, logger)
 }
 
 // armExternalFilters probes each configured external attachment view once
@@ -234,6 +278,7 @@ func (s *Server) Handler() http.Handler {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(s.openapi)
 	})
+	mux.HandleFunc("GET /metrics", s.handleMetrics)
 
 	// The API itself, under the prefix clients call through tapes:
 	// /api/<name>/... republishes as /v1/cassettes/<name>/.... Content saves,
@@ -269,17 +314,37 @@ func (s *Server) Handler() http.Handler {
 
 // Serve runs the cassette server on listener until ctx is canceled.
 func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
-	// Background probes share the server lifecycle and are fully drained
-	// before Serve returns.
+	// Background probes and the generation worker share the server lifecycle
+	// and are fully drained before Serve returns.
 	backgroundCtx, stopBackground := context.WithCancel(ctx)
 	reprobeDone := make(chan struct{})
 	go func() {
 		defer close(reprobeDone)
 		s.reprobeExternalFilters(backgroundCtx)
 	}()
+	workerDone := make(chan struct{})
+	go func() {
+		defer close(workerDone)
+		if s.generationWorker != nil {
+			if err := s.generationWorker.Run(backgroundCtx); err != nil {
+				s.logger.Error("generation worker stopped")
+			}
+		}
+	}()
+	queueMonitorDone := make(chan struct{})
+	go func() {
+		defer close(queueMonitorDone)
+		if s.generationQueueMonitor != nil {
+			if err := s.generationQueueMonitor.Run(backgroundCtx); err != nil {
+				s.logger.Error("generation queue monitor stopped")
+			}
+		}
+	}()
 	defer func() {
 		stopBackground()
 		<-reprobeDone
+		<-workerDone
+		<-queueMonitorDone
 	}()
 
 	httpServer := &http.Server{Handler: s.Handler(), ReadHeaderTimeout: 5 * time.Second}

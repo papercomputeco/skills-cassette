@@ -9,18 +9,24 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/text/cases"
 	"golang.org/x/text/unicode/norm"
 
+	"github.com/papercomputeco/skills-cassette/internal/generation"
 	"github.com/papercomputeco/skills-cassette/pkg/skill"
 )
 
 // DefaultName is the cassette identity everything derives from: the local
 // route prefix (/api/skills), the public route (/v1/cassettes/skills), and
 // the Postgres schema ("skills").
-const DefaultName = "skills"
+const (
+	DefaultName                    = "skills"
+	candidateEvaluatorCassettePath = "/v1/cassettes/skills-evaluator/candidate-evaluations"
+)
 
 // Config is everything the cassette process reads from its environment. The
 // deployment supplies it; the cassette has no config file and no knowledge of
@@ -38,14 +44,17 @@ type Config struct {
 	// filters (CASSETTE_FILTERS), validated at startup. Absent: the
 	// capability is off with zero behavioral change.
 	Filters []ExternalFilter
+	// Generation bounds the cassette-local leased worker.
+	Generation generation.WorkerConfig
 }
 
 // ConfigFromEnv reads the manifest-declared configuration from the
 // conventional CASSETTE_* environment variables.
 func ConfigFromEnv() Config {
 	return Config{
-		Name:    envOrDefault("CASSETTE_NAME", DefaultName),
-		CoreURL: strings.TrimSpace(os.Getenv("CASSETTE_CORE_URL")),
+		Name:       envOrDefault("CASSETTE_NAME", DefaultName),
+		CoreURL:    strings.TrimSpace(os.Getenv("CASSETTE_CORE_URL")),
+		Generation: generationWorkerConfigFromEnv(),
 		LLM: skill.LLMCallerConfig{
 			Provider: strings.TrimSpace(os.Getenv("CASSETTE_LLM_PROVIDER")),
 			Model:    strings.TrimSpace(os.Getenv("CASSETTE_LLM_MODEL")),
@@ -53,6 +62,67 @@ func ConfigFromEnv() Config {
 			BaseURL:  strings.TrimSpace(os.Getenv("CASSETTE_LLM_BASE_URL")),
 		},
 	}
+}
+
+func generationWorkerConfigFromEnv() generation.WorkerConfig {
+	config := generation.DefaultWorkerConfig()
+	config.WorkerConcurrency = boundedEnvInt("CASSETTE_GENERATION_WORKER_CONCURRENCY", config.WorkerConcurrency, 1, 64)
+	config.MaxSessions = boundedEnvInt("CASSETTE_GENERATION_MAX_SESSIONS", config.MaxSessions, 1, 100)
+	configuredCandidateConcurrency := boundedEnvInt(
+		"CASSETTE_GENERATION_CANDIDATE_CONCURRENCY", config.CandidateConcurrency, 1, 100,
+	)
+	config.CandidateConcurrency = generation.EffectiveCandidateConcurrency(
+		configuredCandidateConcurrency, config.MaxSessions,
+	)
+	config.PollInterval = boundedEnvMilliseconds("CASSETTE_GENERATION_POLL_INTERVAL_MS", config.PollInterval, 10*time.Millisecond, time.Minute)
+	config.MaxPollInterval = boundedEnvMilliseconds("CASSETTE_GENERATION_MAX_POLL_INTERVAL_MS", config.MaxPollInterval, 10*time.Millisecond, 5*time.Minute)
+	config.LeaseDuration = boundedEnvMilliseconds("CASSETTE_GENERATION_LEASE_DURATION_MS", config.LeaseDuration, time.Second, time.Hour)
+	config.HeartbeatInterval = boundedEnvMilliseconds("CASSETTE_GENERATION_HEARTBEAT_INTERVAL_MS", config.HeartbeatInterval, 100*time.Millisecond, 10*time.Minute)
+	config.ProcessingTimeout = boundedEnvMilliseconds("CASSETTE_GENERATION_PROCESSING_TIMEOUT_MS", config.ProcessingTimeout, time.Second, time.Hour)
+	config.DrainTimeout = boundedEnvMilliseconds("CASSETTE_GENERATION_DRAIN_TIMEOUT_MS", config.DrainTimeout, time.Second, 5*time.Minute)
+	config.RetryBackoff = boundedEnvMilliseconds("CASSETTE_GENERATION_RETRY_BACKOFF_MS", config.RetryBackoff, 10*time.Millisecond, 5*time.Minute)
+	config.MaxRetryBackoff = boundedEnvMilliseconds("CASSETTE_GENERATION_MAX_RETRY_BACKOFF_MS", config.MaxRetryBackoff, 10*time.Millisecond, time.Hour)
+	config.MaxAttempts = boundedEnvInt("CASSETTE_GENERATION_MAX_ATTEMPTS", config.MaxAttempts, 1, 10)
+	config.MaxTranscriptBytes = boundedEnvInt("CASSETTE_GENERATION_MAX_TRANSCRIPT_BYTES", config.MaxTranscriptBytes, 4096, 1<<20)
+	// Apply relational bounds after every scalar has been parsed. This makes
+	// partially overridden deployments deterministic rather than allowing an
+	// individually valid combination to disable the worker at Run time.
+	if config.MaxPollInterval < config.PollInterval {
+		config.MaxPollInterval = config.PollInterval
+	}
+	if config.HeartbeatInterval >= config.LeaseDuration {
+		config.HeartbeatInterval = config.LeaseDuration / 2
+	}
+	if config.MaxRetryBackoff < config.RetryBackoff {
+		config.MaxRetryBackoff = config.RetryBackoff
+	}
+	return config
+}
+
+func boundedEnvInt(key string, fallback, minimum, maximum int) int {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < minimum || value > maximum {
+		return fallback
+	}
+	return value
+}
+
+func boundedEnvMilliseconds(key string, fallback, minimum, maximum time.Duration) time.Duration {
+	milliseconds := boundedEnvInt(key, int(fallback/time.Millisecond), int(minimum/time.Millisecond), int(maximum/time.Millisecond))
+	return time.Duration(milliseconds) * time.Millisecond
+}
+
+// CandidateEvaluatorURL routes generation judgment through the same
+// tenant-local Tapes core used for transcript reads.
+func (c Config) CandidateEvaluatorURL() string {
+	if strings.TrimSpace(c.CoreURL) == "" {
+		return ""
+	}
+	return strings.TrimRight(c.CoreURL, "/") + candidateEvaluatorCassettePath
 }
 
 // ValidateCoreURL checks the configured core target. An empty value is

@@ -13,8 +13,10 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -23,12 +25,30 @@ import (
 	. "github.com/onsi/gomega"
 
 	"github.com/papercomputeco/skills-cassette/internal/evaluator"
+	"github.com/papercomputeco/skills-cassette/internal/generation"
 	"github.com/papercomputeco/skills-cassette/internal/server"
 	"github.com/papercomputeco/skills-cassette/internal/storage"
+	"github.com/papercomputeco/skills-cassette/pkg/skill"
 )
 
 func newTestServer() *server.Server {
 	return server.New(server.Config{}, storage.NewMemoryStore(), nil, nil)
+}
+
+func serverMetricGauge(service *server.Server, name string) float64 {
+	recorder := httptest.NewRecorder()
+	service.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	Expect(recorder.Code).To(Equal(http.StatusOK))
+	for _, line := range strings.Split(recorder.Body.String(), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 && fields[0] == name {
+			value, err := strconv.ParseFloat(fields[1], 64)
+			Expect(err).NotTo(HaveOccurred())
+			return value
+		}
+	}
+	Fail("metric not found: " + name)
+	return 0
 }
 
 type generationCreationTestStore interface {
@@ -42,6 +62,42 @@ type generationCreationTestStore interface {
 type generationListInspectionStore struct {
 	generationCreationTestStore
 	exactReads int
+}
+
+type lifecycleQueueStore struct {
+	*storage.MemoryStore
+	queueStatsCalls atomic.Int32
+}
+
+func (s *lifecycleQueueStore) GenerationQueueStats(ctx context.Context) (storage.GenerationQueueStats, error) {
+	s.queueStatsCalls.Add(1)
+	return s.MemoryStore.GenerationQueueStats(ctx)
+}
+
+type joiningLifecycleQueueStore struct {
+	*storage.MemoryStore
+	entered  chan struct{}
+	canceled chan struct{}
+	release  chan struct{}
+	once     sync.Once
+}
+
+func (s *joiningLifecycleQueueStore) GenerationQueueStats(ctx context.Context) (storage.GenerationQueueStats, error) {
+	s.once.Do(func() { close(s.entered) })
+	<-ctx.Done()
+	close(s.canceled)
+	<-s.release
+	return storage.GenerationQueueStats{}, ctx.Err()
+}
+
+type emptyTraceQuerier struct{}
+
+func (emptyTraceQuerier) TraceSummaries(context.Context, string) ([]skill.TraceSummary, error) {
+	return nil, nil
+}
+
+func (emptyTraceQuerier) Trace(context.Context, string) (*skill.Trace, error) {
+	return nil, nil
 }
 
 func (s *generationListInspectionStore) GetSkillGeneration(ctx context.Context, callerSubject, skillID, generationID string) (*storage.GenerationState, error) {
@@ -1187,6 +1243,280 @@ var _ = Describe("skill-scoped generation creation", func() {
 		}
 	})
 
+	It("generation_history_follows_result_revision_visibility", func() {
+		runCommit7GenerationHistoryVisibilitySpec()
+
+		ctx := context.Background()
+		store := storage.NewMemoryStore()
+		DeferCleanup(store.Close)
+		const (
+			creator = "generation-history-creator"
+			member  = "generation-history-member"
+		)
+		now := time.Now().UTC().Add(-time.Hour)
+		skillRecord, err := store.ResolveSkill(ctx, storage.ResolveSkillInput{
+			ID: uuid.NewString(), Slug: "generation-history-visibility", CreatorSubject: creator, CreatedAt: now,
+		})
+		Expect(err).NotTo(HaveOccurred())
+		criteriaSet := evaluator.GenerationCandidateCriteria()
+		criteriaJSON, err := json.Marshal(criteriaSet.Criteria)
+		Expect(err).NotTo(HaveOccurred())
+
+		createGeneration := func(label string, createdAt time.Time) *storage.SkillGenerationRecord {
+			generation, createErr := store.CreateGeneration(ctx, storage.CreateGenerationInput{
+				ID: uuid.NewString(), SkillID: skillRecord.ID, CreatorSubject: creator,
+				Snapshot: storage.SkillRevisionSnapshot{
+					Name: label, Description: "Visibility fixture.", Type: "workflow", Content: "# " + label,
+				},
+				AuthorContext: "preserve exact visibility", EvaluatorProfile: criteriaSet.Profile,
+				EvaluatorProfileVersion: criteriaSet.Version, EvaluationCriteria: criteriaJSON, CreatedAt: createdAt,
+			})
+			Expect(createErr).NotTo(HaveOccurred())
+			return generation
+		}
+		completeGeneration := func(label string, createdAt time.Time) (*storage.SkillGenerationRecord, *storage.SkillRevisionRecord) {
+			generation := createGeneration(label, createdAt)
+			claim, claimErr := store.ClaimGeneration(ctx, storage.ClaimGenerationInput{
+				WorkerID: "visibility-worker", LeaseDuration: time.Hour,
+			})
+			Expect(claimErr).NotTo(HaveOccurred())
+			Expect(claim).NotTo(BeNil())
+			Expect(claim.ID).To(Equal(generation.ID))
+			Expect(store.UpdateGenerationStatus(ctx, generation.ID, claim.ClaimToken,
+				storage.GenerationStatusQueued, storage.GenerationStatusGeneratingCandidates)).To(Succeed())
+			candidate, candidateErr := store.PutGenerationCandidate(ctx, generation.ID, claim.ClaimToken, storage.GenerationCandidateRecord{
+				ID: uuid.NewString(), Ordinal: 0, Kind: storage.GenerationCandidateContext,
+				Snapshot: storage.GenerationCandidateSnapshot{
+					Name: label + " result", Description: "Bounded result.", Type: "workflow",
+					Content: "# " + label + " result", IsAIGenerated: true,
+				},
+				Insights: json.RawMessage(`[]`), BundleSHA256: "bundle-" + label,
+			})
+			Expect(candidateErr).NotTo(HaveOccurred())
+			Expect(store.UpdateGenerationStatus(ctx, generation.ID, claim.ClaimToken,
+				storage.GenerationStatusGeneratingCandidates, storage.GenerationStatusEvaluatingCandidates)).To(Succeed())
+			score := 0.9
+			_, evaluationErr := store.PutCandidateEvaluation(ctx, generation.ID, claim.ClaimToken, storage.CandidateEvaluationRecord{
+				ID: uuid.NewString(), CandidateID: candidate.ID, RequestSHA256: "request-" + label,
+				Profile: criteriaSet.Profile, ProfileVersion: criteriaSet.Version,
+				EvaluatorVersion: "test", Score: &score, Decision: "pass",
+				CriterionResults: json.RawMessage(`[]`), Findings: json.RawMessage(`[]`),
+				Strengths: json.RawMessage(`["bounded"]`), Panel: json.RawMessage(`{}`),
+			})
+			Expect(evaluationErr).NotTo(HaveOccurred())
+			Expect(store.UpdateGenerationStatus(ctx, generation.ID, claim.ClaimToken,
+				storage.GenerationStatusEvaluatingCandidates, storage.GenerationStatusSynthesizing)).To(Succeed())
+			revision, finalizeErr := store.AppendPrivateGenerationResult(ctx, storage.AppendPrivateGenerationResultInput{
+				GenerationID: generation.ID, ClaimToken: claim.ClaimToken,
+				InitialWinnerCandidateID: candidate.ID, ResultCandidateID: candidate.ID,
+			})
+			Expect(finalizeErr).NotTo(HaveOccurred())
+			completed, readErr := store.GetGenerationByID(ctx, creator, generation.ID)
+			Expect(readErr).NotTo(HaveOccurred())
+			return &completed.Generation, revision
+		}
+
+		privateCompleted, privateResult := completeGeneration("private-completed", now.Add(time.Minute))
+		publicCompleted, publicResult := completeGeneration("public-completed", now.Add(2*time.Minute))
+		_, err = store.SetRevisionVisibility(ctx, storage.SetRevisionVisibilityInput{
+			SkillID: skillRecord.ID, RevisionID: publicResult.ID, CallerSubject: creator,
+			IsPublic: true, ChangedAt: now.Add(3 * time.Minute),
+		})
+		Expect(err).NotTo(HaveOccurred())
+		failed := createGeneration("failed", now.Add(4*time.Minute))
+		failedClaim, err := store.ClaimGeneration(ctx, storage.ClaimGenerationInput{WorkerID: "failed-worker", LeaseDuration: time.Hour})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(failedClaim.ID).To(Equal(failed.ID))
+		failedRecord, err := store.FailGeneration(ctx, storage.FailGenerationInput{
+			GenerationID: failed.ID, ClaimToken: failedClaim.ClaimToken,
+			Failure: storage.GenerationFailure{Code: "generation_failed", Message: "Generation could not be completed."},
+		})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(failedRecord.Status).To(Equal(storage.GenerationStatusFailed))
+		canceled := createGeneration("canceled", now.Add(5*time.Minute))
+		_, err = store.CancelSkillGeneration(ctx, creator, skillRecord.ID, canceled.ID)
+		Expect(err).NotTo(HaveOccurred())
+		inProgress := createGeneration("in-progress", now.Add(6*time.Minute))
+
+		srv := newSkillsServer(store)
+		nestedPath := func(generationID string) string {
+			return "/api/skills/" + skillRecord.ID + "/generations/" + generationID
+		}
+		directPath := func(generationID string) string {
+			return "/api/skills/generations/" + generationID
+		}
+		statusFor := func(path, subject string) int {
+			_, status := doJSON(srv, http.MethodGet, path, "", subject)
+			return status
+		}
+		all := []string{inProgress.ID, failed.ID, canceled.ID, privateCompleted.ID, publicCompleted.ID}
+		for _, generationID := range all {
+			Expect(statusFor(nestedPath(generationID), creator)).To(Equal(http.StatusOK), generationID)
+			Expect(statusFor(directPath(generationID), creator)).To(Equal(http.StatusOK), generationID)
+		}
+		ownerList, status := doJSON(srv, http.MethodGet,
+			"/api/skills/"+skillRecord.ID+"/generations?limit=100", "", creator)
+		Expect(status).To(Equal(http.StatusOK), ownerList)
+		Expect(ownerList["generations"]).To(HaveLen(5))
+
+		for _, generationID := range []string{inProgress.ID, failed.ID, canceled.ID, privateCompleted.ID} {
+			Expect(statusFor(nestedPath(generationID), member)).To(Equal(http.StatusNotFound), generationID)
+			Expect(statusFor(directPath(generationID), member)).To(Equal(http.StatusNotFound), generationID)
+		}
+		Expect(statusFor(nestedPath(publicCompleted.ID), member)).To(Equal(http.StatusOK))
+		Expect(statusFor(directPath(publicCompleted.ID), member)).To(Equal(http.StatusOK))
+		memberList, status := doJSON(srv, http.MethodGet,
+			"/api/skills/"+skillRecord.ID+"/generations?limit=100", "", member)
+		Expect(status).To(Equal(http.StatusOK), memberList)
+		Expect(memberList["generations"]).To(HaveLen(1))
+		Expect(memberList["generations"].([]any)[0].(map[string]any)).To(HaveKeyWithValue("id", publicCompleted.ID))
+
+		_, err = store.SetRevisionVisibility(ctx, storage.SetRevisionVisibilityInput{
+			SkillID: skillRecord.ID, RevisionID: publicResult.ID, CallerSubject: creator,
+			IsPublic: false, ChangedAt: now.Add(7 * time.Minute),
+		})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(statusFor(nestedPath(publicCompleted.ID), member)).To(Equal(http.StatusNotFound))
+		Expect(statusFor(directPath(publicCompleted.ID), member)).To(Equal(http.StatusNotFound))
+		memberList, status = doJSON(srv, http.MethodGet,
+			"/api/skills/"+skillRecord.ID+"/generations?limit=100", "", member)
+		Expect(status).To(Equal(http.StatusOK), memberList)
+		Expect(memberList["generations"]).To(BeEmpty())
+
+		_, err = store.SetRevisionVisibility(ctx, storage.SetRevisionVisibilityInput{
+			SkillID: skillRecord.ID, RevisionID: publicResult.ID, CallerSubject: creator,
+			IsPublic: true, ChangedAt: now.Add(8 * time.Minute),
+		})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(statusFor(nestedPath(publicCompleted.ID), member)).To(Equal(http.StatusOK))
+		Expect(statusFor(directPath(publicCompleted.ID), member)).To(Equal(http.StatusOK))
+		Expect(privateResult.ID).NotTo(Equal(publicResult.ID))
+	})
+
+	It("generation_routes_exclude_raw_transcripts_and_provider_errors", func() {
+		runCommit7SensitiveGenerationWireSpec()
+
+		const (
+			owner             = "wire-owner-secret"
+			member            = "wire-member"
+			creatorSecret     = "creator-subject-secret"
+			claimSecret       = "claim-token-secret"
+			providerSecret    = "provider-stacktrace-secret"
+			providerRequestID = "provider-request-id-secret"
+			requestSHA        = "request-sha-secret"
+			transcriptKey     = "oversized-transcript-secret"
+			panelSecret       = "provider-panel-secret"
+			diagnosticID      = "00000000-0000-0000-0000-000000000077"
+		)
+		now := time.Date(2026, 9, 9, 10, 0, 0, 0, time.UTC)
+		generationID := uuid.NewString()
+		skillID := uuid.NewString()
+		candidateID := uuid.NewString()
+		score := 0.8
+		completedAt := now.Add(time.Minute)
+		store := &defensiveGenerationReadStore{
+			MemoryStore: storage.NewMemoryStore(),
+			state: storage.GenerationState{
+				Generation: storage.SkillGenerationRecord{
+					ID: generationID, SkillID: skillID, CreatorSubject: owner,
+					Status:        storage.GenerationStatusCompleted,
+					Snapshot:      storage.SkillRevisionSnapshot{Name: "Safe input", Type: "workflow", Content: "# Safe input"},
+					AuthorContext: "safe", EvaluatorProfile: "generation-candidate-v1", EvaluatorProfileVersion: "1",
+					EvaluationCriteria: json.RawMessage(`[{"id":"safe","weight":1}]`),
+					WinnerCandidateID:  candidateID, ResultCandidateID: candidateID, ResultRevisionID: uuid.NewString(),
+					ErrorCode: "generation_failed", ErrorMessage: "Generation could not be completed.",
+					ClaimToken: claimSecret, ClaimOwner: creatorSecret, CreatedAt: now, UpdatedAt: completedAt, CompletedAt: &completedAt,
+				},
+				Candidates: []storage.GenerationCandidateRecord{{
+					ID: candidateID, Ordinal: 0, Kind: storage.GenerationCandidateContext,
+					Snapshot: storage.GenerationCandidateSnapshot{Name: "Safe result", Type: "workflow", Content: "# Safe result"},
+					Insights: json.RawMessage(fmt.Sprintf(
+						`[{"kind":"fact","summary":"safe","evidence":"safe","provider":%q}]`, providerSecret,
+					)),
+					BundleSHA256: "safe-bundle",
+				}},
+				Evaluations: []storage.CandidateEvaluationRecord{{
+					ID: uuid.NewString(), CandidateID: candidateID, RequestSHA256: requestSHA,
+					Profile: "generation-candidate-v1", ProfileVersion: "1",
+					EvaluatorVersion: "safe", Score: &score, Decision: "pass", CriterionResults: json.RawMessage(`[]`),
+					Findings: json.RawMessage(`[]`), Strengths: json.RawMessage(`[]`),
+					Panel: json.RawMessage(fmt.Sprintf(`{"%s":%q,"panel":%q,"providerError":%q,"providerRequestId":%q}`, transcriptKey, strings.Repeat("t", 128<<10), panelSecret, providerSecret, providerRequestID)),
+				}},
+				Diagnostics: []storage.GenerationDiagnosticRecord{{
+					ID: diagnosticID, Stage: "evaluation", Code: "candidate_evaluation_failed",
+					Message: "A candidate could not be evaluated.", CreatedAt: now,
+				}},
+			},
+		}
+		DeferCleanup(store.Close)
+		srv := server.New(server.Config{}, store, nil, nil)
+		paths := []string{
+			"/api/skills/" + skillID + "/generations/" + generationID,
+			"/api/skills/generations/" + generationID,
+		}
+		assertSafeWire := func(path, subject string) {
+			response := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodGet, path, nil)
+			request.Header.Set(authSubjectHeader, subject)
+			srv.Handler().ServeHTTP(response, request)
+			Expect(response.Code).To(Equal(http.StatusOK), "%s response: %s", path, response.Body.String())
+			serialized := response.Body.String()
+			for _, forbidden := range []string{
+				owner, creatorSecret, providerSecret, providerRequestID, requestSHA, transcriptKey,
+				panelSecret, claimSecret, diagnosticID,
+				`"requestSHA256"`, `"panel"`, `"claimToken"`, `"claimOwner"`, `"leaseExpiresAt"`, `"creatorSubject"`,
+			} {
+				Expect(serialized).NotTo(ContainSubstring(forbidden), "%s exposed %q", path, forbidden)
+			}
+			Expect(len(serialized)).To(BeNumerically("<", 128<<10), "oversized external material must not reach the response")
+		}
+
+		for _, path := range paths {
+			assertSafeWire(path, owner)
+			_, privateStatus := doJSON(srv, http.MethodGet, path, "", member)
+			Expect(privateStatus).To(Equal(http.StatusNotFound))
+		}
+		privateList, status := doJSON(srv, http.MethodGet, "/api/skills/"+skillID+"/generations", "", owner)
+		Expect(status).To(Equal(http.StatusOK), privateList)
+		privateListJSON, err := json.Marshal(privateList)
+		Expect(err).NotTo(HaveOccurred())
+		for _, forbidden := range []string{owner, creatorSecret, providerSecret, providerRequestID, requestSHA, transcriptKey, panelSecret, claimSecret, diagnosticID} {
+			Expect(string(privateListJSON)).NotTo(ContainSubstring(forbidden))
+		}
+
+		store.setPublic(true)
+		for _, path := range paths {
+			assertSafeWire(path, member)
+		}
+		publicList, status := doJSON(srv, http.MethodGet, "/api/skills/"+skillID+"/generations", "", member)
+		Expect(status).To(Equal(http.StatusOK), publicList)
+		publicListJSON, err := json.Marshal(publicList)
+		Expect(err).NotTo(HaveOccurred())
+		for _, forbidden := range []string{owner, creatorSecret, providerSecret, providerRequestID, requestSHA, transcriptKey, panelSecret, claimSecret, diagnosticID} {
+			Expect(string(publicListJSON)).NotTo(ContainSubstring(forbidden))
+		}
+
+		openAPIRecorder := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(openAPIRecorder, httptest.NewRequest(http.MethodGet, "/openapi", nil))
+		Expect(openAPIRecorder.Code).To(Equal(http.StatusOK))
+		var document any
+		Expect(json.Unmarshal(openAPIRecorder.Body.Bytes(), &document)).To(Succeed())
+		keys := map[string]struct{}{}
+		collectJSONKeys(document, keys)
+		for _, forbidden := range []string{
+			owner, creatorSecret, providerSecret, providerRequestID, requestSHA,
+			transcriptKey, panelSecret, claimSecret, diagnosticID,
+		} {
+			Expect(openAPIRecorder.Body.String()).NotTo(ContainSubstring(forbidden))
+		}
+		for _, forbiddenKey := range []string{
+			"requestSHA256", "requestId", "providerRequestId", "panel", "transcript", "transcripts",
+			"providerError", "rawError", "diagnosticId", "claimToken", "claimOwner",
+			"leaseExpiresAt", "lastHeartbeatAt", "creatorSubject",
+		} {
+			Expect(keys).NotTo(HaveKey(forbiddenKey), "OpenAPI must not advertise sensitive field %q", forbiddenKey)
+		}
+	})
 })
 
 var _ = Describe("cassette anchors", func() {
@@ -1260,6 +1590,69 @@ var _ = Describe("cassette anchors", func() {
 		recorder = httptest.NewRecorder()
 		srv.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/skills-two", nil))
 		Expect(recorder.Code).To(Equal(http.StatusOK))
+	})
+
+	It("samples queue state without worker dependencies and never starts a duplicate sampler", func() {
+		start := func(service *server.Server) (context.CancelFunc, <-chan error) {
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			Expect(err).NotTo(HaveOccurred())
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() { done <- service.Serve(ctx, listener) }()
+			return cancel, done
+		}
+
+		standaloneStore := &lifecycleQueueStore{MemoryStore: storage.NewMemoryStore()}
+		standaloneConfig := server.Config{Generation: generation.WorkerConfig{
+			PollInterval: 10 * time.Millisecond, MaxPollInterval: 20 * time.Millisecond,
+		}}
+		standaloneService := server.New(standaloneConfig, standaloneStore, nil, nil)
+		cancel, done := start(standaloneService)
+		Eventually(standaloneStore.queueStatsCalls.Load).Should(BeNumerically(">=", 3),
+			"queue state is sampled even without Tapes, evaluator, or LLM dependencies")
+		Expect(serverMetricGauge(standaloneService, generation.MetricGenerationWorkerReady)).To(BeZero(),
+			"a queue-sampling replica without processing dependencies is not worker-ready")
+		cancel()
+		Eventually(done).Should(Receive(Succeed()))
+		callsAfterStop := standaloneStore.queueStatsCalls.Load()
+		time.Sleep(30 * time.Millisecond)
+		Expect(standaloneStore.queueStatsCalls.Load()).To(Equal(callsAfterStop),
+			"the sampler shares the Serve lifecycle")
+		standaloneStore.Close()
+
+		joiningStore := &joiningLifecycleQueueStore{
+			MemoryStore: storage.NewMemoryStore(), entered: make(chan struct{}),
+			canceled: make(chan struct{}), release: make(chan struct{}),
+		}
+		cancel, done = start(server.New(standaloneConfig, joiningStore, nil, nil))
+		Eventually(joiningStore.entered).Should(BeClosed())
+		cancel()
+		Eventually(joiningStore.canceled).Should(BeClosed())
+		Consistently(done).WithTimeout(30*time.Millisecond).ShouldNot(Receive(),
+			"Serve must join its standalone queue monitor")
+		close(joiningStore.release)
+		Eventually(done).Should(Receive(Succeed()))
+		joiningStore.Close()
+
+		workerStore := &lifecycleQueueStore{MemoryStore: storage.NewMemoryStore()}
+		workerConfig := server.Config{
+			CoreURL: "http://127.0.0.1:9999",
+			LLM:     skill.LLMCallerConfig{Provider: "ollama", Model: "fixture", BaseURL: "http://127.0.0.1:9999"},
+			Generation: generation.WorkerConfig{
+				PollInterval: 500 * time.Millisecond, MaxPollInterval: 500 * time.Millisecond,
+			},
+		}
+		workerService := server.New(workerConfig, workerStore, emptyTraceQuerier{}, nil)
+		cancel, done = start(workerService)
+		Eventually(workerStore.queueStatsCalls.Load).Should(Equal(int32(1)))
+		Eventually(func() float64 {
+			return serverMetricGauge(workerService, generation.MetricGenerationWorkerReady)
+		}).Should(Equal(float64(1)))
+		Consistently(workerStore.queueStatsCalls.Load).WithTimeout(100*time.Millisecond).Should(Equal(int32(1)),
+			"the worker-owned queue monitor is the server's only sampler")
+		cancel()
+		Eventually(done).Should(Receive(Succeed()))
+		workerStore.Close()
 	})
 
 	It("shuts down when its context is canceled", func() {
