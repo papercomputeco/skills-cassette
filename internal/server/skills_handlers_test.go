@@ -847,6 +847,11 @@ var _ = Describe("unified skill revision HTTP contract", func() {
 				path:   "/api/skills/" + identity.ID + "/revisions?cursor=not-base64!",
 				status: http.StatusBadRequest, code: "invalid_request", message: "The revision cursor is invalid.",
 			},
+			{
+				name: "malformed generation cursor", method: http.MethodGet,
+				path:   "/api/skills/" + identity.ID + "/generations?cursor=not-base64!",
+				status: http.StatusBadRequest, code: "invalid_request", message: "The generation cursor is invalid.",
+			},
 		}
 		for _, testCase := range errorCases {
 			responseBody, responseStatus := doJSON(srv, testCase.method, testCase.path, testCase.body, owner)
@@ -1021,13 +1026,37 @@ var _ = Describe("unified skill revision HTTP contract", func() {
 		expectDSG46Error(conflict, status, http.StatusConflict,
 			"revision_sequence_conflict", "The revision could not be appended because its identity conflicts.")
 
-		Expect(coveredDSG46Codes).To(HaveLen(5),
+		By("reaching invalid_generation_state by canceling an already canceled generation")
+		generationID := uuid.NewString()
+		_, err = store.CreateGeneration(ctx, storage.CreateGenerationInput{
+			ID: generationID, SkillID: identity.ID, CreatorSubject: owner,
+			Snapshot: storage.SkillRevisionSnapshot{
+				Name: "Cancelable generation", Description: "Stable terminal-state fixture.", Type: "workflow",
+				Tags: []string{}, Content: "# queued", SourceSessionIDs: []string{},
+			},
+			AuthorContext: "exercise cancellation", SelectedSessionIDs: []string{},
+			EvaluatorProfile: "generation-candidate-v1", EvaluatorProfileVersion: "1",
+			EvaluationCriteria: json.RawMessage(`[{"id":"intent","kind":"content","description":"Match intent","weight":1}]`),
+			CreatedAt:          time.Now().UTC(),
+		})
+		Expect(err).NotTo(HaveOccurred())
+		canceled, cancelStatus := doJSON(srv, http.MethodPost,
+			"/api/skills/"+identity.ID+"/generations/"+generationID+"/cancellations", "", owner)
+		Expect(cancelStatus).To(Equal(http.StatusOK), "response: %#v", canceled)
+		Expect(canceled).To(HaveKeyWithValue("status", "canceled"))
+		terminal, terminalStatus := doJSON(srv, http.MethodPost,
+			"/api/skills/"+identity.ID+"/generations/"+generationID+"/cancellations", "", owner)
+		expectDSG46Error(terminal, terminalStatus, http.StatusConflict,
+			"invalid_generation_state", "The generation cannot be changed from its current state.")
+
+		Expect(coveredDSG46Codes).To(HaveLen(6),
 			"the stable-envelope specification must exercise every code required by DSG-46")
 		for _, code := range []string{
 			"revision_not_found",
 			"revision_private",
 			"revision_not_public",
 			"latest_revision_conflict",
+			"invalid_generation_state",
 			"revision_sequence_conflict",
 		} {
 			Expect(coveredDSG46Codes).To(HaveKey(code))

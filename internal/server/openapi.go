@@ -18,10 +18,13 @@ func openAPIDocument(name string) []byte {
 	prefix := "/api/" + name
 	paths := map[string]any{}
 	revisionPaths := revisionOpenAPIPaths(prefix, name)
-	// Creator identity is an authorization input, not public revision data.
-	// Keep it out of every reused revision schema.
+	// Creator identity is an authorization input, not public revision or
+	// generation-history data. Keep it out of every reused revision schema.
 	removeOpenAPIProperty(revisionPaths, "creatorSubject")
 	for path, item := range revisionPaths {
+		paths[path] = item
+	}
+	for path, item := range generationOpenAPIPaths(prefix, name) {
 		paths[path] = item
 	}
 	document := map[string]any{
