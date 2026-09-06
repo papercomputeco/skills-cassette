@@ -39,8 +39,8 @@ type distributionStore interface {
 	IncrementSkillDownloads(ctx context.Context, skillID string) error
 }
 
-// Server is the whole cassette: stable skill/revision storage behind the
-// identity, revision, metadata, and distribution capabilities.
+// Server is the whole cassette: stable skill/revision storage and durable
+// skill-anchored generation storage.
 type Server struct {
 	name                  string
 	distributions         distributionStore
@@ -48,6 +48,7 @@ type Server struct {
 	skillIdentityStore    storage.SkillIdentityStore
 	revisionStore         storage.RevisionStore
 	revisionMetadataStore storage.RevisionMetadataStore
+	generationStore       storage.GenerationStore
 	logger                *slog.Logger
 	openapi               []byte
 	// mu guards filters and pending: request handlers read the armed set
@@ -82,11 +83,13 @@ func New(cfg Config, store distributionStore, _ skill.Querier, logger *slog.Logg
 	skillIdentityStore, _ := store.(storage.SkillIdentityStore)
 	revisionStore, _ := store.(storage.RevisionStore)
 	revisionMetadataStore, _ := store.(storage.RevisionMetadataStore)
+	generationStore, _ := store.(storage.GenerationStore)
 	return &Server{
 		name: name, distributions: store,
 		skillReader: skillReader, skillIdentityStore: skillIdentityStore,
 		revisionStore: revisionStore, revisionMetadataStore: revisionMetadataStore,
-		logger: logger, openapi: openAPIDocument(name),
+		generationStore: generationStore, logger: logger,
+		openapi: openAPIDocument(name),
 		filters: armed, pending: pending, prober: prober,
 	}
 }
@@ -247,6 +250,18 @@ func (s *Server) Handler() http.Handler {
 	skillsMux.HandleFunc("PUT "+prefix+"/{skillId}/revisions/{revisionId}/visibility", s.handleSetRevisionVisibility)
 	skillsMux.HandleFunc("PUT "+prefix+"/{skillId}/latest", s.handleSetLatest)
 	skillsMux.HandleFunc("DELETE "+prefix+"/{skillId}/latest", s.handleClearLatest)
+	skillsMux.HandleFunc("GET "+prefix+"/{skillId}/generations", s.handleListGenerations)
+	skillsMux.HandleFunc("POST "+prefix+"/{skillId}/generations", s.handleCreateGeneration)
+	skillsMux.HandleFunc("GET "+prefix+"/{skillId}/generations/{generationId}", s.handleGetGeneration)
+	skillsMux.HandleFunc("POST "+prefix+"/{skillId}/generations/{generationId}/cancellations", s.handleCancelGeneration)
+
+	generationByIDMux := http.NewServeMux()
+	generationByIDMux.HandleFunc("GET "+prefix+"/generations/{generationId}", s.handleGetGenerationByID)
+
+	// Keep the reserved direct-ID collection out of skillsMux: its literal
+	// /generations/{generationId} shape otherwise overlaps the wildcard skill
+	// subtree when the skill ID is "generations".
+	mux.Handle(prefix+"/generations/", generationByIDMux)
 	mux.Handle(prefix, skillsMux)
 	mux.Handle(prefix+"/", skillsMux)
 	return mux

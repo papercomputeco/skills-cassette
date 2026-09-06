@@ -165,6 +165,44 @@ func (s *Server) writeLifecycleStorageError(w http.ResponseWriter, operation str
 	}
 }
 
+type generationFailureResponse struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+type generationSessionResponse struct {
+	SessionID      string                          `json:"sessionId"`
+	Ordinal        int                             `json:"ordinal"`
+	Status         storage.GenerationSessionStatus `json:"status"`
+	CandidateID    *string                         `json:"candidateId"`
+	DiagnosticCode *string                         `json:"diagnosticCode"`
+}
+
+type candidateEvaluationResponse struct {
+	ID                   string          `json:"id"`
+	CandidateID          string          `json:"candidateId"`
+	Profile              string          `json:"profile"`
+	ProfileVersion       string          `json:"profileVersion"`
+	EvaluatorVersion     string          `json:"evaluatorVersion"`
+	Score                *float64        `json:"score"`
+	Decision             string          `json:"decision"`
+	CriticalFindingCount int             `json:"criticalFindingCount"`
+	WarningFindingCount  int             `json:"warningFindingCount"`
+	CriterionResults     json.RawMessage `json:"criterionResults"`
+	Findings             json.RawMessage `json:"findings"`
+	Strengths            json.RawMessage `json:"strengths"`
+}
+
+type generationDiagnosticResponse struct {
+	SessionID   *string `json:"sessionId"`
+	CandidateID *string `json:"candidateId"`
+	Stage       string  `json:"stage"`
+	Code        string  `json:"code"`
+	Message     string  `json:"message"`
+	Retryable   bool    `json:"retryable"`
+	CreatedAt   string  `json:"createdAt"`
+}
+
 func validateSelectedSessionIDs(sessionIDs []string) ([]string, string) {
 	selected := make([]string, 0, len(sessionIDs))
 	seen := make(map[string]struct{}, len(sessionIDs))
@@ -260,14 +298,4 @@ func optionalTime(value *time.Time) *string {
 	}
 	formatted := value.UTC().Format(time.RFC3339Nano)
 	return &formatted
-}
-
-func boundedLifecycleText(value string, maxCodePoints int) string {
-	if !utf8.ValidString(value) {
-		value = strings.ToValidUTF8(value, "�")
-	}
-	if utf8.RuneCountInString(value) <= maxCodePoints {
-		return value
-	}
-	return string([]rune(value)[:maxCodePoints])
 }

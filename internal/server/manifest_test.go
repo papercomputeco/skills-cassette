@@ -126,13 +126,17 @@ var _ = Describe("unified revision manifest and route surface", func() {
 		Expect(json.Unmarshal(openAPIDocument(DefaultName), &document)).To(Succeed())
 
 		wantMethods := map[string][]string{
-			prefix:                                                  {"get", "post"},
-			prefix + "/{skillId}":                                   {"get"},
-			prefix + "/{skillId}/skill.md":                          {"get"},
-			prefix + "/{skillId}/revisions":                         {"get", "post"},
-			prefix + "/{skillId}/revisions/{revisionId}":            {"get"},
-			prefix + "/{skillId}/revisions/{revisionId}/visibility": {"put"},
-			prefix + "/{skillId}/latest":                            {"delete", "put"},
+			prefix:                                                         {"get", "post"},
+			prefix + "/{skillId}":                                          {"get"},
+			prefix + "/{skillId}/skill.md":                                 {"get"},
+			prefix + "/{skillId}/revisions":                                {"get", "post"},
+			prefix + "/{skillId}/revisions/{revisionId}":                   {"get"},
+			prefix + "/{skillId}/revisions/{revisionId}/visibility":        {"put"},
+			prefix + "/{skillId}/latest":                                   {"delete", "put"},
+			prefix + "/{skillId}/generations":                              {"get", "post"},
+			prefix + "/{skillId}/generations/{generationId}":               {"get"},
+			prefix + "/generations/{generationId}":                         {"get"},
+			prefix + "/{skillId}/generations/{generationId}/cancellations": {"post"},
 		}
 		gotMethods := make(map[string][]string, len(document.Paths))
 		operationIDs := make([]string, 0)
@@ -156,12 +160,14 @@ var _ = Describe("unified revision manifest and route surface", func() {
 			sort.Strings(gotMethods[path])
 		}
 		Expect(gotMethods).To(Equal(wantMethods),
-			"OpenAPI must contain exactly identity/effective, revision, visibility, latest, and markdown routes")
-		Expect(operationIDs).To(HaveLen(10))
+			"OpenAPI must contain exactly identity/effective, revision, visibility, latest, markdown, and generation routes")
+		Expect(operationIDs).To(HaveLen(15))
 		Expect(operationIDs).To(ConsistOf(
 			"listEffectiveSkills", "resolveSkillIdentity", "getEffectiveSkill", "getSkillMarkdown",
 			"listSkillRevisions", "appendSkillRevision", "getSkillRevision",
 			"setSkillRevisionVisibility", "setSkillLatestRevision", "clearSkillLatestRevision",
+			"listSkillGenerations", "createSkillGeneration", "getSkillGeneration",
+			"getSkillGenerationById", "cancelSkillGeneration",
 		))
 
 		for path := range document.Paths {
@@ -207,11 +213,23 @@ var _ = Describe("unified revision manifest and route surface", func() {
 		})
 		Expect(err).NotTo(HaveOccurred())
 		generationID := uuid.NewString()
+		_, err = store.CreateGeneration(context.Background(), storage.CreateGenerationInput{
+			ID: generationID, SkillID: skillRecord.ID, BaseRevisionID: revision.ID,
+			CreatorSubject: "route-owner",
+			Snapshot: storage.SkillRevisionSnapshot{
+				Name: "Route generation", Description: "route input", Type: "workflow",
+				Tags: []string{}, Content: "# generation", SourceSessionIDs: []string{},
+			},
+			EvaluatorProfile: "route-profile", EvaluatorProfileVersion: "1",
+			EvaluationCriteria: json.RawMessage(`[{"id":"route"}]`), CreatedAt: now.Add(3 * time.Second),
+		})
+		Expect(err).NotTo(HaveOccurred())
 		serverInstance := New(Config{}, store, nil, nil)
 		var handler http.Handler
 		Expect(func() { handler = serverInstance.Handler() }).NotTo(Panic(),
 			"constructing the complete live route tree must never panic")
 		appendBody := `{"snapshot":{"name":"Appended","description":"complete","type":"workflow","tags":[],"content":"# appended","isAiGenerated":false,"sourceSessionIds":[]},"idempotencyKey":"route-http-append"}`
+		generationBody := `{"baseRevisionId":null,"input":{"name":"Generated","description":"complete","type":"workflow","tags":[],"content":"# generated","isAiGenerated":true,"sourceSessionIds":[]},"authorContext":"route","selectedSessionIds":[]}`
 		present := []struct {
 			method string
 			path   string
@@ -228,6 +246,11 @@ var _ = Describe("unified revision manifest and route surface", func() {
 			{http.MethodPut, prefix + "/" + skillRecord.ID + "/revisions/" + revision.ID + "/visibility", `{"isPublic":true}`, http.StatusOK},
 			{http.MethodPut, prefix + "/" + skillRecord.ID + "/latest", fmt.Sprintf(`{"revisionId":%q}`, revision.ID), http.StatusOK},
 			{http.MethodDelete, prefix + "/" + skillRecord.ID + "/latest", "", http.StatusOK},
+			{http.MethodGet, prefix + "/" + skillRecord.ID + "/generations", "", http.StatusOK},
+			{http.MethodPost, prefix + "/" + skillRecord.ID + "/generations", generationBody, http.StatusAccepted},
+			{http.MethodGet, prefix + "/" + skillRecord.ID + "/generations/" + generationID, "", http.StatusOK},
+			{http.MethodGet, prefix + "/generations/" + generationID, "", http.StatusOK},
+			{http.MethodPost, prefix + "/" + skillRecord.ID + "/generations/" + generationID + "/cancellations", "", http.StatusOK},
 		}
 		for _, route := range present {
 			result := invokeHandler(handler, route.method, route.path, route.body, "route-owner")
@@ -454,6 +477,72 @@ var _ = Describe("unified revision manifest and route surface", func() {
 			HaveKeyWithValue("required", ConsistOf("revisionId")),
 		))
 
+		generationRequest := requestSchemaAt(prefix+"/{skillId}/generations", "post")
+		Expect(generationRequest).To(HaveKeyWithValue("additionalProperties", false))
+		generationProperties := propertiesOf(generationRequest)
+		Expect(generationProperties["baseRevisionId"]).To(
+			HaveKeyWithValue("type", ConsistOf("string", "null")))
+		Expect(generationProperties["authorContext"]).To(HaveKeyWithValue("maxLength", float64(32768)))
+		Expect(generationProperties["selectedSessionIds"]).To(And(
+			HaveKeyWithValue("maxItems", float64(100)),
+			HaveKeyWithValue("uniqueItems", true),
+			HaveKeyWithValue("items", HaveKeyWithValue("maxLength", float64(256))),
+		))
+		generationInputProperties := propertiesOf(generationProperties["input"].(map[string]any))
+		Expect(generationInputProperties["content"]).To(HaveKeyWithValue("maxLength", float64(1048576)))
+		Expect(generationInputProperties["tags"]).To(HaveKeyWithValue("maxItems", float64(64)))
+
+		generationResponse := responseSchemaAt(prefix+"/{skillId}/generations", "post", "202")
+		generationResponseProperties := propertiesOf(generationResponse)
+		candidateItems := generationResponseProperties["candidates"].(map[string]any)["items"].(map[string]any)
+		insights := propertiesOf(candidateItems)["insights"].(map[string]any)
+		Expect(insights).To(HaveKeyWithValue("maxItems", float64(storage.MaxGenerationCandidateInsights)))
+		Expect(insights).To(HaveKeyWithValue("x-max-json-bytes", float64(storage.MaxGenerationCandidateInsightsJSONBytes)))
+		insightItem := insights["items"].(map[string]any)
+		Expect(insightItem).To(And(
+			HaveKeyWithValue("additionalProperties", false),
+			HaveKeyWithValue("required", ConsistOf("kind", "summary", "evidence")),
+		))
+		for _, property := range propertiesOf(insightItem) {
+			Expect(property).To(HaveKeyWithValue("maxLength", float64(2048)))
+		}
+
+		evaluationItems := generationResponseProperties["evaluations"].(map[string]any)["items"].(map[string]any)
+		evaluationProperties := propertiesOf(evaluationItems)
+		criterionResults := evaluationProperties["criterionResults"].(map[string]any)
+		Expect(criterionResults).To(HaveKeyWithValue("maxItems", float64(100)))
+		criterionItem := criterionResults["items"].(map[string]any)
+		Expect(criterionItem).To(And(
+			HaveKeyWithValue("additionalProperties", false),
+			HaveKeyWithValue("required", ConsistOf("criterion_id", "weight", "passed", "rationale")),
+		))
+		Expect(propertiesOf(criterionItem)).To(And(
+			HaveKey("criterion_id"), HaveKey("weight"), HaveKey("passed"), HaveKey("rationale"),
+		))
+
+		findings := evaluationProperties["findings"].(map[string]any)
+		Expect(findings).To(HaveKeyWithValue("maxItems", float64(50)))
+		findingItem := findings["items"].(map[string]any)
+		Expect(findingItem).To(HaveKeyWithValue("additionalProperties", false))
+		Expect(propertiesOf(findingItem)).To(And(
+			HaveKey("rule_id"), HaveKey("severity"), HaveKey("message"), HaveKey("file"), HaveKey("line"),
+		))
+
+		strengths := evaluationProperties["strengths"].(map[string]any)
+		Expect(strengths).To(HaveKeyWithValue("maxItems", float64(50)))
+		Expect(strengths["items"]).To(HaveKeyWithValue("type", "string"))
+		Expect(evaluationProperties).NotTo(HaveKey("panel"),
+			"provider-specific evaluator panels are never part of private or public generation history")
+
+		diagnostics := generationResponseProperties["diagnostics"].(map[string]any)
+		Expect(diagnostics).To(HaveKeyWithValue("maxItems", float64(storage.MaxGenerationDiagnostics)))
+		diagnosticItem := diagnostics["items"].(map[string]any)
+		Expect(diagnosticItem["oneOf"]).To(HaveLen(len(storage.GenerationDiagnosticDefinitions())))
+		diagnosticProperties := propertiesOf(diagnosticItem)
+		Expect(diagnosticProperties["stage"]).To(HaveKey("enum"))
+		Expect(diagnosticProperties["code"]).To(HaveKey("enum"))
+		Expect(diagnosticProperties["message"]).To(HaveKey("enum"))
+
 		pageContracts := []struct {
 			path              string
 			arrayProperty     string
@@ -461,6 +550,7 @@ var _ = Describe("unified revision manifest and route surface", func() {
 		}{
 			{path: prefix, arrayProperty: "items", maximum: 100, fallback: 24},
 			{path: prefix + "/{skillId}/revisions", arrayProperty: "items", maximum: 100, fallback: 24},
+			{path: prefix + "/{skillId}/generations", arrayProperty: "generations", maximum: 100, fallback: 20},
 		}
 		for _, contract := range pageContracts {
 			limitSchema := querySchemaAt(contract.path, "get", "limit")

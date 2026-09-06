@@ -56,6 +56,11 @@ test: ## Runs tests through Dagger.
 	$(call print-target)
 	dagger call test
 
+.PHONY: test-skills-evaluator-contract
+test-skills-evaluator-contract: ## Runs the real skills-cassette to skills-evaluator HTTP contract.
+	$(call print-target)
+	./scripts/test-skills-evaluator-contract.sh
+
 .PHONY: help
 .DEFAULT_GOAL := help
 help: ## Prints this help message.
