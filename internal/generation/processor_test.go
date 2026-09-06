@@ -697,6 +697,31 @@ var _ = Describe("generation processor", func() {
 		Expect(outcome.result).NotTo(BeNil())
 	})
 
+	It("records canceled external stages as canceled rather than failed", func() {
+		store, claim := claimedGeneration([]string{"cancel-source"}, "cancel in-flight generation")
+		generator := &blockingCandidateGenerator{
+			entered: make(chan struct{}, 1), release: make(chan struct{}),
+		}
+		metrics := generation.NewMetrics()
+		processor := generation.NewProcessorWithConfig(store, &fakeTranscriptLoader{
+			transcripts: map[string]string{"cancel-source": "bounded"}, errors: map[string]error{},
+		}, generator, &fakeCandidateEvaluator{outcomes: map[string]evaluationOutcome{}},
+			generation.ProcessorConfig{CandidateConcurrency: 1}, metrics)
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() {
+			_, err := processor.Process(ctx, claim.ID, claim.ClaimToken)
+			done <- err
+		}()
+		Eventually(generator.entered).Should(Receive())
+		cancel()
+		Eventually(done).Should(Receive(MatchError(context.Canceled)))
+		text := metricText(metrics)
+		Expect(metricValue(text, generation.MetricGenerationStageTotal, map[string]string{
+			"stage": string(generation.GenerationStageCandidateGeneration), "outcome": "canceled", "reason": "canceled",
+		})).To(BeNumerically(">=", 1))
+	})
+
 	It("processor_continues_after_source_failures", func() {
 		selected := []string{"transcript-bad", "generation-bad", "evaluation-bad", "good"}
 		store, claim := claimedGeneration(selected, "retain healthy evidence")

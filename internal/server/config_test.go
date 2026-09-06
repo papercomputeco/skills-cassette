@@ -2,6 +2,7 @@ package server_test
 
 import (
 	"strings"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -54,6 +55,19 @@ var _ = Describe("config from env", func() {
 		GinkgoT().Setenv("CASSETTE_LLM_MODEL", "claude-haiku-4-5-20251001")
 		GinkgoT().Setenv("CASSETTE_LLM_API_KEY", "sk-test")
 		GinkgoT().Setenv("CASSETTE_LLM_BASE_URL", "https://proxy.internal")
+		GinkgoT().Setenv("CASSETTE_GENERATION_WORKER_CONCURRENCY", "7")
+		GinkgoT().Setenv("CASSETTE_GENERATION_MAX_SESSIONS", "6")
+		GinkgoT().Setenv("CASSETTE_GENERATION_CANDIDATE_CONCURRENCY", "9")
+		GinkgoT().Setenv("CASSETTE_GENERATION_POLL_INTERVAL_MS", "20")
+		GinkgoT().Setenv("CASSETTE_GENERATION_MAX_POLL_INTERVAL_MS", "90")
+		GinkgoT().Setenv("CASSETTE_GENERATION_LEASE_DURATION_MS", "2000")
+		GinkgoT().Setenv("CASSETTE_GENERATION_HEARTBEAT_INTERVAL_MS", "500")
+		GinkgoT().Setenv("CASSETTE_GENERATION_PROCESSING_TIMEOUT_MS", "3000")
+		GinkgoT().Setenv("CASSETTE_GENERATION_DRAIN_TIMEOUT_MS", "2000")
+		GinkgoT().Setenv("CASSETTE_GENERATION_RETRY_BACKOFF_MS", "30")
+		GinkgoT().Setenv("CASSETTE_GENERATION_MAX_RETRY_BACKOFF_MS", "80")
+		GinkgoT().Setenv("CASSETTE_GENERATION_MAX_ATTEMPTS", "4")
+		GinkgoT().Setenv("CASSETTE_GENERATION_MAX_TRANSCRIPT_BYTES", "65536")
 
 		cfg := server.ConfigFromEnv()
 		Expect(cfg.Name).To(Equal("skills-two"))
@@ -62,14 +76,65 @@ var _ = Describe("config from env", func() {
 		Expect(cfg.LLM.Model).To(Equal("claude-haiku-4-5-20251001"))
 		Expect(cfg.LLM.APIKey).To(Equal("sk-test"))
 		Expect(cfg.LLM.BaseURL).To(Equal("https://proxy.internal"))
+		Expect(cfg.Generation.WorkerConcurrency).To(Equal(7))
+		Expect(cfg.Generation.MaxSessions).To(Equal(6))
+		Expect(cfg.Generation.CandidateConcurrency).To(Equal(6), "candidate concurrency is capped by max sessions")
+		Expect(cfg.Generation.PollInterval).To(Equal(20 * time.Millisecond))
+		Expect(cfg.Generation.MaxPollInterval).To(Equal(90 * time.Millisecond))
+		Expect(cfg.Generation.LeaseDuration).To(Equal(2 * time.Second))
+		Expect(cfg.Generation.HeartbeatInterval).To(Equal(500 * time.Millisecond))
+		Expect(cfg.Generation.ProcessingTimeout).To(Equal(3 * time.Second))
+		Expect(cfg.Generation.DrainTimeout).To(Equal(2 * time.Second))
+		Expect(cfg.Generation.RetryBackoff).To(Equal(30 * time.Millisecond))
+		Expect(cfg.Generation.MaxRetryBackoff).To(Equal(80 * time.Millisecond))
+		Expect(cfg.Generation.MaxAttempts).To(Equal(4))
+		Expect(cfg.Generation.MaxTranscriptBytes).To(Equal(65536))
+		Expect(cfg.CandidateEvaluatorURL()).To(Equal("https://tapes.internal/v1/cassettes/skills-evaluator/candidate-evaluations"))
+	})
+
+	It("normalizes relational worker bounds after scalar parsing", func() {
+		GinkgoT().Setenv("CASSETTE_GENERATION_POLL_INTERVAL_MS", "60000")
+		GinkgoT().Setenv("CASSETTE_GENERATION_MAX_POLL_INTERVAL_MS", "10")
+		GinkgoT().Setenv("CASSETTE_GENERATION_LEASE_DURATION_MS", "1000")
+		GinkgoT().Setenv("CASSETTE_GENERATION_HEARTBEAT_INTERVAL_MS", "600000")
+		GinkgoT().Setenv("CASSETTE_GENERATION_RETRY_BACKOFF_MS", "300000")
+		GinkgoT().Setenv("CASSETTE_GENERATION_MAX_RETRY_BACKOFF_MS", "10")
+
+		cfg := server.ConfigFromEnv()
+		Expect(cfg.Generation.MaxPollInterval).To(Equal(cfg.Generation.PollInterval))
+		Expect(cfg.Generation.HeartbeatInterval).To(Equal(500 * time.Millisecond))
+		Expect(cfg.Generation.MaxRetryBackoff).To(Equal(cfg.Generation.RetryBackoff))
 	})
 
 	It("defaults the name when the environment is empty", func() {
-		for _, key := range []string{"CASSETTE_NAME", "CASSETTE_CORE_URL"} {
+		for _, key := range []string{
+			"CASSETTE_NAME", "CASSETTE_CORE_URL",
+			"CASSETTE_GENERATION_WORKER_CONCURRENCY", "CASSETTE_GENERATION_MAX_SESSIONS",
+			"CASSETTE_GENERATION_CANDIDATE_CONCURRENCY", "CASSETTE_GENERATION_POLL_INTERVAL_MS",
+			"CASSETTE_GENERATION_MAX_POLL_INTERVAL_MS", "CASSETTE_GENERATION_LEASE_DURATION_MS",
+			"CASSETTE_GENERATION_HEARTBEAT_INTERVAL_MS", "CASSETTE_GENERATION_PROCESSING_TIMEOUT_MS",
+			"CASSETTE_GENERATION_DRAIN_TIMEOUT_MS", "CASSETTE_GENERATION_RETRY_BACKOFF_MS",
+			"CASSETTE_GENERATION_MAX_RETRY_BACKOFF_MS", "CASSETTE_GENERATION_MAX_ATTEMPTS",
+			"CASSETTE_GENERATION_MAX_TRANSCRIPT_BYTES",
+		} {
 			GinkgoT().Setenv(key, "")
 		}
 		cfg := server.ConfigFromEnv()
 		Expect(cfg.Name).To(Equal(server.DefaultName))
+		Expect(cfg.CandidateEvaluatorURL()).To(BeEmpty())
+		Expect(cfg.Generation.WorkerConcurrency).To(Equal(2))
+		Expect(cfg.Generation.MaxSessions).To(Equal(8))
+		Expect(cfg.Generation.CandidateConcurrency).To(Equal(2))
+		Expect(cfg.Generation.PollInterval).To(Equal(250 * time.Millisecond))
+		Expect(cfg.Generation.MaxPollInterval).To(Equal(5 * time.Second))
+		Expect(cfg.Generation.LeaseDuration).To(Equal(2 * time.Minute))
+		Expect(cfg.Generation.HeartbeatInterval).To(Equal(30 * time.Second))
+		Expect(cfg.Generation.ProcessingTimeout).To(Equal(5 * time.Minute))
+		Expect(cfg.Generation.DrainTimeout).To(Equal(10 * time.Second))
+		Expect(cfg.Generation.RetryBackoff).To(Equal(time.Second))
+		Expect(cfg.Generation.MaxRetryBackoff).To(Equal(30 * time.Second))
+		Expect(cfg.Generation.MaxAttempts).To(Equal(3))
+		Expect(cfg.Generation.MaxTranscriptBytes).To(Equal(1 << 20))
 	})
 })
 
