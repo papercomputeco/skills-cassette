@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -804,6 +805,208 @@ var _ = Describe("Postgres durable revision identities", func() {
 		Expect(nextSequence).To(Equal(10))
 	})
 
+	It("postgres_latest_requires_public_same_skill", func() {
+		target, err := store.ResolveSkill(ctx, ResolveSkillInput{
+			ID: uuid.NewString(), Slug: "latest-target", CreatorSubject: "creator-a", CreatedAt: now,
+		})
+		Expect(err).NotTo(HaveOccurred())
+		targetPrivate, err := store.AppendRevision(ctx, AppendRevisionInput{
+			ID: uuid.NewString(), SkillID: target.ID, CreatorSubject: "creator-a", Origin: RevisionOriginManual,
+			Snapshot:  SkillRevisionSnapshot{Name: "Target private", Type: "workflow", Content: "# Target private"},
+			CreatedAt: now.Add(time.Minute),
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		latest, err := store.SetExplicitLatestRevision(ctx, SetExplicitLatestRevisionInput{
+			SkillID: target.ID, RevisionID: targetPrivate.ID, CallerSubject: "creator-a",
+			ChangedAt: now.Add(2 * time.Minute),
+		})
+		Expect(latest).To(BeNil())
+		Expect(errors.Is(err, ErrRevisionNotPublic)).To(BeTrue())
+		latest, err = store.SetExplicitLatestRevision(ctx, SetExplicitLatestRevisionInput{
+			SkillID: target.ID, RevisionID: targetPrivate.ID, CallerSubject: "creator-b",
+			ChangedAt: now.Add(3 * time.Minute),
+		})
+		Expect(latest).To(BeNil())
+		Expect(errors.Is(err, ErrRevisionNotFound)).To(BeTrue(), "another creator must not learn that the private UUID exists")
+
+		foreign, err := store.ResolveSkill(ctx, ResolveSkillInput{
+			ID: uuid.NewString(), Slug: "latest-foreign", CreatorSubject: "creator-b", CreatedAt: now,
+		})
+		Expect(err).NotTo(HaveOccurred())
+		foreignPublic, err := store.AppendRevision(ctx, AppendRevisionInput{
+			ID: uuid.NewString(), SkillID: foreign.ID, CreatorSubject: "creator-b", Origin: RevisionOriginManual,
+			Snapshot:  SkillRevisionSnapshot{Name: "Foreign public", Type: "workflow", Content: "# Foreign"},
+			CreatedAt: now.Add(4 * time.Minute),
+		})
+		Expect(err).NotTo(HaveOccurred())
+		_, err = store.SetRevisionVisibility(ctx, SetRevisionVisibilityInput{
+			SkillID: foreign.ID, RevisionID: foreignPublic.ID, CallerSubject: "creator-b",
+			IsPublic: true, ChangedAt: now.Add(5 * time.Minute),
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		latest, err = store.SetExplicitLatestRevision(ctx, SetExplicitLatestRevisionInput{
+			SkillID: target.ID, RevisionID: foreignPublic.ID, CallerSubject: "creator-c",
+			ChangedAt: now.Add(6 * time.Minute),
+		})
+		Expect(latest).To(BeNil())
+		Expect(errors.Is(err, ErrRevisionNotFound)).To(BeTrue(), "a public revision from another skill cannot become target latest")
+
+		var explicitLatest string
+		Expect(store.pool.QueryRow(ctx, fmt.Sprintf(`SELECT COALESCE(explicit_latest_revision_id::text, '') FROM %s.skills WHERE id = $1`, quoteIdentifier(schema)), target.ID).Scan(&explicitLatest)).To(Succeed())
+		Expect(explicitLatest).To(BeEmpty(), "every rejected mutation must roll back without moving the pointer")
+
+		_, err = store.SetRevisionVisibility(ctx, SetRevisionVisibilityInput{
+			SkillID: target.ID, RevisionID: targetPrivate.ID, CallerSubject: "creator-a",
+			IsPublic: true, ChangedAt: now.Add(7 * time.Minute),
+		})
+		Expect(err).NotTo(HaveOccurred())
+		latest, err = store.SetExplicitLatestRevision(ctx, SetExplicitLatestRevisionInput{
+			SkillID: target.ID, RevisionID: targetPrivate.ID, CallerSubject: "creator-c",
+			ChangedAt: now.Add(8 * time.Minute),
+		})
+		Expect(err).NotTo(HaveOccurred(), "any tenant member may select an accessible public revision")
+		Expect(latest.ExplicitLatestRevisionID).To(Equal(targetPrivate.ID))
+
+		latest, err = store.SetExplicitLatestRevision(ctx, SetExplicitLatestRevisionInput{
+			SkillID: target.ID, RevisionID: foreignPublic.ID, CallerSubject: "creator-c",
+			ChangedAt: now.Add(9 * time.Minute),
+		})
+		Expect(latest).To(BeNil())
+		Expect(errors.Is(err, ErrRevisionNotFound)).To(BeTrue())
+		Expect(store.pool.QueryRow(ctx, fmt.Sprintf(`SELECT COALESCE(explicit_latest_revision_id::text, '') FROM %s.skills WHERE id = $1`, quoteIdentifier(schema)), target.ID).Scan(&explicitLatest)).To(Succeed())
+		Expect(explicitLatest).To(Equal(targetPrivate.ID), "a cross-skill failure must preserve the prior valid pointer")
+	})
+
+	It("postgres_latest_revision_cannot_be_made_private", func() {
+		skill, err := store.ResolveSkill(ctx, ResolveSkillInput{
+			ID: uuid.NewString(), Slug: "latest-privacy-forced-race",
+			CreatorSubject: "creator-a", CreatedAt: now,
+		})
+		Expect(err).NotTo(HaveOccurred())
+		revision, err := store.AppendRevision(ctx, AppendRevisionInput{
+			ID: uuid.NewString(), SkillID: skill.ID, CreatorSubject: "creator-a", Origin: RevisionOriginManual,
+			Snapshot: SkillRevisionSnapshot{
+				Name: "Forced race", Type: "workflow", Content: "# Forced race",
+			},
+			CreatedAt: now.Add(time.Minute),
+		})
+		Expect(err).NotTo(HaveOccurred())
+		_, err = store.SetRevisionVisibility(ctx, SetRevisionVisibilityInput{
+			SkillID: skill.ID, RevisionID: revision.ID, CallerSubject: "creator-a",
+			IsPublic: true, ChangedAt: now.Add(2 * time.Minute),
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		// Hold a session advisory lock and make the final skills-row mutation
+		// request its transaction-scoped counterpart from a test-only trigger.
+		// Reaching this trigger means latest has selected/validated its public
+		// target but cannot write or commit yet. This creates the dangerous
+		// interleaving deterministically, without a production synchronization
+		// hook or relying on which simultaneously-started goroutine gets lucky.
+		const barrierClassID int32 = 190073
+		var barrierObjectID int32
+		Expect(store.pool.QueryRow(ctx, `SELECT hashtext($1) & 2147483647`, schema).Scan(&barrierObjectID)).To(Succeed())
+
+		barrierConnection, err := store.pool.Acquire(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		barrierHeld := false
+		DeferCleanup(func() {
+			if barrierHeld {
+				var unlocked bool
+				_ = barrierConnection.QueryRow(context.Background(), `SELECT pg_advisory_unlock($1, $2)`, barrierClassID, barrierObjectID).Scan(&unlocked)
+			}
+			barrierConnection.Release()
+		})
+		Expect(barrierConnection.QueryRow(ctx, `SELECT pg_try_advisory_lock($1, $2)`, barrierClassID, barrierObjectID).Scan(&barrierHeld)).To(Succeed())
+		Expect(barrierHeld).To(BeTrue())
+
+		barrierFunction := quoteIdentifier(schema) + ".pause_latest_mutation_for_test"
+		_, err = store.pool.Exec(ctx, fmt.Sprintf(`CREATE FUNCTION %s()
+			RETURNS trigger LANGUAGE plpgsql AS $barrier$
+			BEGIN
+				PERFORM pg_advisory_xact_lock(%d, %d);
+				RETURN NEW;
+			END
+			$barrier$`, barrierFunction, barrierClassID, barrierObjectID))
+		Expect(err).NotTo(HaveOccurred())
+		_, err = store.pool.Exec(ctx, fmt.Sprintf(`CREATE TRIGGER pause_latest_mutation_for_test
+			BEFORE UPDATE OF explicit_latest_revision_id ON %s.skills
+			FOR EACH ROW EXECUTE FUNCTION %s()`, quoteIdentifier(schema), barrierFunction))
+		Expect(err).NotTo(HaveOccurred())
+
+		results := make(chan revisionMetadataRaceResult, 2)
+		go func() {
+			_, mutationErr := setExplicitLatestForRace(ctx, store, SetExplicitLatestRevisionInput{
+				SkillID: skill.ID, RevisionID: revision.ID, CallerSubject: "creator-a",
+				ChangedAt: now.Add(3 * time.Minute),
+			})
+			results <- revisionMetadataRaceResult{operation: "latest", err: mutationErr}
+		}()
+
+		var latestBackendPID int32
+		Eventually(func() int32 {
+			_ = store.pool.QueryRow(ctx, `SELECT pid
+				FROM pg_locks
+				WHERE locktype = 'advisory'
+				  AND classid::bigint = $1
+				  AND objid::bigint = $2
+				  AND NOT granted
+				LIMIT 1`, barrierClassID, barrierObjectID).Scan(&latestBackendPID)
+			return latestBackendPID
+		}).WithTimeout(5*time.Second).WithPolling(10*time.Millisecond).ShouldNot(BeZero(), "latest must reach the post-validation test barrier")
+
+		go func() {
+			_, mutationErr := setRevisionVisibilityForRace(ctx, store, SetRevisionVisibilityInput{
+				SkillID: skill.ID, RevisionID: revision.ID, CallerSubject: "creator-a",
+				IsPublic: false, ChangedAt: now.Add(4 * time.Minute),
+			})
+			results <- revisionMetadataRaceResult{operation: "private", err: mutationErr}
+		}()
+
+		Eventually(func() bool {
+			var privateIsBlockedByLatest bool
+			scanErr := store.pool.QueryRow(ctx, `SELECT EXISTS (
+				SELECT 1
+				FROM pg_stat_activity activity
+				WHERE activity.pid <> $1
+				  AND $1 = ANY(pg_blocking_pids(activity.pid))
+			)`, latestBackendPID).Scan(&privateIsBlockedByLatest)
+			return scanErr == nil && privateIsBlockedByLatest
+		}).WithTimeout(5*time.Second).WithPolling(10*time.Millisecond).Should(BeTrue(), "the private mutation must enter Postgres while latest is paused and wait on its transaction")
+
+		var unlocked bool
+		Expect(barrierConnection.QueryRow(ctx, `SELECT pg_advisory_unlock($1, $2)`, barrierClassID, barrierObjectID).Scan(&unlocked)).To(Succeed())
+		Expect(unlocked).To(BeTrue())
+		barrierHeld = false
+
+		outcomes := map[string]error{}
+		for range 2 {
+			var result revisionMetadataRaceResult
+			Eventually(results).WithTimeout(5 * time.Second).Should(Receive(&result))
+			outcomes[result.operation] = result.err
+		}
+		Expect(outcomes).To(HaveKey("latest"))
+		Expect(outcomes).To(HaveKey("private"))
+		Expect(outcomes["latest"]).NotTo(HaveOccurred())
+		Expect(errors.Is(outcomes["private"], ErrRevisionIsExplicitLatest)).To(BeTrue(), "the waiter must re-check latest after the winning transaction commits")
+
+		var (
+			explicitLatest string
+			isPublic       bool
+		)
+		Expect(store.pool.QueryRow(ctx, fmt.Sprintf(`
+			SELECT COALESCE(skill.explicit_latest_revision_id::text, ''), visibility.is_public
+			FROM %s.skills skill
+			JOIN %s.skill_revisions revision ON revision.skill_id = skill.id
+			JOIN %s.skill_revision_visibility visibility ON visibility.revision_id = revision.id
+			WHERE skill.id = $1 AND revision.id = $2`,
+			quoteIdentifier(schema), quoteIdentifier(schema), quoteIdentifier(schema)),
+			skill.ID, revision.ID).Scan(&explicitLatest, &isPublic)).To(Succeed())
+		Expect(explicitLatest).To(Equal(revision.ID))
+		Expect(isPublic).To(BeTrue())
+	})
 })
 
 // TestPostgresExternalAttachmentFilter pins the storage half of the
@@ -896,6 +1099,91 @@ var _ = Describe("Postgres durable generations", func() {
 		Expect(state.Candidates).To(BeEmpty())
 		Expect(state.Evaluations).To(BeEmpty())
 		Expect(state.Diagnostics).To(BeEmpty())
+	})
+
+	It("holds public generation authorization through artifact loading", func() {
+		creator := "authorization-owner"
+		observer := "authorization-observer"
+		skill, err := store.ResolveSkill(ctx, ResolveSkillInput{
+			ID: uuid.NewString(), Slug: "atomic-public-generation-read",
+			CreatorSubject: creator, CreatedAt: now,
+		})
+		Expect(err).NotTo(HaveOccurred())
+		generation, err := store.CreateGeneration(ctx, CreateGenerationInput{
+			ID: uuid.NewString(), SkillID: skill.ID, CreatorSubject: creator,
+			Snapshot:      SkillRevisionSnapshot{Name: "Atomic read", Type: "workflow", Content: "# Atomic read"},
+			AuthorContext: "Keep authorization atomic.", EvaluatorProfile: "generation-candidate-v1",
+			EvaluatorProfileVersion: "1",
+			EvaluationCriteria:      json.RawMessage(`[{"id":"atomic","kind":"content","description":"Atomic.","weight":1}]`),
+			CreatedAt:               now,
+		})
+		Expect(err).NotTo(HaveOccurred())
+		claim, err := store.ClaimGeneration(ctx, ClaimGenerationInput{WorkerID: "authorization-worker", LeaseDuration: time.Minute})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(claim.ID).To(Equal(generation.ID))
+		Expect(store.UpdateGenerationStatus(ctx, generation.ID, claim.ClaimToken,
+			GenerationStatusQueued, GenerationStatusGeneratingCandidates)).To(Succeed())
+		candidate, err := store.PutGenerationCandidate(ctx, generation.ID, claim.ClaimToken, GenerationCandidateRecord{
+			ID: uuid.NewString(), Ordinal: 0, Kind: GenerationCandidateContext,
+			Snapshot: GenerationCandidateSnapshot{Name: "Atomic candidate", Type: "workflow", Content: "# Atomic candidate"},
+			Insights: json.RawMessage(`[]`), BundleSHA256: "atomic-candidate",
+		})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(store.UpdateGenerationStatus(ctx, generation.ID, claim.ClaimToken,
+			GenerationStatusGeneratingCandidates, GenerationStatusEvaluatingCandidates)).To(Succeed())
+		score := 0.9
+		evaluation, err := store.PutCandidateEvaluation(ctx, generation.ID, claim.ClaimToken, CandidateEvaluationRecord{
+			ID: uuid.NewString(), CandidateID: candidate.ID, RequestSHA256: "atomic-evaluation",
+			Profile: generation.EvaluatorProfile, ProfileVersion: generation.EvaluatorProfileVersion,
+			EvaluatorVersion: "test", Score: &score, Decision: "pass",
+			CriterionResults: json.RawMessage(`[]`), Findings: json.RawMessage(`[]`), Strengths: json.RawMessage(`[]`),
+		})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(store.UpdateGenerationStatus(ctx, generation.ID, claim.ClaimToken,
+			GenerationStatusEvaluatingCandidates, GenerationStatusSynthesizing)).To(Succeed())
+		result, err := store.AppendPrivateGenerationResult(ctx, AppendPrivateGenerationResultInput{
+			GenerationID: generation.ID, ClaimToken: claim.ClaimToken,
+			InitialWinnerCandidateID: candidate.ID, ResultCandidateID: candidate.ID,
+		})
+		Expect(err).NotTo(HaveOccurred())
+		_, err = store.SetRevisionVisibility(ctx, SetRevisionVisibilityInput{
+			SkillID: skill.ID, RevisionID: result.ID, CallerSubject: creator, IsPublic: true, ChangedAt: now,
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		readTx, err := store.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { _ = readTx.Rollback(context.Background()) })
+		authorized, err := store.authorizeGenerationRead(ctx, readTx, observer, skill.ID, generation.ID)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(authorized).NotTo(BeNil())
+		type visibilityResult struct {
+			record *RevisionVisibilityRecord
+			err    error
+		}
+		visibilityDone := make(chan visibilityResult, 1)
+		go func() {
+			record, setErr := store.SetRevisionVisibility(context.Background(), SetRevisionVisibilityInput{
+				SkillID: skill.ID, RevisionID: result.ID, CallerSubject: creator,
+				IsPublic: false, ChangedAt: now.Add(time.Second),
+			})
+			visibilityDone <- visibilityResult{record: record, err: setErr}
+		}()
+		Consistently(visibilityDone).WithTimeout(100*time.Millisecond).ShouldNot(Receive(),
+			"public-to-private mutation must wait while the authorized artifact snapshot is open")
+		state, err := store.loadGenerationState(ctx, readTx, *authorized)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(state.Candidates).To(ConsistOf(*candidate))
+		Expect(state.Evaluations).To(ConsistOf(*evaluation))
+		Expect(readTx.Commit(ctx)).To(Succeed())
+		var visibility visibilityResult
+		Eventually(visibilityDone).WithTimeout(5 * time.Second).Should(Receive(&visibility))
+		Expect(visibility.err).NotTo(HaveOccurred())
+		Expect(visibility.record.Changed).To(BeTrue())
+		Expect(visibility.record.PreviousIsPublic).To(BeTrue())
+		hidden, err := store.GetSkillGeneration(ctx, observer, skill.ID, generation.ID)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(hidden).To(BeNil())
 	})
 
 	It("postgres_allows_concurrent_generations_per_skill", func() {
@@ -1007,6 +1295,472 @@ var _ = Describe("Postgres durable generations", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(next.SequenceNumber).To(Equal(2), "generation creation must not reserve a result revision sequence")
 		Expect(next.Version).To(Equal("2"))
+	})
+
+	It("finalize_generation_appends_one_private_revision", func() {
+		creator := "creator-finalize"
+		skill, err := store.ResolveSkill(ctx, ResolveSkillInput{
+			ID: uuid.NewString(), Slug: "finalize-private-revision",
+			CreatorSubject: creator, CreatedAt: now,
+		})
+		Expect(err).NotTo(HaveOccurred())
+		base, err := store.AppendRevision(ctx, AppendRevisionInput{
+			ID: uuid.NewString(), SkillID: skill.ID, CreatorSubject: "base-owner",
+			Origin: RevisionOriginManual,
+			Snapshot: SkillRevisionSnapshot{
+				Name: "Finalization base", Description: "Stable public base.", Type: "workflow",
+				Tags: []string{"base"}, Content: "# Base", SourceSessionIDs: []string{"base-source"},
+			},
+			CreatedAt: now,
+		})
+		Expect(err).NotTo(HaveOccurred())
+		_, err = store.SetRevisionVisibility(ctx, SetRevisionVisibilityInput{
+			SkillID: skill.ID, RevisionID: base.ID, CallerSubject: "base-owner",
+			IsPublic: true, ChangedAt: now,
+		})
+		Expect(err).NotTo(HaveOccurred())
+		_, err = store.SetExplicitLatestRevision(ctx, SetExplicitLatestRevisionInput{
+			SkillID: skill.ID, RevisionID: base.ID, CallerSubject: creator, ChangedAt: now,
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		type finalizationFixture struct {
+			generation       *SkillGenerationRecord
+			claim            *SkillGenerationRecord
+			initialCandidate *GenerationCandidateRecord
+			resultCandidate  *GenerationCandidateRecord
+		}
+		fixtureOrdinal := 0
+		createFinalizationFixture := func(name string, evaluateInitial, separateResult, evaluateResult bool) finalizationFixture {
+			fixtureOrdinal++
+			selectedSessionIDs := []string{"session-" + name}
+			if separateResult {
+				selectedSessionIDs = append(selectedSessionIDs, "supporting-"+name)
+			}
+			generation, createErr := store.CreateGeneration(ctx, CreateGenerationInput{
+				ID: uuid.NewString(), SkillID: skill.ID, BaseRevisionID: base.ID,
+				CreatorSubject: creator,
+				Snapshot: SkillRevisionSnapshot{
+					Name: "Seed " + name, Description: "Complete immutable generation seed.", Type: "workflow",
+					Tags: []string{"seed"}, Content: "# Seed " + name,
+				},
+				AuthorContext: "Choose one evaluated result.", SelectedSessionIDs: selectedSessionIDs,
+				EvaluatorProfile: "generation-candidate-v1", EvaluatorProfileVersion: "1",
+				EvaluationCriteria: json.RawMessage(`[{
+					"id":"complete","kind":"structure","description":"Complete result.","weight":1
+				}]`),
+				CreatedAt: now.Add(-time.Duration(10-fixtureOrdinal) * time.Minute),
+			})
+			Expect(createErr).NotTo(HaveOccurred())
+			claim, claimErr := store.ClaimGeneration(ctx, ClaimGenerationInput{
+				WorkerID: "worker-" + name, LeaseDuration: time.Minute,
+			})
+			Expect(claimErr).NotTo(HaveOccurred())
+			Expect(claim).NotTo(BeNil())
+			Expect(claim.ID).To(Equal(generation.ID))
+			Expect(store.UpdateGenerationStatus(ctx, generation.ID, claim.ClaimToken,
+				GenerationStatusQueued, GenerationStatusGeneratingCandidates)).To(Succeed())
+
+			initial, putErr := store.PutGenerationCandidate(ctx, generation.ID, claim.ClaimToken, GenerationCandidateRecord{
+				ID: uuid.NewString(), Ordinal: 0, Kind: GenerationCandidateSession,
+				SourceSessionIDs: []string{"session-" + name},
+				Snapshot: GenerationCandidateSnapshot{
+					Name: "Initial " + name, Description: "Evaluated deterministic winner.", Type: "workflow",
+					Tags: []string{"initial"}, Content: "# Initial " + name, IsAIGenerated: true,
+				},
+				Insights:     json.RawMessage(`[{"kind":"evidence","summary":"Initial evidence.","evidence":"Persisted source."}]`),
+				BundleSHA256: "bundle-initial-" + name,
+			})
+			Expect(putErr).NotTo(HaveOccurred())
+			Expect(store.UpdateGenerationStatus(ctx, generation.ID, claim.ClaimToken,
+				GenerationStatusGeneratingCandidates, GenerationStatusEvaluatingCandidates)).To(Succeed())
+
+			putEvaluation := func(candidate *GenerationCandidateRecord, score float64) {
+				_, evaluationErr := store.PutCandidateEvaluation(ctx, generation.ID, claim.ClaimToken, CandidateEvaluationRecord{
+					ID: uuid.NewString(), CandidateID: candidate.ID,
+					RequestSHA256: "request-" + candidate.ID, Profile: "generation-candidate-v1",
+					ProfileVersion: "1", EvaluatorVersion: "test", Score: &score, Decision: "pass",
+					CriterionResults: json.RawMessage(`[{"criterion_id":"complete","weight":1,"passed":true,"rationale":"Complete result."}]`),
+					Findings:         json.RawMessage(`[]`), Strengths: json.RawMessage(`["complete"]`),
+					Panel: json.RawMessage(`{"judgeCount":1}`),
+				})
+				Expect(evaluationErr).NotTo(HaveOccurred())
+			}
+			if evaluateInitial {
+				putEvaluation(initial, 0.9)
+				Expect(store.UpdateGenerationSession(ctx, generation.ID, claim.ClaimToken, GenerationSessionRecord{
+					SessionID: "session-" + name, Status: GenerationSessionEvaluated, CandidateID: initial.ID,
+				})).To(Succeed())
+			}
+
+			result := initial
+			if separateResult {
+				result, putErr = store.PutGenerationCandidate(ctx, generation.ID, claim.ClaimToken, GenerationCandidateRecord{
+					ID: uuid.NewString(), Ordinal: 1, Kind: GenerationCandidateSynthesis,
+					SourceSessionIDs: []string{"session-" + name, "supporting-" + name},
+					Snapshot: GenerationCandidateSnapshot{
+						Name: "Synthesis " + name, Description: "Higher-ranked evaluated result.", Type: "workflow",
+						Tags: []string{"synthesis", name}, Content: "# Synthesis " + name, IsAIGenerated: true,
+					},
+					Insights:     json.RawMessage(`[{"kind":"synthesis","summary":"Bounded synthesis.","evidence":"Structured feedback."}]`),
+					BundleSHA256: "bundle-synthesis-" + name,
+				})
+				Expect(putErr).NotTo(HaveOccurred())
+				if evaluateResult {
+					putEvaluation(result, 0.95)
+				}
+			}
+			Expect(store.UpdateGenerationStatus(ctx, generation.ID, claim.ClaimToken,
+				GenerationStatusEvaluatingCandidates, GenerationStatusSynthesizing)).To(Succeed())
+			return finalizationFixture{
+				generation: generation, claim: claim, initialCandidate: initial, resultCandidate: result,
+			}
+		}
+
+		expectNoResultRevision := func(generationID string, expectedNextSequence int) {
+			var generationRevisionCount int
+			Expect(store.pool.QueryRow(ctx, fmt.Sprintf(`SELECT count(*) FROM %s.skill_revisions
+				WHERE generation_id = $1`, quoteIdentifier(schema)), generationID).
+				Scan(&generationRevisionCount)).To(Succeed())
+			Expect(generationRevisionCount).To(BeZero())
+			var nextSequence int
+			Expect(store.pool.QueryRow(ctx, fmt.Sprintf(`SELECT next_sequence_number FROM %s.skills
+				WHERE id = $1`, quoteIdentifier(schema)), skill.ID).Scan(&nextSequence)).To(Succeed())
+			Expect(nextSequence).To(Equal(expectedNextSequence), "a rejected finalization must not consume a revision sequence")
+		}
+
+		By("rejecting unknown candidate identity without appending")
+		invalid := createFinalizationFixture("invalid", true, false, false)
+		invalidResult, err := store.AppendPrivateGenerationResult(ctx, AppendPrivateGenerationResultInput{
+			GenerationID: invalid.generation.ID, ClaimToken: invalid.claim.ClaimToken,
+			InitialWinnerCandidateID: uuid.NewString(), ResultCandidateID: invalid.resultCandidate.ID,
+		})
+		Expect(invalidResult).To(BeNil())
+		Expect(err).To(HaveOccurred())
+		expectNoResultRevision(invalid.generation.ID, 2)
+
+		By("rejecting an unevaluated result without appending")
+		unevaluated := createFinalizationFixture("unevaluated", false, false, false)
+		unevaluatedResult, err := store.AppendPrivateGenerationResult(ctx, AppendPrivateGenerationResultInput{
+			GenerationID: unevaluated.generation.ID, ClaimToken: unevaluated.claim.ClaimToken,
+			InitialWinnerCandidateID: unevaluated.initialCandidate.ID,
+			ResultCandidateID:        unevaluated.resultCandidate.ID,
+		})
+		Expect(unevaluatedResult).To(BeNil())
+		Expect(err).To(HaveOccurred())
+		expectNoResultRevision(unevaluated.generation.ID, 2)
+
+		By("rejecting candidate identity from another generation without appending")
+		crossTarget := createFinalizationFixture("cross-target", true, false, false)
+		crossSource := createFinalizationFixture("cross-source", true, false, false)
+		crossResult, err := store.AppendPrivateGenerationResult(ctx, AppendPrivateGenerationResultInput{
+			GenerationID: crossTarget.generation.ID, ClaimToken: crossTarget.claim.ClaimToken,
+			InitialWinnerCandidateID: crossTarget.initialCandidate.ID,
+			ResultCandidateID:        crossSource.resultCandidate.ID,
+		})
+		Expect(crossResult).To(BeNil())
+		Expect(err).To(HaveOccurred())
+		expectNoResultRevision(crossTarget.generation.ID, 2)
+		expectNoResultRevision(crossSource.generation.ID, 2)
+
+		By("rejecting evaluator identities that differ from the generation snapshot")
+		profilePut := createFinalizationFixture("profile-put", false, false, false)
+		profileScore := 1.0
+		mismatchedEvaluation, err := store.PutCandidateEvaluation(ctx, profilePut.generation.ID,
+			profilePut.claim.ClaimToken, CandidateEvaluationRecord{
+				ID: uuid.NewString(), CandidateID: profilePut.initialCandidate.ID,
+				RequestSHA256: "mismatched-profile-put", Profile: "other-profile",
+				ProfileVersion: "1", EvaluatorVersion: "test", Score: &profileScore, Decision: "pass",
+				CriterionResults: json.RawMessage(`[]`), Findings: json.RawMessage(`[]`),
+				Strengths: json.RawMessage(`[]`), Panel: json.RawMessage(`{}`),
+			})
+		Expect(mismatchedEvaluation).To(BeNil())
+		Expect(err).To(MatchError(ErrInvalidGenerationState))
+		expectNoResultRevision(profilePut.generation.ID, 2)
+
+		profileFinalization := createFinalizationFixture("profile-finalization", true, false, false)
+		_, err = store.pool.Exec(ctx, fmt.Sprintf(`UPDATE %s.candidate_evaluations
+			SET profile_version = 'stale-version' WHERE generation_id = $1`, quoteIdentifier(schema)),
+			profileFinalization.generation.ID)
+		Expect(err).NotTo(HaveOccurred())
+		profileResult, err := store.AppendPrivateGenerationResult(ctx, AppendPrivateGenerationResultInput{
+			GenerationID: profileFinalization.generation.ID, ClaimToken: profileFinalization.claim.ClaimToken,
+			InitialWinnerCandidateID: profileFinalization.initialCandidate.ID,
+			ResultCandidateID:        profileFinalization.resultCandidate.ID,
+		})
+		Expect(profileResult).To(BeNil())
+		Expect(err).To(MatchError(ContainSubstring("matching evaluated candidate not found")))
+		expectNoResultRevision(profileFinalization.generation.ID, 2)
+
+		By("rechecking current same-skill creator access to the base before append")
+		baseAccess := createFinalizationFixture("base-access", true, false, false)
+		_, err = store.ClearExplicitLatestRevision(ctx, ClearExplicitLatestRevisionInput{
+			SkillID: skill.ID, CallerSubject: creator, ChangedAt: now.Add(time.Minute),
+		})
+		Expect(err).NotTo(HaveOccurred())
+		_, err = store.SetRevisionVisibility(ctx, SetRevisionVisibilityInput{
+			SkillID: skill.ID, RevisionID: base.ID, CallerSubject: creator,
+			IsPublic: false, ChangedAt: now.Add(time.Minute),
+		})
+		Expect(err).NotTo(HaveOccurred())
+		inaccessibleBaseResult, err := store.AppendPrivateGenerationResult(ctx, AppendPrivateGenerationResultInput{
+			GenerationID: baseAccess.generation.ID, ClaimToken: baseAccess.claim.ClaimToken,
+			InitialWinnerCandidateID: baseAccess.initialCandidate.ID,
+			ResultCandidateID:        baseAccess.resultCandidate.ID,
+		})
+		Expect(inaccessibleBaseResult).To(BeNil())
+		Expect(err).To(MatchError(ErrRevisionNotFound))
+		expectNoResultRevision(baseAccess.generation.ID, 2)
+		_, err = store.SetRevisionVisibility(ctx, SetRevisionVisibilityInput{
+			SkillID: skill.ID, RevisionID: base.ID, CallerSubject: "base-owner",
+			IsPublic: true, ChangedAt: now.Add(2 * time.Minute),
+		})
+		Expect(err).NotTo(HaveOccurred())
+		_, err = store.SetExplicitLatestRevision(ctx, SetExplicitLatestRevisionInput{
+			SkillID: skill.ID, RevisionID: base.ID, CallerSubject: creator, ChangedAt: now.Add(2 * time.Minute),
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		By("forcing two same-token finalization transactions to overlap")
+		valid := createFinalizationFixture("valid", true, true, true)
+		input := AppendPrivateGenerationResultInput{
+			GenerationID: valid.generation.ID, ClaimToken: valid.claim.ClaimToken,
+			InitialWinnerCandidateID: valid.initialCandidate.ID,
+			ResultCandidateID:        valid.resultCandidate.ID,
+		}
+
+		const barrierClassID int32 = 190076
+		var barrierObjectID int32
+		Expect(store.pool.QueryRow(ctx, `SELECT hashtext($1) & 2147483647`, valid.generation.ID).Scan(&barrierObjectID)).To(Succeed())
+		barrierConnection, err := store.pool.Acquire(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		barrierHeld := false
+		DeferCleanup(func() {
+			if barrierHeld {
+				var unlocked bool
+				_ = barrierConnection.QueryRow(context.Background(), `SELECT pg_advisory_unlock($1, $2)`, barrierClassID, barrierObjectID).Scan(&unlocked)
+			}
+			barrierConnection.Release()
+		})
+		Expect(barrierConnection.QueryRow(ctx, `SELECT pg_try_advisory_lock($1, $2)`, barrierClassID, barrierObjectID).Scan(&barrierHeld)).To(Succeed())
+		Expect(barrierHeld).To(BeTrue())
+
+		barrierFunction := quoteIdentifier(schema) + ".pause_generation_result_append_for_test"
+		_, err = store.pool.Exec(ctx, fmt.Sprintf(`CREATE FUNCTION %s()
+			RETURNS trigger LANGUAGE plpgsql AS $barrier$
+			BEGIN
+				IF NEW.generation_id = '%s'::uuid THEN
+					PERFORM pg_advisory_xact_lock(%d, %d);
+				END IF;
+				RETURN NEW;
+			END
+			$barrier$`, barrierFunction, valid.generation.ID, barrierClassID, barrierObjectID))
+		Expect(err).NotTo(HaveOccurred())
+		_, err = store.pool.Exec(ctx, fmt.Sprintf(`CREATE TRIGGER pause_generation_result_append_for_test
+			BEFORE INSERT ON %s.skill_revisions
+			FOR EACH ROW EXECUTE FUNCTION %s()`, quoteIdentifier(schema), barrierFunction))
+		Expect(err).NotTo(HaveOccurred())
+
+		results := make(chan generationFinalizationTestResult, 2)
+		go func() {
+			finalizeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			results <- finalizeGenerationForTest(finalizeCtx, store, input)
+		}()
+
+		var firstBackendPID int32
+		var earlyResult *generationFinalizationTestResult
+		Eventually(func() bool {
+			select {
+			case result := <-results:
+				earlyResult = &result
+				return true
+			default:
+			}
+			_ = store.pool.QueryRow(ctx, `SELECT pid
+				FROM pg_locks
+				WHERE locktype = 'advisory' AND classid::bigint = $1
+				  AND objid::bigint = $2 AND NOT granted
+				LIMIT 1`, barrierClassID, barrierObjectID).Scan(&firstBackendPID)
+			return firstBackendPID != 0
+		}).WithTimeout(5 * time.Second).WithPolling(10 * time.Millisecond).Should(BeTrue())
+		if earlyResult != nil {
+			// The designer stub returns a concrete error here. Keep the test RED on
+			// that returned value rather than dereferencing a nil revision or
+			// timing out while waiting for a transaction the stub never opened.
+			Expect(earlyResult.err).NotTo(MatchError(ErrGenerationResultAppendUnimplemented),
+				"valid finalization must enter its atomic transaction instead of returning the designer stub")
+			Expect(earlyResult.err).NotTo(HaveOccurred())
+			Expect(earlyResult.revision).NotTo(BeNil())
+			return
+		}
+		Expect(firstBackendPID).NotTo(BeZero(), "the first finalizer must reach the insert barrier while holding its generation transaction")
+
+		go func() {
+			finalizeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			results <- finalizeGenerationForTest(finalizeCtx, store, input)
+		}()
+		Eventually(func() bool {
+			var secondWaitsForFirst bool
+			scanErr := store.pool.QueryRow(ctx, `SELECT EXISTS (
+				SELECT 1 FROM pg_stat_activity activity
+				WHERE activity.pid <> $1 AND $1 = ANY(pg_blocking_pids(activity.pid))
+			)`, firstBackendPID).Scan(&secondWaitsForFirst)
+			return scanErr == nil && secondWaitsForFirst
+		}).WithTimeout(5*time.Second).WithPolling(10*time.Millisecond).Should(BeTrue(),
+			"the second same-token finalizer must overlap and wait on the first transaction")
+
+		var unlocked bool
+		Expect(barrierConnection.QueryRow(ctx, `SELECT pg_advisory_unlock($1, $2)`, barrierClassID, barrierObjectID).Scan(&unlocked)).To(Succeed())
+		Expect(unlocked).To(BeTrue())
+		barrierHeld = false
+
+		var first, second generationFinalizationTestResult
+		Eventually(results).WithTimeout(10 * time.Second).Should(Receive(&first))
+		Eventually(results).WithTimeout(10 * time.Second).Should(Receive(&second))
+		Expect(first.err).NotTo(HaveOccurred())
+		Expect(second.err).NotTo(HaveOccurred())
+		if first.err != nil || second.err != nil {
+			return
+		}
+		Expect(first.revision).NotTo(BeNil())
+		Expect(second.revision).NotTo(BeNil())
+		if first.revision == nil || second.revision == nil {
+			return
+		}
+		Expect(second.revision.ID).To(Equal(first.revision.ID))
+		resultRevision := first.revision
+		retried := finalizeGenerationForTest(ctx, store, input)
+		Expect(retried.err).NotTo(HaveOccurred())
+		Expect(retried.revision).To(Equal(resultRevision))
+
+		By("expiring and reclaiming a later generation so only the new token can append")
+		reclaimedFixture := createFinalizationFixture("reclaimed", true, false, false)
+		_, err = store.pool.Exec(ctx, fmt.Sprintf(`UPDATE %s.skill_generations
+			SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE id = $1`,
+			quoteIdentifier(schema)), reclaimedFixture.generation.ID)
+		Expect(err).NotTo(HaveOccurred())
+		reclaimedClaim, err := store.ClaimGeneration(ctx, ClaimGenerationInput{
+			WorkerID: "worker-reclaimed", LeaseDuration: time.Minute,
+		})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(reclaimedClaim).NotTo(BeNil())
+		Expect(reclaimedClaim.ID).To(Equal(reclaimedFixture.generation.ID))
+		Expect(reclaimedClaim.ClaimToken).NotTo(Equal(reclaimedFixture.claim.ClaimToken))
+		staleResult := finalizeGenerationForTest(ctx, store, AppendPrivateGenerationResultInput{
+			GenerationID: reclaimedFixture.generation.ID, ClaimToken: reclaimedFixture.claim.ClaimToken,
+			InitialWinnerCandidateID: reclaimedFixture.initialCandidate.ID,
+			ResultCandidateID:        reclaimedFixture.resultCandidate.ID,
+		})
+		Expect(staleResult.revision).To(BeNil())
+		Expect(staleResult.err).To(MatchError(ErrGenerationClaimLost))
+		expectNoResultRevision(reclaimedFixture.generation.ID, 3)
+
+		reclaimedResult := finalizeGenerationForTest(ctx, store, AppendPrivateGenerationResultInput{
+			GenerationID: reclaimedFixture.generation.ID, ClaimToken: reclaimedClaim.ClaimToken,
+			InitialWinnerCandidateID: reclaimedFixture.initialCandidate.ID,
+			ResultCandidateID:        reclaimedFixture.resultCandidate.ID,
+		})
+		Expect(reclaimedResult.err).NotTo(HaveOccurred())
+		Expect(reclaimedResult.revision).NotTo(BeNil())
+		if reclaimedResult.err != nil || reclaimedResult.revision == nil {
+			return
+		}
+		Expect(reclaimedResult.revision.SequenceNumber).To(Equal(3))
+		Expect(reclaimedResult.revision.GenerationID).To(Equal(reclaimedFixture.generation.ID))
+		persistedReclaimed, readErr := persistedRevisionForTest(ctx, store, reclaimedResult.revision.ID)
+		Expect(readErr).NotTo(HaveOccurred())
+		Expect(persistedReclaimed.IsPublic).To(BeFalse())
+		var reclaimedRevisionCount int
+		Expect(store.pool.QueryRow(ctx, fmt.Sprintf(`SELECT count(*) FROM %s.skill_revisions
+			WHERE generation_id = $1`, quoteIdentifier(schema)), reclaimedFixture.generation.ID).
+			Scan(&reclaimedRevisionCount)).To(Succeed())
+		Expect(reclaimedRevisionCount).To(Equal(1), "stale and current tokens must converge on exactly one result revision")
+		reclaimedState, readErr := store.GetGenerationByID(ctx, creator, reclaimedFixture.generation.ID)
+		Expect(readErr).NotTo(HaveOccurred())
+		Expect(reclaimedState).NotTo(BeNil())
+		Expect(reclaimedState.Generation.Status).To(Equal(GenerationStatusCompleted))
+		Expect(reclaimedState.Generation.ResultRevisionID).To(Equal(reclaimedResult.revision.ID))
+
+		_, err = uuid.Parse(resultRevision.ID)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(resultRevision.ID).NotTo(Equal(valid.resultCandidate.ID))
+		Expect(resultRevision.SkillID).To(Equal(skill.ID))
+		Expect(resultRevision.SequenceNumber).To(Equal(2))
+		Expect(resultRevision.Version).To(Equal("2"))
+		Expect(resultRevision.CreatorSubject).To(Equal(creator))
+		Expect(resultRevision.BasedOnRevisionID).To(Equal(base.ID))
+		Expect(resultRevision.SourceRevisionID).To(BeEmpty())
+		Expect(resultRevision.Origin).To(Equal(RevisionOriginGeneration))
+		Expect(resultRevision.Snapshot).To(Equal(generationCandidateRevisionSnapshot(*valid.resultCandidate)))
+		Expect(resultRevision.Snapshot.SourceSessionIDs).To(Equal(valid.resultCandidate.SourceSessionIDs))
+		Expect(resultRevision.ContentSHA256).To(Equal(skillRevisionSnapshotSHA256(resultRevision.Snapshot)))
+		Expect(resultRevision.ChangeNote).NotTo(BeEmpty())
+		Expect(len(resultRevision.ChangeNote)).To(BeNumerically("<=", 1024))
+		Expect(resultRevision.GenerationID).To(Equal(valid.generation.ID))
+		Expect(resultRevision.IdempotencyKey).To(Equal("generation:" + valid.generation.ID))
+
+		persisted, err := persistedRevisionForTest(ctx, store, resultRevision.ID)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(persisted.IsPublic).To(BeFalse())
+		Expect(persisted.ChangedBySubject).To(Equal(creator))
+		Expect(persisted.Snapshot).To(Equal(resultRevision.Snapshot))
+		Expect(persisted.ContentSHA256).To(Equal(resultRevision.ContentSHA256))
+
+		state, err := store.GetGenerationByID(ctx, creator, valid.generation.ID)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(state.Generation.Status).To(Equal(GenerationStatusCompleted))
+		Expect(state.Generation.WinnerCandidateID).To(Equal(valid.initialCandidate.ID))
+		Expect(state.Generation.ResultCandidateID).To(Equal(valid.resultCandidate.ID))
+		Expect(state.Generation.ResultRevisionID).To(Equal(resultRevision.ID))
+		Expect(state.Generation.CompletedAt).NotTo(BeNil())
+		Expect(state.Generation.ClaimToken).To(BeEmpty())
+		Expect(state.Generation.ClaimOwner).To(BeEmpty())
+		Expect(state.Generation.LeaseExpiresAt).To(BeNil())
+
+		var revisionCount, visibilityCount, nextSequence int
+		var explicitLatestID string
+		Expect(store.pool.QueryRow(ctx, fmt.Sprintf(`SELECT
+			(SELECT count(*) FROM %s.skill_revisions WHERE generation_id = $1),
+			(SELECT count(*) FROM %s.skill_revision_visibility visibility
+			 JOIN %s.skill_revisions revision ON revision.id = visibility.revision_id
+			 WHERE revision.generation_id = $1),
+			 skill.next_sequence_number, skill.explicit_latest_revision_id::text
+			FROM %s.skills skill WHERE skill.id = $2`, quoteIdentifier(schema),
+			quoteIdentifier(schema), quoteIdentifier(schema), quoteIdentifier(schema)),
+			valid.generation.ID, skill.ID).Scan(
+			&revisionCount, &visibilityCount, &nextSequence, &explicitLatestID)).To(Succeed())
+		Expect(revisionCount).To(Equal(1))
+		Expect(visibilityCount).To(Equal(1))
+		Expect(nextSequence).To(Equal(4), "two completed generations must each consume exactly one sequence")
+		Expect(explicitLatestID).To(Equal(base.ID), "generation must not move explicit latest")
+
+		ownerRead, err := store.GetRevision(ctx, RevisionReadOpts{
+			SkillID: skill.ID, RevisionID: resultRevision.ID, CallerSubject: creator,
+		})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(ownerRead.Revision).To(Equal(*resultRevision))
+		otherRead, err := store.GetRevision(ctx, RevisionReadOpts{
+			SkillID: skill.ID, RevisionID: resultRevision.ID, CallerSubject: "other-member",
+		})
+		Expect(otherRead).To(BeNil())
+		Expect(err).To(MatchError(ErrRevisionNotFound), "the result must remain creator-private")
+
+		By("returning the identical completed result after visibility and latest change")
+		_, err = store.SetRevisionVisibility(ctx, SetRevisionVisibilityInput{
+			SkillID: skill.ID, RevisionID: resultRevision.ID, CallerSubject: creator,
+			IsPublic: true, ChangedAt: now.Add(30 * time.Minute),
+		})
+		Expect(err).NotTo(HaveOccurred())
+		_, err = store.SetExplicitLatestRevision(ctx, SetExplicitLatestRevisionInput{
+			SkillID: skill.ID, RevisionID: resultRevision.ID, CallerSubject: creator,
+			ChangedAt: now.Add(30 * time.Minute),
+		})
+		Expect(err).NotTo(HaveOccurred())
+		completedRetry := finalizeGenerationForTest(ctx, store, input)
+		Expect(completedRetry.err).NotTo(HaveOccurred())
+		Expect(completedRetry.revision).To(Equal(resultRevision))
 	})
 
 	It("postgres_claims_are_exclusive_and_lease_fenced", func() {
@@ -1710,6 +2464,32 @@ type revisionMetadataRaceResult struct {
 	err       error
 }
 
+func setExplicitLatestForRace(
+	ctx context.Context,
+	store *PostgresStore,
+	input SetExplicitLatestRevisionInput,
+) (latest *SkillLatestRecord, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("set explicit latest panicked: %v", recovered)
+		}
+	}()
+	return store.SetExplicitLatestRevision(ctx, input)
+}
+
+func setRevisionVisibilityForRace(
+	ctx context.Context,
+	store *PostgresStore,
+	input SetRevisionVisibilityInput,
+) (visibility *RevisionVisibilityRecord, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("set revision visibility panicked: %v", recovered)
+		}
+	}()
+	return store.SetRevisionVisibility(ctx, input)
+}
+
 type appendRevisionTestResult struct {
 	revision *SkillRevisionRecord
 	err      error
@@ -1764,4 +2544,230 @@ func expectPostgresForeignKeyViolation(err error) {
 	var postgresError *pgconn.PgError
 	Expect(errors.As(err, &postgresError)).To(BeTrue(), "expected Postgres foreign-key rejection, got %v", err)
 	Expect(postgresError.Code).To(Equal("23503"))
+}
+
+func TestPostgresExternalAttachmentFilter(t *testing.T) {
+	dsn := os.Getenv("TEST_POSTGRES_DSN")
+	if dsn == "" {
+		dsn = os.Getenv("TEST_DATABASE_URL")
+	}
+	if dsn == "" {
+		t.Skip("TEST_POSTGRES_DSN / TEST_DATABASE_URL is not set")
+	}
+	ctx := context.Background()
+	suffix := uuid.NewString()[:8]
+	schema := "skills_extf_" + suffix
+	fixture := "attach_fixt_" + suffix
+	store, err := OpenPostgresStore(ctx, dsn, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_, _ = store.pool.Exec(ctx, fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", quoteIdentifier(fixture)))
+		_, _ = store.pool.Exec(ctx, fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", quoteIdentifier(schema)))
+		store.Close()
+	}()
+
+	// The probe must refuse a view that does not exist yet.
+	view := fixture + ".attachments"
+	if err := store.ProbeExternalView(ctx, view); err == nil {
+		t.Fatal("probe of a missing view must fail")
+	}
+
+	for _, statement := range []string{
+		fmt.Sprintf(`CREATE SCHEMA %s`, quoteIdentifier(fixture)),
+		fmt.Sprintf(`CREATE TABLE %s.rows (
+			primitive_type text NOT NULL,
+			primitive_id   text NOT NULL,
+			value          text NOT NULL
+		)`, quoteIdentifier(fixture)),
+		fmt.Sprintf(`CREATE VIEW %s.attachments AS
+			SELECT primitive_type, primitive_id, value FROM %s.rows`,
+			quoteIdentifier(fixture), quoteIdentifier(fixture)),
+	} {
+		if _, err := store.pool.Exec(ctx, statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.ProbeExternalView(ctx, view); err != nil {
+		t.Fatalf("probe of the fixture view failed: %v", err)
+	}
+
+	now := time.Now().UTC()
+	matching, other := uuid.NewString(), uuid.NewString()
+	for i, id := range []string{matching, other} {
+		if _, err := store.UpsertSkill(ctx, SkillRecord{
+			ID: id, Slug: fmt.Sprintf("s-%d", i), Name: fmt.Sprintf("S %d", i),
+			Type: "workflow", Version: "0.1.0", Visibility: "private",
+			CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, row := range [][3]string{
+		{"skill", matching, "alpha"},
+		{"skill", matching, "beta"},
+		{"skill", other, "beta"},
+	} {
+		if _, err := store.pool.Exec(ctx,
+			fmt.Sprintf(`INSERT INTO %s.rows (primitive_type, primitive_id, value) VALUES ($1, $2, $3)`,
+				quoteIdentifier(fixture)),
+			row[0], row[1], row[2]); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	filter := []ExternalAttachmentFilter{{View: view, TypeValue: "skill", Values: []string{"alpha", "beta"}}}
+	recs, err := store.ListSkills(ctx, SkillListOpts{External: filter})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) != 1 || recs[0].ID != matching {
+		t.Fatalf("filtered list = %#v, want exactly the skill carrying every value", recs)
+	}
+
+	canonical, err := store.ResolveSkill(ctx, ResolveSkillInput{
+		ID: uuid.NewString(), Slug: "coalesced-attachment", CreatorSubject: "creator-alias",
+		CreatedAt: now.Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonicalRevision, err := store.AppendRevision(ctx, AppendRevisionInput{
+		ID: uuid.NewString(), SkillID: canonical.ID, CreatorSubject: "creator-alias",
+		Origin: RevisionOriginMigrated,
+		Snapshot: SkillRevisionSnapshot{
+			Name: "Canonical attached skill", Type: "workflow", Content: "# Canonical",
+		},
+		CreatedAt: now.Add(2 * time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.SetRevisionVisibility(ctx, SetRevisionVisibilityInput{
+		SkillID: canonical.ID, RevisionID: canonicalRevision.ID, CallerSubject: "creator-alias",
+		IsPublic: true, ChangedAt: now.Add(3 * time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A newer unattached card proves the external predicate remains inside the
+	// paginating query: filtering a fetched page afterward would return empty.
+	decoy, err := store.ResolveSkill(ctx, ResolveSkillInput{
+		ID: uuid.NewString(), Slug: "newer-unattached", CreatorSubject: "creator-decoy",
+		CreatedAt: now.Add(4 * time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoyRevision, err := store.AppendRevision(ctx, AppendRevisionInput{
+		ID: uuid.NewString(), SkillID: decoy.ID, CreatorSubject: "creator-decoy",
+		Origin: RevisionOriginManual,
+		Snapshot: SkillRevisionSnapshot{
+			Name: "Newer unattached skill", Type: "workflow", Content: "# Decoy",
+		},
+		CreatedAt: now.Add(5 * time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.SetRevisionVisibility(ctx, SetRevisionVisibilityInput{
+		SkillID: decoy.ID, RevisionID: decoyRevision.ID, CallerSubject: "creator-decoy",
+		IsPublic: true, ChangedAt: now.Add(6 * time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	aliasID := uuid.NewSHA1(durableRevisionMigrationNamespace, []byte("predecessor:coalesced-attachment")).String()
+	if _, err = store.pool.Exec(ctx, fmt.Sprintf(`INSERT INTO %s.skills (
+		id, slug, name, author_subject, created_by_subject, created_at, updated_at,
+		migration_alias_of_skill_id
+	) VALUES ($1, $2, $3, $4, $4, $5, $5, $6)`, quoteIdentifier(schema)),
+		aliasID, canonical.Slug, "Migrated predecessor alias", "creator-alias", now, canonical.ID); err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range []string{"alias-alpha", "alias-beta"} {
+		if _, err = store.pool.Exec(ctx,
+			fmt.Sprintf(`INSERT INTO %s.rows (primitive_type, primitive_id, value) VALUES ($1, $2, $3)`,
+				quoteIdentifier(fixture)),
+			"skill", aliasID, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	aliasFilter := []ExternalAttachmentFilter{{
+		View: view, TypeValue: "skill", Values: []string{"alias-alpha", "alias-beta"},
+	}}
+	effective, err := store.ListEffectiveSkills(ctx, EffectiveSkillListOpts{
+		SkillListOpts: SkillListOpts{External: aliasFilter, Limit: 1}, CallerSubject: "viewer",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(effective) != 1 || effective[0].Skill.ID != canonical.ID {
+		t.Fatalf("alias-filtered effective list = %#v, want one canonical skill %s", effective, canonical.ID)
+	}
+	effectiveCounts, err := store.CountEffectiveSkills(ctx, EffectiveSkillCountOpts{
+		SkillCountOpts: SkillCountOpts{Author: "creator-alias", External: aliasFilter},
+		CallerSubject:  "viewer",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if effectiveCounts != (SkillCounts{Total: 1, Mine: 1}) {
+		t.Fatalf("alias-filtered effective counts = %#v, want one canonical authored skill", effectiveCounts)
+	}
+
+	// The predecessor reads share the same canonical-identity predicate while
+	// the coordinated HTTP cutover is in progress.
+	legacyAliasRecs, err := store.ListSkills(ctx, SkillListOpts{External: aliasFilter, Limit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(legacyAliasRecs) != 1 || legacyAliasRecs[0].ID != canonical.ID {
+		t.Fatalf("alias-filtered predecessor list = %#v, want one canonical skill %s", legacyAliasRecs, canonical.ID)
+	}
+	legacyAliasCounts, err := store.CountSkills(ctx, SkillCountOpts{
+		Author: "creator-alias", External: aliasFilter,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacyAliasCounts != (SkillCounts{Total: 1, Mine: 1}) {
+		t.Fatalf("alias-filtered predecessor counts = %#v, want one canonical authored skill", legacyAliasCounts)
+	}
+
+	// Broken after the probe: the typed error, never a silently unfiltered page.
+	if _, err := store.pool.Exec(ctx,
+		fmt.Sprintf(`DROP VIEW %s.attachments`, quoteIdentifier(fixture))); err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.ListSkills(ctx, SkillListOpts{External: filter})
+	if !errors.Is(err, ErrExternalViewUnavailable) {
+		t.Fatalf("broken-view list error = %v, want %v", err, ErrExternalViewUnavailable)
+	}
+	_, err = store.CountSkills(ctx, SkillCountOpts{External: filter})
+	if !errors.Is(err, ErrExternalViewUnavailable) {
+		t.Fatalf("broken-view count error = %v, want %v", err, ErrExternalViewUnavailable)
+	}
+	_, err = store.ListEffectiveSkills(ctx, EffectiveSkillListOpts{
+		SkillListOpts: SkillListOpts{External: aliasFilter}, CallerSubject: "viewer",
+	})
+	if !errors.Is(err, ErrExternalViewUnavailable) {
+		t.Fatalf("broken-view effective list error = %v, want %v", err, ErrExternalViewUnavailable)
+	}
+	_, err = store.CountEffectiveSkills(ctx, EffectiveSkillCountOpts{
+		SkillCountOpts: SkillCountOpts{External: aliasFilter}, CallerSubject: "viewer",
+	})
+	if !errors.Is(err, ErrExternalViewUnavailable) {
+		t.Fatalf("broken-view effective count error = %v, want %v", err, ErrExternalViewUnavailable)
+	}
+
+	// Without the filter the list still serves.
+	if _, err := store.ListSkills(ctx, SkillListOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ListEffectiveSkills(ctx, EffectiveSkillListOpts{CallerSubject: "viewer"}); err != nil {
+		t.Fatal(err)
+	}
 }

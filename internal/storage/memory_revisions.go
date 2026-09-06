@@ -201,6 +201,123 @@ func (s *MemoryStore) ListRevisions(_ context.Context, opts RevisionListOpts) ([
 	return out, nil
 }
 
+// SetRevisionVisibility changes only mutable visibility/audit metadata. The
+// implementation must make repeated requests idempotent and reject making the
+// current explicit latest private.
+func (s *MemoryStore) SetRevisionVisibility(
+	_ context.Context,
+	input SetRevisionVisibilityInput,
+) (*RevisionVisibilityRecord, error) {
+	if !validUUID(input.SkillID) || !validUUID(input.RevisionID) || input.CallerSubject == "" {
+		return nil, ErrRevisionNotFound
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	visibility, visibilityExists := s.revisionVisibility[input.RevisionID]
+	if !visibilityExists {
+		return nil, ErrRevisionNotFound
+	}
+	// The actor that committed the current state may retry that exact request
+	// using bounded audit metadata even after making a revision private. Only
+	// after establishing that retry capability do we consult immutable content
+	// to verify the route-scoped skill relationship.
+	auditRetry := visibility.IsPublic == input.IsPublic &&
+		visibility.ChangedBySubject == input.CallerSubject
+	skill, skillExists := s.skills[input.SkillID]
+	revision, revisionExists := s.revisions[input.RevisionID]
+	if !skillExists || !revisionExists || revision.SkillID != skill.ID ||
+		(!auditRetry && !visibility.IsPublic && revision.CreatorSubject != input.CallerSubject) {
+		return nil, ErrRevisionNotFound
+	}
+	if !input.IsPublic && skill.ExplicitLatestRevisionID == revision.ID {
+		return nil, &RevisionIsExplicitLatestError{RevisionID: revision.ID}
+	}
+	visibility.PreviousIsPublic = visibility.IsPublic
+	visibility.Changed = visibility.IsPublic != input.IsPublic
+	if !visibility.Changed {
+		return cloneRevisionVisibility(visibility), nil
+	}
+
+	visibility.IsPublic = input.IsPublic
+	visibility.ChangedBySubject = input.CallerSubject
+	visibility.ChangedAt = input.ChangedAt.UTC()
+	stored := visibility
+	stored.Changed = false
+	stored.PreviousIsPublic = false
+	s.revisionVisibility[revision.ID] = stored
+	return cloneRevisionVisibility(visibility), nil
+}
+
+// SetExplicitLatestRevision atomically sets or moves explicit latest to a
+// public revision of the same skill.
+func (s *MemoryStore) SetExplicitLatestRevision(
+	_ context.Context,
+	input SetExplicitLatestRevisionInput,
+) (*SkillLatestRecord, error) {
+	if !validUUID(input.SkillID) || !validUUID(input.RevisionID) || input.CallerSubject == "" {
+		return nil, ErrRevisionNotFound
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	skill, skillExists := s.skills[input.SkillID]
+	revision, revisionExists := s.revisions[input.RevisionID]
+	visibility, visibilityExists := s.revisionVisibility[input.RevisionID]
+	if !skillExists || !revisionExists || revision.SkillID != skill.ID || !visibilityExists ||
+		(!visibility.IsPublic && revision.CreatorSubject != input.CallerSubject) {
+		return nil, ErrRevisionNotFound
+	}
+	if !visibility.IsPublic {
+		return nil, &RevisionNotPublicError{RevisionID: revision.ID}
+	}
+	if skill.ExplicitLatestRevisionID != revision.ID {
+		skill.ExplicitLatestRevisionID = revision.ID
+		if skill.UpdatedAt.Before(input.ChangedAt.UTC()) {
+			skill.UpdatedAt = input.ChangedAt.UTC()
+		}
+		s.skills[skill.ID] = skill
+	}
+
+	effective := cloneAccessibleRevision(revision, visibility, true)
+	return &SkillLatestRecord{
+		SkillID: skill.ID, ExplicitLatestRevisionID: revision.ID,
+		EffectiveRevision: effective,
+	}, nil
+}
+
+// ClearExplicitLatestRevision atomically clears explicit latest and resolves
+// the newest-public fallback without marking that fallback explicit.
+func (s *MemoryStore) ClearExplicitLatestRevision(
+	_ context.Context,
+	input ClearExplicitLatestRevisionInput,
+) (*SkillLatestRecord, error) {
+	if !validUUID(input.SkillID) || input.CallerSubject == "" {
+		return nil, ErrSkillNotFound
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	skill, exists := s.skills[input.SkillID]
+	if !exists || !s.skillIsAccessibleLocked(skill, input.CallerSubject) {
+		return nil, ErrSkillNotFound
+	}
+	if skill.ExplicitLatestRevisionID != "" {
+		skill.ExplicitLatestRevisionID = ""
+		if skill.UpdatedAt.Before(input.ChangedAt.UTC()) {
+			skill.UpdatedAt = input.ChangedAt.UTC()
+		}
+		s.skills[skill.ID] = skill
+	}
+
+	return &SkillLatestRecord{
+		SkillID: skill.ID, EffectiveRevision: s.resolveEffectiveRevisionLocked(skill),
+	}, nil
+}
+
 func validateAppendRevisionInput(input AppendRevisionInput) error {
 	if !validUUID(input.ID) {
 		return errors.New("append revision: id is required")

@@ -18,6 +18,7 @@ type LifecycleStore interface {
 	storage.GenerationStore
 	storage.SkillIdentityStore
 	storage.RevisionStore
+	storage.RevisionMetadataStore
 }
 
 // LifecycleStoreFactory returns an isolated store and its cleanup callback.
@@ -301,6 +302,124 @@ func LifecycleStoreContract(name string, newStore LifecycleStoreFactory, newID f
 			Expect(state.Diagnostics[1].ID).To(Equal(evaluationDiagnostic.ID))
 			Expect(state.Diagnostics[2].ID).To(Equal(replacement.ID))
 			Expect(state.Diagnostics).NotTo(ContainElement(HaveField("ID", first.ID)))
+		})
+
+		It("validates evaluation identity, base access, and visibility-independent completed retries", func() {
+			storeNow := time.Now().UTC().Add(-time.Minute)
+			baseOwner := "generation-base-owner"
+			creator := "generation-result-owner"
+			skill, err := store.ResolveSkill(ctx, storage.ResolveSkillInput{
+				ID: newID(), Slug: "generation-finalization-contract", CreatorSubject: baseOwner, CreatedAt: storeNow,
+			})
+			Expect(err).NotTo(HaveOccurred())
+			base, err := store.AppendRevision(ctx, storage.AppendRevisionInput{
+				ID: newID(), SkillID: skill.ID, CreatorSubject: baseOwner,
+				Origin: storage.RevisionOriginManual,
+				Snapshot: storage.SkillRevisionSnapshot{
+					Name: "Generation base", Type: "workflow", Content: "# Generation base",
+				},
+				CreatedAt: storeNow,
+			})
+			Expect(err).NotTo(HaveOccurred())
+			_, err = store.SetRevisionVisibility(ctx, storage.SetRevisionVisibilityInput{
+				SkillID: skill.ID, RevisionID: base.ID, CallerSubject: baseOwner,
+				IsPublic: true, ChangedAt: storeNow,
+			})
+			Expect(err).NotTo(HaveOccurred())
+			generation, err := store.CreateGeneration(ctx, storage.CreateGenerationInput{
+				ID: newID(), SkillID: skill.ID, BaseRevisionID: base.ID, CreatorSubject: creator,
+				Snapshot: storage.SkillRevisionSnapshot{
+					Name: "Generation seed", Type: "workflow", Content: "# Generation seed",
+				},
+				SelectedSessionIDs: []string{"generation-source"},
+				EvaluatorProfile:   "caller-profile", EvaluatorProfileVersion: "caller-version",
+				EvaluationCriteria: json.RawMessage(`[{
+					"id":"rankable","kind":"structure","description":"Complete.","weight":1
+				}]`),
+				CreatedAt: storeNow,
+			})
+			Expect(err).NotTo(HaveOccurred())
+			claim, err := store.ClaimGeneration(ctx, storage.ClaimGenerationInput{
+				WorkerID: "finalization-contract-worker", LeaseDuration: time.Minute,
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(claim).NotTo(BeNil())
+			Expect(store.UpdateGenerationStatus(ctx, generation.ID, claim.ClaimToken,
+				storage.GenerationStatusQueued, storage.GenerationStatusGeneratingCandidates)).To(Succeed())
+			candidate, err := store.PutGenerationCandidate(ctx, generation.ID, claim.ClaimToken,
+				storage.GenerationCandidateRecord{
+					ID: newID(), Ordinal: 0, Kind: storage.GenerationCandidateSession,
+					SourceSessionIDs: []string{"generation-source"},
+					Snapshot: storage.GenerationCandidateSnapshot{
+						Name: "Generation result", Type: "workflow", Content: "# Generation result",
+						IsAIGenerated: true,
+					},
+					Insights: json.RawMessage(`[]`), BundleSHA256: "generation-result-bundle",
+				})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(store.UpdateGenerationStatus(ctx, generation.ID, claim.ClaimToken,
+				storage.GenerationStatusGeneratingCandidates, storage.GenerationStatusEvaluatingCandidates)).To(Succeed())
+			score := 0.9
+			evaluation := storage.CandidateEvaluationRecord{
+				ID: newID(), CandidateID: candidate.ID, RequestSHA256: "generation-result-request",
+				Profile: "other-profile", ProfileVersion: "caller-version", EvaluatorVersion: "contract",
+				Score: &score, Decision: "pass", CriterionResults: json.RawMessage(`[]`),
+				Findings: json.RawMessage(`[]`), Strengths: json.RawMessage(`[]`), Panel: json.RawMessage(`{}`),
+			}
+			storedEvaluation, err := store.PutCandidateEvaluation(ctx, generation.ID, claim.ClaimToken, evaluation)
+			Expect(storedEvaluation).To(BeNil())
+			Expect(err).To(MatchError(storage.ErrInvalidGenerationState))
+			evaluation.Profile = "caller-profile"
+			evaluation.GenerationID = newID()
+			_, err = store.PutCandidateEvaluation(ctx, generation.ID, claim.ClaimToken, evaluation)
+			Expect(err).To(MatchError(ContainSubstring("another generation")))
+			evaluation.GenerationID = ""
+			evaluation.ID = newID()
+			storedEvaluation, err = store.PutCandidateEvaluation(ctx, generation.ID, claim.ClaimToken, evaluation)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(storedEvaluation.Profile).To(Equal(generation.EvaluatorProfile))
+			Expect(storedEvaluation.ProfileVersion).To(Equal(generation.EvaluatorProfileVersion))
+			Expect(store.UpdateGenerationStatus(ctx, generation.ID, claim.ClaimToken,
+				storage.GenerationStatusEvaluatingCandidates, storage.GenerationStatusSynthesizing)).To(Succeed())
+
+			_, err = store.SetRevisionVisibility(ctx, storage.SetRevisionVisibilityInput{
+				SkillID: skill.ID, RevisionID: base.ID, CallerSubject: creator,
+				IsPublic: false, ChangedAt: storeNow.Add(time.Second),
+			})
+			Expect(err).NotTo(HaveOccurred())
+			input := storage.AppendPrivateGenerationResultInput{
+				GenerationID: generation.ID, ClaimToken: claim.ClaimToken,
+				InitialWinnerCandidateID: candidate.ID, ResultCandidateID: candidate.ID,
+			}
+			revision, err := store.AppendPrivateGenerationResult(ctx, input)
+			Expect(revision).To(BeNil())
+			Expect(err).To(MatchError(storage.ErrRevisionNotFound))
+
+			_, err = store.SetRevisionVisibility(ctx, storage.SetRevisionVisibilityInput{
+				SkillID: skill.ID, RevisionID: base.ID, CallerSubject: baseOwner,
+				IsPublic: true, ChangedAt: storeNow.Add(2 * time.Second),
+			})
+			Expect(err).NotTo(HaveOccurred())
+			revision, err = store.AppendPrivateGenerationResult(ctx, input)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(revision).NotTo(BeNil())
+			renewed, err := store.RenewGenerationLease(ctx, generation.ID, claim.ClaimToken, time.Minute)
+			Expect(renewed).To(BeFalse())
+			Expect(err).To(MatchError(storage.ErrGenerationCompleted),
+				"the completing claim is distinct from expiry, reclaim, and creator cancellation")
+			_, err = store.SetRevisionVisibility(ctx, storage.SetRevisionVisibilityInput{
+				SkillID: skill.ID, RevisionID: revision.ID, CallerSubject: creator,
+				IsPublic: true, ChangedAt: storeNow.Add(3 * time.Second),
+			})
+			Expect(err).NotTo(HaveOccurred())
+			_, err = store.SetExplicitLatestRevision(ctx, storage.SetExplicitLatestRevisionInput{
+				SkillID: skill.ID, RevisionID: revision.ID, CallerSubject: creator,
+				ChangedAt: storeNow.Add(3 * time.Second),
+			})
+			Expect(err).NotTo(HaveOccurred())
+			retry, err := store.AppendPrivateGenerationResult(ctx, input)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(retry).To(Equal(revision), "completed retry must ignore mutable visibility and latest")
 		})
 
 		It("validates persisted snapshots and evaluator-owned detail JSON", func() {

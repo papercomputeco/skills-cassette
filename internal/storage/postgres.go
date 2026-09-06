@@ -32,9 +32,11 @@ type postgresQuerier interface {
 }
 
 var (
-	_ Store              = (*PostgresStore)(nil)
-	_ SkillIdentityStore = (*PostgresStore)(nil)
-	_ RevisionStore      = (*PostgresStore)(nil)
+	_ Store                 = (*PostgresStore)(nil)
+	_ SkillIdentityStore    = (*PostgresStore)(nil)
+	_ SkillReader           = (*PostgresStore)(nil)
+	_ RevisionStore         = (*PostgresStore)(nil)
+	_ RevisionMetadataStore = (*PostgresStore)(nil)
 )
 
 func isUniqueViolation(err error) bool {
