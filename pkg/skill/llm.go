@@ -295,6 +295,18 @@ func newOllamaCaller(model, baseURL string) LLMCallFunc {
 	}
 }
 
+// callTimeout is llmCallTimeout unless CASSETTE_LLM_TIMEOUT (the llm.timeout
+// cassette config key) names a longer duration. A hosted provider answers in
+// seconds; a local model behind Ollama needs minutes per candidate.
+func callTimeout() time.Duration {
+	if raw := strings.TrimSpace(os.Getenv("CASSETTE_LLM_TIMEOUT")); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+			return d
+		}
+	}
+	return llmCallTimeout
+}
+
 // postJSON issues a JSON POST and returns the response body, retrying a
 // transient provider failure (408/429/5xx or a transport blip) up to
 // llmCallRetries times. One timeout spans every attempt, so retries never
@@ -306,7 +318,7 @@ func postJSON(ctx context.Context, url string, reqBody any, headers map[string]s
 		return nil, externalCallError(fmt.Errorf("marshal request: %w", err), false)
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, llmCallTimeout)
+	ctx, cancel := context.WithTimeout(ctx, callTimeout())
 	defer cancel()
 
 	var lastErr error
