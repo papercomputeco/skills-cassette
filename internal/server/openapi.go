@@ -95,6 +95,10 @@ func manifest(name string) map[string]any {
 				"description": "Provider base URL override for proxies and self-hosted endpoints.",
 			},
 			{
+				"key": "llm.timeout", "type": "duration", "default": "30s",
+				"description": "Provider call deadline per candidate, spanning retries. Only values above the 30s default apply; a local model behind Ollama needs minutes.",
+			},
+			{
 				"key": "generation.worker_concurrency", "type": "int", "default": 2, "min": 1, "max": 64,
 				"description": "Maximum concurrently claimed generations in this cassette process.",
 			},

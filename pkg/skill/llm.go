@@ -295,10 +295,29 @@ func newOllamaCaller(model, baseURL string) LLMCallFunc {
 	}
 }
 
+// callTimeout is llmCallTimeout unless CASSETTE_LLM_TIMEOUT (the llm.timeout
+// cassette config key) names a longer duration. A hosted provider answers in
+// seconds; a local model behind Ollama needs minutes per candidate. The
+// setting only ever extends the deadline: a shorter or unparseable value
+// keeps the default, so a typo cannot make hosted calls fail early. The
+// generation worker's processing budget still bounds the whole run.
+func callTimeout() time.Duration {
+	return callTimeoutFrom(os.Getenv("CASSETTE_LLM_TIMEOUT"))
+}
+
+func callTimeoutFrom(raw string) time.Duration {
+	if raw = strings.TrimSpace(raw); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil && d > llmCallTimeout {
+			return d
+		}
+	}
+	return llmCallTimeout
+}
+
 // postJSON issues a JSON POST and returns the response body, retrying a
 // transient provider failure (408/429/5xx or a transport blip) up to
 // llmCallRetries times. One timeout spans every attempt, so retries never
-// extend the handler's time budget past llmCallTimeout; a deadline or
+// extend the handler's time budget past callTimeout(); a deadline or
 // cancellation stops retrying immediately.
 func postJSON(ctx context.Context, url string, reqBody any, headers map[string]string) ([]byte, error) {
 	data, err := json.Marshal(reqBody)
@@ -306,7 +325,7 @@ func postJSON(ctx context.Context, url string, reqBody any, headers map[string]s
 		return nil, externalCallError(fmt.Errorf("marshal request: %w", err), false)
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, llmCallTimeout)
+	ctx, cancel := context.WithTimeout(ctx, callTimeout())
 	defer cancel()
 
 	var lastErr error
