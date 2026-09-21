@@ -68,8 +68,10 @@ var _ = Describe("config from env", func() {
 		GinkgoT().Setenv("CASSETTE_GENERATION_MAX_RETRY_BACKOFF_MS", "80")
 		GinkgoT().Setenv("CASSETTE_GENERATION_MAX_ATTEMPTS", "4")
 		GinkgoT().Setenv("CASSETTE_GENERATION_MAX_TRANSCRIPT_BYTES", "65536")
+		GinkgoT().Setenv("CASSETTE_GENERATION_ENABLED", "false")
 
 		cfg := server.ConfigFromEnv()
+		Expect(cfg.Generation.AdmissionClosed).To(BeTrue())
 		Expect(cfg.Name).To(Equal("skills-two"))
 		Expect(cfg.CoreURL).To(Equal("https://tapes.internal"))
 		Expect(cfg.LLM.Provider).To(Equal("anthropic"))
@@ -115,7 +117,7 @@ var _ = Describe("config from env", func() {
 			"CASSETTE_GENERATION_HEARTBEAT_INTERVAL_MS", "CASSETTE_GENERATION_PROCESSING_TIMEOUT_MS",
 			"CASSETTE_GENERATION_DRAIN_TIMEOUT_MS", "CASSETTE_GENERATION_RETRY_BACKOFF_MS",
 			"CASSETTE_GENERATION_MAX_RETRY_BACKOFF_MS", "CASSETTE_GENERATION_MAX_ATTEMPTS",
-			"CASSETTE_GENERATION_MAX_TRANSCRIPT_BYTES",
+			"CASSETTE_GENERATION_MAX_TRANSCRIPT_BYTES", "CASSETTE_GENERATION_ENABLED",
 		} {
 			GinkgoT().Setenv(key, "")
 		}
@@ -135,6 +137,26 @@ var _ = Describe("config from env", func() {
 		Expect(cfg.Generation.MaxRetryBackoff).To(Equal(30 * time.Second))
 		Expect(cfg.Generation.MaxAttempts).To(Equal(3))
 		Expect(cfg.Generation.MaxTranscriptBytes).To(Equal(1 << 20))
+		Expect(cfg.Generation.AdmissionClosed).To(BeFalse(),
+			"generation.enabled defaults to true, so an unconfigured deployment keeps admitting work")
+	})
+
+	It("reads generation.enabled as a bool and falls back to admitting work", func() {
+		for _, admitted := range []string{"false", "FALSE", "False", "0", "f"} {
+			GinkgoT().Setenv("CASSETTE_GENERATION_ENABLED", admitted)
+			Expect(server.ConfigFromEnv().Generation.AdmissionClosed).To(BeTrue(), admitted)
+		}
+		for _, admitted := range []string{"true", "TRUE", "True", "1", "t"} {
+			GinkgoT().Setenv("CASSETTE_GENERATION_ENABLED", admitted)
+			Expect(server.ConfigFromEnv().Generation.AdmissionClosed).To(BeFalse(), admitted)
+		}
+		// The value is rendered by the deployment as a literal bool, so
+		// anything else is a deployment error and must not silently close
+		// admission on a tenant whose configuration simply failed to render.
+		for _, unreadable := range []string{"", "  ", "no", "disabled", "off", "null"} {
+			GinkgoT().Setenv("CASSETTE_GENERATION_ENABLED", unreadable)
+			Expect(server.ConfigFromEnv().Generation.AdmissionClosed).To(BeFalse(), unreadable)
+		}
 	})
 })
 

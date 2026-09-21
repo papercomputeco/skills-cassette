@@ -31,6 +31,16 @@ type WorkerConfig struct {
 	MaxSessions          int
 	CandidateConcurrency int
 	MaxTranscriptBytes   int
+	// AdmissionClosed mirrors the deployment's generation.enabled=false. The
+	// polarity is inverted deliberately: generation.enabled defaults to true,
+	// and a zero-valued WorkerConfig must therefore keep admitting work, the
+	// behavior every standalone deployment and every existing caller has.
+	//
+	// It lives on the worker's configuration because one setting governs both
+	// halves of admission: the HTTP enqueue (internal/server) and the durable
+	// retry a failed attempt would otherwise schedule (handleClaim). Neither
+	// half learns why the deployment closed admission.
+	AdmissionClosed bool
 }
 
 func DefaultWorkerConfig() WorkerConfig {

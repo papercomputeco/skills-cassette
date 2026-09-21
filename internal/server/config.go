@@ -66,6 +66,11 @@ func ConfigFromEnv() Config {
 
 func generationWorkerConfigFromEnv() generation.WorkerConfig {
 	config := generation.DefaultWorkerConfig()
+	// generation.enabled defaults to true, so an absent or unparsable value
+	// leaves admission open — exactly what a standalone or open-core
+	// deployment that renders no configuration has always done. The worker
+	// carries the inverted form; see generation.WorkerConfig.AdmissionClosed.
+	config.AdmissionClosed = !envBool("CASSETTE_GENERATION_ENABLED", true)
 	config.WorkerConcurrency = boundedEnvInt("CASSETTE_GENERATION_WORKER_CONCURRENCY", config.WorkerConcurrency, 1, 64)
 	config.MaxSessions = boundedEnvInt("CASSETTE_GENERATION_MAX_SESSIONS", config.MaxSessions, 1, 100)
 	configuredCandidateConcurrency := boundedEnvInt(
@@ -97,6 +102,23 @@ func generationWorkerConfigFromEnv() generation.WorkerConfig {
 		config.MaxRetryBackoff = config.RetryBackoff
 	}
 	return config
+}
+
+// envBool reads one manifest-declared bool setting. An absent value, and a
+// value strconv.ParseBool cannot read, both fall back — the same
+// fallback-on-unreadable discipline boundedEnvInt applies to the int
+// settings, and the reason the rendered value is always a literal
+// "true"/"false" rather than free text.
+func envBool(key string, fallback bool) bool {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.ParseBool(raw)
+	if err != nil {
+		return fallback
+	}
+	return value
 }
 
 func boundedEnvInt(key string, fallback, minimum, maximum int) int {

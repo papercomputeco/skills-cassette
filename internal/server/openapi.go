@@ -95,6 +95,10 @@ func manifest(name string) map[string]any {
 				"description": "Provider base URL override for proxies and self-hosted endpoints.",
 			},
 			{
+				"key": "generation.enabled", "type": "bool", "default": true,
+				"description": "Whether this cassette admits new skill generations. Disabled rejects creation with a stable code; browsing, manual creation and revisions are unaffected.",
+			},
+			{
 				"key": "generation.worker_concurrency", "type": "int", "default": 2, "min": 1, "max": 64,
 				"description": "Maximum concurrently claimed generations in this cassette process.",
 			},

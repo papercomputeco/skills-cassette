@@ -95,6 +95,11 @@ func manifestGenerationIntegerBounds(raw map[string]any) map[string]publishedInt
 		if !strings.HasPrefix(entry.Key, "generation.") {
 			continue
 		}
+		if entry.Type == "bool" {
+			// generation.enabled is the one non-numeric generation setting;
+			// manifestConfigEntry pins its shape instead.
+			continue
+		}
 		Expect(entry.Type).To(Equal("int"), entry.Key)
 		Expect(entry.Default).To(BeAssignableToTypeOf(float64(0)), entry.Key)
 		Expect(entry.Minimum).To(BeAssignableToTypeOf(float64(0)), entry.Key)
@@ -104,6 +109,39 @@ func manifestGenerationIntegerBounds(raw map[string]any) map[string]publishedInt
 		}
 	}
 	return bounds
+}
+
+// manifestConfigEntry returns one declared config entry exactly as its
+// encoding carries it, so a non-integer setting can be pinned field by field
+// rather than through the integer-bound projection.
+func manifestConfigEntry(raw map[string]any, key string) map[string]any {
+	encoded, err := json.Marshal(raw["config"])
+	Expect(err).NotTo(HaveOccurred())
+	var entries []map[string]any
+	Expect(json.Unmarshal(encoded, &entries)).To(Succeed())
+	for _, entry := range entries {
+		if entry["key"] == key {
+			return entry
+		}
+	}
+	Fail("manifest declares no config key " + key)
+	return nil
+}
+
+// manifestConfigKeys returns the declared config keys in order. Order is part
+// of the canonical manifest both encodings must agree on.
+func manifestConfigKeys(raw map[string]any) []string {
+	encoded, err := json.Marshal(raw["config"])
+	Expect(err).NotTo(HaveOccurred())
+	var entries []struct {
+		Key string `json:"key"`
+	}
+	Expect(json.Unmarshal(encoded, &entries)).To(Succeed())
+	keys := make([]string, len(entries))
+	for index, entry := range entries {
+		keys[index] = entry.Key
+	}
+	return keys
 }
 
 type handlerInvocation struct {
@@ -384,6 +422,25 @@ var _ = Describe("unified revision manifest and route surface", func() {
 		}
 		Expect(manifestGenerationIntegerBounds(authoredRaw)).To(Equal(expectedGenerationBounds))
 		Expect(manifestGenerationIntegerBounds(embeddedRaw)).To(Equal(expectedGenerationBounds))
+
+		By("pinning the neutral generation admission switch in both encodings")
+		expectedAdmissionSetting := map[string]any{
+			"key": "generation.enabled", "type": "bool", "default": true,
+			"description": "Whether this cassette admits new skill generations. " +
+				"Disabled rejects creation with a stable code; browsing, manual creation and revisions are unaffected.",
+		}
+		for label, raw := range map[string]map[string]any{"cassette.toml": authoredRaw, "x-tapes-cassette": embeddedRaw} {
+			entry := manifestConfigEntry(raw, "generation.enabled")
+			Expect(entry).To(Equal(expectedAdmissionSetting), label)
+			Expect(entry["description"]).NotTo(SatisfyAny(
+				ContainSubstring("plan"), ContainSubstring("tier"), ContainSubstring("entitle"),
+			), "%s must describe the switch without naming a commercial concept", label)
+			// Default true is what keeps a deployment that renders nothing
+			// behaving exactly as it did before this key existed.
+			Expect(entry["default"]).To(BeTrue(), label)
+		}
+		Expect(manifestConfigKeys(embeddedRaw)).To(Equal(manifestConfigKeys(authoredRaw)))
+		Expect(manifestConfigKeys(authoredRaw)).To(ContainElement("generation.enabled"))
 
 		By("pinning concrete request and page bounds in the served OpenAPI contract")
 		var document map[string]any
