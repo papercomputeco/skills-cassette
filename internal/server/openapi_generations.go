@@ -38,6 +38,7 @@ func generationOpenAPIPaths(prefix, tag string) map[string]any {
 					jsonResponse("202", "Durably queued generation", generationSchema()),
 					jsonResponse("400", "Invalid request", lifecycleErrorSchema()),
 					jsonResponse("401", "Authentication required", lifecycleErrorSchema()),
+					jsonResponse("403", "This deployment is not admitting new generations (generation_disabled)", lifecycleErrorSchema()),
 					jsonResponse("404", "Skill or accessible same-skill base revision not found", lifecycleErrorSchema()),
 					jsonResponse("500", "Creation failed", lifecycleErrorSchema()),
 				)),

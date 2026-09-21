@@ -220,6 +220,20 @@ Successful completion appends exactly one new private revision and returns its
 `resultRevisionId`. It never makes that revision public or latest. Cancellation
 retains artifacts and fences late worker writes.
 
+### Generation admission
+
+A deployment may close generation admission with
+`CASSETTE_GENERATION_ENABLED=false`. Creating a generation then returns `403`
+with code `generation_disabled`, decided before anything is written, so nothing
+is queued and then refused. Nothing else changes: listing and reading skills,
+revisions and generation history, resolving a skill identity, appending a
+revision, visibility and latest all behave exactly as before.
+
+Work already in the durable queue is finished, not dropped — including a row
+whose lease expired because its worker died. Only a *new* attempt is new
+admission: a row whose attempt fails while admission is closed is not requeued
+and goes terminal instead.
+
 ## Evaluation contracts
 
 Two evaluator contracts cross the boundary with skills-evaluator, in opposite
@@ -264,8 +278,8 @@ Lifecycle failures use a bounded stable envelope:
 ```
 
 Codes include `revision_not_found`, `revision_private`, `revision_not_public`,
-`latest_revision_conflict`, `revision_sequence_conflict`, and
-`invalid_generation_state`. Inaccessible private content uses not-found
+`latest_revision_conflict`, `revision_sequence_conflict`,
+`invalid_generation_state`, and `generation_disabled`. Inaccessible private content uses not-found
 semantics. Responses never include raw transcripts, provider/model errors,
 creator subjects, claim tokens, or lease state.
 
