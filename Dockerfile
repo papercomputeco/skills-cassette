@@ -5,10 +5,14 @@ ARG TARGETARCH
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
-COPY . .
+COPY cli/ cli/
+COPY cmd/ cmd/
+COPY internal/ internal/
+COPY pkg/ pkg/
 
 ARG LDFLAGS="-s -w"
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -trimpath -ldflags="$LDFLAGS" -o /out/skills-cassette ./cli/skills-cassette
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
+    go build -trimpath -ldflags="$LDFLAGS" -o /out/skills-cassette ./cli/skills-cassette
 
 FROM gcr.io/distroless/static-debian12:nonroot
 

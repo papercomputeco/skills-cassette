@@ -185,9 +185,6 @@ type DiffStatID string
 type DirectoryID string
 
 // A unique identifier for an object.
-type DockerimageID string
-
-// A unique identifier for an object.
 type EnumTypeDefID string
 
 // A unique identifier for an object.
@@ -12905,16 +12902,6 @@ func (r *Query) LoadDirectoryFromID(id DirectoryID) *Directory {
 	q = q.Arg("id", id)
 
 	return &Directory{
-		query: q,
-	}
-}
-
-// Load a Dockerimage from its ID.
-func (r *Query) LoadDockerimageFromID(id DockerimageID) *Dockerimage {
-	q := r.query.Select("loadDockerimageFromID")
-	q = q.Arg("id", id)
-
-	return &Dockerimage{
 		query: q,
 	}
 }

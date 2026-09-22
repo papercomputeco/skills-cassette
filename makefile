@@ -11,6 +11,7 @@ endif
 VERSION_PACKAGE := github.com/papercomputeco/skills-cassette/cmd/skills-cassette
 LDFLAGS := -s -w -X $(VERSION_PACKAGE).Version=$(VERSION)
 IMAGE ?= skills-cassette:dev
+CONTAINER_TOOL ?= docker
 
 .PHONY: check
 check: ## Runs all Dagger checks. Auto-fixes are not automatically applied.
@@ -36,15 +37,13 @@ install: build-local ## Builds and installs skills-cassette to GOBIN.
 	# executable replacement issues on macOS.
 	install -m 0755 ./build/skills-cassette $(GOBIN)/skills-cassette
 
-.PHONY: image
-image: ## Builds and loads the cassette container image via Dagger.
-	$(call print-target)
-	dagger call build-image --version=$(VERSION) export-image --name=$(IMAGE)
+.PHONY: build
+build: image ## Builds the local development image directly from Dockerfile.
 
-.PHONY: check-image
-check-image: ## Builds the cassette container image without loading it.
+.PHONY: image
+image: ## Builds the cassette container image (override with IMAGE=name:tag).
 	$(call print-target)
-	dagger call build-image --version=$(VERSION) sync
+	$(CONTAINER_TOOL) build --build-arg LDFLAGS="$(LDFLAGS)" -t $(IMAGE) -f Dockerfile .
 
 .PHONY: clean
 clean: ## Removes built artifacts.

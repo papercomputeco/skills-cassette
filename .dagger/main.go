@@ -1,6 +1,6 @@
-// skills-cassette CI/CD
+// skills-cassette checks
 //
-// Package main provides reproducible builds and tests locally and in GitHub Actions.
+// Package main provides reproducible tests locally and in GitHub Actions.
 package main
 
 import (
