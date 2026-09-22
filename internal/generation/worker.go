@@ -31,6 +31,16 @@ type WorkerConfig struct {
 	MaxSessions          int
 	CandidateConcurrency int
 	MaxTranscriptBytes   int
+	// AdmissionClosed mirrors the deployment's generation.enabled=false. The
+	// polarity is inverted deliberately: generation.enabled defaults to true,
+	// and a zero-valued WorkerConfig must therefore keep admitting work, the
+	// behavior every standalone deployment and every existing caller has.
+	//
+	// It lives on the worker's configuration because one setting governs both
+	// halves of admission: the HTTP enqueue (internal/server) and the durable
+	// retry a failed attempt would otherwise schedule (handleClaim). Neither
+	// half learns why the deployment closed admission.
+	AdmissionClosed bool
 }
 
 func DefaultWorkerConfig() WorkerConfig {
@@ -390,7 +400,16 @@ func (w *Worker) handleClaim(parent context.Context, claim storage.SkillGenerati
 
 	var classified *ProcessError
 	if errors.As(processErr, &classified) && classified.Retryable {
-		if claim.AttemptCount >= w.config.MaxAttempts {
+		// A retry is new admission. Requeueing releases the row and asks the
+		// queue to claim it again later, which is exactly the work a closed
+		// admission refuses; the failed attempt therefore goes terminal in the
+		// shape a caller already handles rather than sitting through a retry
+		// ladder no drain deadline covers.
+		//
+		// Crash recovery is a different thing and stays: the claim loop keeps
+		// picking up rows whose lease expired, because continuing an attempt
+		// whose worker died is finishing admitted work, not admitting new work.
+		if w.config.AdmissionClosed || claim.AttemptCount >= w.config.MaxAttempts {
 			w.failClaim(parent, claim, storage.GenerationFailure{
 				Code: "attempts_exhausted", Message: "Generation retry attempts were exhausted.",
 			}, GenerationStageReasonAttemptsExhausted, started)

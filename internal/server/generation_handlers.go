@@ -157,6 +157,13 @@ func (s *Server) handleCreateGeneration(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
+	// Admission is settled before the body is read, parsed or stored. It is an
+	// authorization decision, so it precedes validation — a refused caller is
+	// not told whether its request would otherwise have been well formed — and
+	// putting it here leaves no path from this handler to the durable enqueue.
+	if !s.admitGeneration(w) {
+		return
+	}
 	if !s.requireGenerationStore(w) {
 		return
 	}
@@ -390,6 +397,19 @@ func (request generationRevisionContentRequest) snapshot() (storage.SkillRevisio
 		return storage.SkillRevisionSnapshot{}, validationMessage(err)
 	}
 	return snapshot, ""
+}
+
+// admitGeneration reports whether this deployment admits new generation work,
+// writing the stable refusal when it does not. Closed admission refuses only
+// new work: reads, cancellation, the manual skill and revision surface, and
+// every row already committed to the durable queue continue unchanged.
+func (s *Server) admitGeneration(w http.ResponseWriter) bool {
+	if !s.generationAdmissionClosed {
+		return true
+	}
+	writeLifecycleError(w, http.StatusForbidden, errorCodeGenerationDisabled,
+		"This deployment is not admitting new skill generations.", "")
+	return false
 }
 
 func (s *Server) requireGenerationStore(w http.ResponseWriter) bool {

@@ -37,6 +37,7 @@ manifest schema.
 | `CASSETTE_LLM_MODEL` | Model override; each provider has a default. |
 | `CASSETTE_LLM_API_KEY` | Provider API key; falls back to `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`. |
 | `CASSETTE_LLM_BASE_URL` | Provider base URL override for proxies or self-hosted endpoints. |
+| `CASSETTE_GENERATION_ENABLED` | Whether new generations are admitted (default `true`). `false` refuses creation with 403 `generation_disabled`; reads, manual creation, revisions, and already-queued work are unaffected. |
 | `CASSETTE_GENERATION_MAX_SESSIONS` | Selected-session limit for one generation (default 8, range 1–100). |
 | `CASSETTE_GENERATION_CANDIDATE_CONCURRENCY` | Candidate inference concurrency (default 2, capped by max sessions). |
 | `CASSETTE_GENERATION_MAX_TRANSCRIPT_BYTES` | Per-session rendered transcript limit (default 1048576, range 4096–1048576). |

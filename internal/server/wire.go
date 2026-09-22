@@ -43,6 +43,7 @@ const (
 	errorCodeRevisionSequenceConflict = "revision_sequence_conflict"
 	errorCodeGenerationNotFound       = "generation_not_found"
 	errorCodeInvalidGenerationState   = "invalid_generation_state"
+	errorCodeGenerationDisabled       = "generation_disabled"
 	errorCodePersistenceNotConfigured = "not_configured"
 	errorCodeInternal                 = "internal_error"
 )

@@ -55,6 +55,10 @@ Configuration arrives through the environment supplied by the deployment:
   CASSETTE_LLM_API_KEY   provider API key (falls back to OPENAI_API_KEY /
                          ANTHROPIC_API_KEY)
   CASSETTE_LLM_BASE_URL  provider base URL override
+  CASSETTE_GENERATION_ENABLED
+                         whether new generations are admitted (default true);
+                         false refuses creation while reads, manual creation,
+                         revisions, and already-queued work continue
   CASSETTE_FILTERS       external attachment-view filters: a JSON list of
                          {param, view, type_value, normalize} entries; absent
                          turns the capability off

@@ -56,6 +56,11 @@ type Server struct {
 	generationWorker       *generation.Worker
 	generationQueueMonitor *generation.QueueMonitor
 	generationMetrics      *generation.Metrics
+	// generationAdmissionClosed mirrors generation.enabled=false. It gates
+	// the one route that enqueues durable generation work; every read, the
+	// manual skill and revision surface, and already-enqueued rows are
+	// untouched by it.
+	generationAdmissionClosed bool
 	// mu guards filters and pending: request handlers read the armed set
 	// on every list, while the background re-probe loop arms filters after
 	// startup. Writers swap in fresh slices, never mutate published ones,
@@ -97,6 +102,7 @@ func New(cfg Config, store distributionStore, querier skill.Querier, logger *slo
 		generationStore: generationStore, logger: logger,
 		openapi: openAPIDocument(name), generationMetrics: metrics,
 		filters: armed, pending: pending, prober: prober,
+		generationAdmissionClosed: cfg.Generation.AdmissionClosed,
 	}
 	result.generationWorker = buildGenerationWorker(cfg, generationStore, querier, metrics, logger)
 	if generationStore != nil && result.generationWorker == nil {

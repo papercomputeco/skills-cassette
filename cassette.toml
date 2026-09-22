@@ -115,6 +115,12 @@ type = "string"
 description = "Provider base URL override for proxies and self-hosted endpoints."
 
 [[config]]
+key = "generation.enabled"
+type = "bool"
+default = true
+description = "Whether this cassette admits new skill generations. Disabled rejects creation with a stable code; browsing, manual creation and revisions are unaffected."
+
+[[config]]
 key = "generation.worker_concurrency"
 type = "int"
 default = 2
