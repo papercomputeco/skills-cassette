@@ -35,6 +35,19 @@ func (q *countingQuerier) Trace(_ context.Context, traceID string) (*skill.Trace
 	return q.traces[traceID], nil
 }
 
+type failingTraceQuerier struct {
+	summaries []skill.TraceSummary
+	err       error
+}
+
+func (f failingTraceQuerier) TraceSummaries(context.Context, string) ([]skill.TraceSummary, error) {
+	return f.summaries, nil
+}
+
+func (f failingTraceQuerier) Trace(context.Context, string) (*skill.Trace, error) {
+	return nil, f.err
+}
+
 func (f fakeQuerier) TraceSummaries(_ context.Context, sessionID string) ([]skill.TraceSummary, error) {
 	if f.sessions != nil {
 		return f.sessions[sessionID], nil
@@ -78,6 +91,19 @@ var _ = Describe("skill generation boundary", func() {
 		Expect(transcript).NotTo(ContainSubstring("thread"))
 		Expect(transcript).NotTo(ContainSubstring("hidden"))
 		Expect(transcript).NotTo(ContainSubstring("private reasoning"))
+	})
+
+	It("fails the transcript on a transient trace failure instead of falling back to the preview", func() {
+		summaries := []skill.TraceSummary{{TraceID: "one", UserPrompt: "do it", ResponsePreview: "preview only", StartedAt: time.Now()}}
+		transient := failingTraceQuerier{summaries: summaries, err: &skill.ExternalCallError{Retryable: true}}
+		_, err := skill.BuildSessionTranscript(context.Background(), transient, "session")
+		Expect(skill.IsRetryableExternalError(err)).To(BeTrue(),
+			"a later-page 503 must retry the source, not drop the turn's final text")
+
+		permanent := failingTraceQuerier{summaries: summaries, err: errors.New("cursor repeated")}
+		transcript, err := skill.BuildSessionTranscript(context.Background(), permanent, "session")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(transcript).To(ContainSubstring("[assistant] preview only"))
 	})
 
 	It("enforces transcript budgets before fetching later traces", func() {

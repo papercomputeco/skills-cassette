@@ -44,6 +44,84 @@ var _ = Describe("tapes-core HTTP querier", func() {
 		Expect(trace.Spans[0].Output[0].Text).To(Equal("answer"))
 	})
 
+	It("walks paged trace spans and returns the turn whole", func() {
+		var cursors []string
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			Expect(r.URL.EscapedPath()).To(Equal("/v1/traces/trace-1"))
+			cursor := r.URL.Query().Get("cursor")
+			cursors = append(cursors, cursor)
+			switch cursor {
+			case "":
+				_, _ = fmt.Fprint(w, `{"trace":{"trace_id":"trace-1"},"spans":[{"span_id":"s1","kind":"llm","seq":1,"call_kind":"main","output":[{"type":"text","text":"first"}]}],"next_cursor":"c 2"}`)
+			case "c 2":
+				_, _ = fmt.Fprint(w, `{"trace":{"trace_id":"trace-1"},"spans":[{"span_id":"s2","kind":"tool","seq":2,"call_kind":"main"}],"next_cursor":"c3"}`)
+			case "c3":
+				_, _ = fmt.Fprint(w, `{"trace":{"trace_id":"trace-1"},"spans":[{"span_id":"s3","kind":"llm","seq":3,"call_kind":"main","output":[{"type":"text","text":"final answer"}]}]}`)
+			}
+		}))
+		defer server.Close()
+		trace, err := skill.NewAPIClient(server.URL).Trace(context.Background(), "trace-1")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(cursors).To(Equal([]string{"", "c 2", "c3"}))
+		Expect(trace.Spans).To(HaveLen(3))
+		Expect(trace.Spans[0].SpanID).To(Equal("s1"))
+		Expect(trace.Spans[2].Output[0].Text).To(Equal("final answer"),
+			"a long turn's final text lives on its last page and must not be dropped")
+	})
+
+	It("makes one request when tapes serves the turn whole", func() {
+		requests := 0
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			requests++
+			_, _ = fmt.Fprint(w, `{"trace":{"trace_id":"trace-1"},"spans":[{"span_id":"s1","kind":"llm","seq":1,"call_kind":"main"}]}`)
+		}))
+		defer server.Close()
+		trace, err := skill.NewAPIClient(server.URL).Trace(context.Background(), "trace-1")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(trace.Spans).To(HaveLen(1))
+		Expect(requests).To(Equal(1))
+	})
+
+	It("fails instead of looping when a cursor repeats", func() {
+		requests := 0
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			requests++
+			_, _ = fmt.Fprint(w, `{"trace":{"trace_id":"trace-1"},"spans":[],"next_cursor":"again"}`)
+		}))
+		defer server.Close()
+		_, err := skill.NewAPIClient(server.URL).Trace(context.Background(), "trace-1")
+		Expect(err).To(MatchError(ContainSubstring("cursor repeated")))
+		Expect(requests).To(Equal(2))
+	})
+
+	It("stops walking pages once the context is cancelled", func() {
+		requests := 0
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			requests++
+			_, _ = fmt.Fprintf(w, `{"trace":{"trace_id":"trace-1"},"spans":[],"next_cursor":"c%d"}`, requests)
+		}))
+		defer server.Close()
+		// The context reports cancellation only once the first page has been
+		// served, and never closes Done, so the first request always completes
+		// and only the check between pages can stop the walk.
+		ctx := cancelledAfterFirstPage{Context: context.Background(), requests: &requests}
+		_, err := skill.NewAPIClient(server.URL).Trace(ctx, "trace-1")
+		Expect(errors.Is(err, context.Canceled)).To(BeTrue())
+		Expect(requests).To(Equal(1))
+	})
+
+	It("stops a walk that never ends", func() {
+		requests := 0
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			requests++
+			_, _ = fmt.Fprintf(w, `{"trace":{"trace_id":"trace-1"},"spans":[],"next_cursor":"c%d"}`, requests)
+		}))
+		defer server.Close()
+		_, err := skill.NewAPIClient(server.URL).Trace(context.Background(), "trace-1")
+		Expect(err).To(MatchError(ContainSubstring("more than 100 pages")))
+		Expect(requests).To(Equal(100))
+	})
+
 	It("reports invalid JSON", func() {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = fmt.Fprint(w, `{`) }))
 		defer server.Close()
@@ -191,3 +269,15 @@ var _ = Describe("tapes-core HTTP querier", func() {
 		}
 	})
 })
+
+type cancelledAfterFirstPage struct {
+	context.Context
+	requests *int
+}
+
+func (c cancelledAfterFirstPage) Err() error {
+	if *c.requests > 0 {
+		return context.Canceled
+	}
+	return nil
+}
