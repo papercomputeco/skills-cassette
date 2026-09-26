@@ -742,7 +742,7 @@ func evaluationRequest(generation storage.SkillGenerationRecord, candidate stora
 			Code: "invalid_evaluation_criteria", Message: "The generation ranking criteria are invalid.",
 		}
 	}
-	baseline := evaluatorBundle(generation.Snapshot)
+	baseline := evaluatorBundle(storage.EvaluationBaselineSnapshot(generation.Snapshot))
 	return evaluator.CandidateEvaluationRequest{
 		Ref: deterministicID(generation.ID, "ref", candidate.ID), Name: candidate.Snapshot.Name,
 		Candidate: candidateEvaluatorBundle(candidate), Baseline: &baseline,

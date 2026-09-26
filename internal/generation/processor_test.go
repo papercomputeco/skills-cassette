@@ -339,6 +339,10 @@ func candidateEvaluation(profile string, value float64, decision string) evaluat
 }
 
 func claimedGeneration(selected []string, authorContext string) (*recordingGenerationStore, *storage.SkillGenerationRecord) {
+	return claimedNamedGeneration("Working", selected, authorContext)
+}
+
+func claimedNamedGeneration(name string, selected []string, authorContext string) (*recordingGenerationStore, *storage.SkillGenerationRecord) {
 	store := &recordingGenerationStore{MemoryStore: storage.NewMemoryStore(), creatorSubject: "owner-1"}
 	criteriaJSON, err := json.Marshal(persistedEvaluationCriteria)
 	Expect(err).NotTo(HaveOccurred())
@@ -369,7 +373,7 @@ func claimedGeneration(selected []string, authorContext string) (*recordingGener
 	_, err = store.CreateGeneration(context.Background(), storage.CreateGenerationInput{
 		ID: testGenerationID, SkillID: skillRecord.ID, BaseRevisionID: baseRevision.ID, CreatorSubject: "owner-1",
 		Snapshot: storage.SkillRevisionSnapshot{
-			Name: "Working", Description: "Use when working.", Type: "workflow",
+			Name: name, Description: "Use when working.", Type: "workflow",
 			Tags: []string{"seed", "custom"}, Content: "## Steps\n\n1. Work from the persisted seed.",
 			SourceSessionIDs: []string{"seed-source-b", "seed-source-a"},
 		},
@@ -644,6 +648,32 @@ var _ = Describe("generation processor", func() {
 		contextEvaluationRequests := contextJudge.Requests()
 		Expect(contextEvaluationRequests).To(HaveLen(1))
 		expectExactEvaluationContract(contextEvaluationRequests[0], *contextClaim, "candidate-context", nil, 0)
+	})
+
+	It("lets the model name an unnamed seed and gives the evaluator a baseline name", func() {
+		store, claim := claimedNamedGeneration("", []string{"session-alpha"}, "This skill is about CLI UX.")
+		Expect(claim.Snapshot.Name).To(BeEmpty())
+		loader := &fakeTranscriptLoader{transcripts: map[string]string{"session-alpha": "ONLY_ALPHA"}, errors: map[string]error{}}
+		generator := &fakeCandidateGenerator{generateErrors: map[string]error{}, synthesisError: errors.New("no synthesis")}
+		judge := &fakeCandidateEvaluator{outcomes: map[string]evaluationOutcome{}}
+
+		result, err := generation.NewProcessor(store, loader, generator, judge).
+			Process(context.Background(), claim.ID, claim.ClaimToken)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(generator.Requests()).To(HaveLen(1))
+		Expect(generator.Requests()[0].Name).To(BeEmpty(), "an unnamed seed must not pin a name")
+		Expect(judge.Requests()).To(HaveLen(1))
+		Expect(judge.Requests()[0].Baseline.Name).To(Equal("Untitled skill"))
+		state := persistedGeneration(store)
+		Expect(state.Candidates).To(HaveLen(1))
+		storedHash, err := storage.GenerationCandidateEvaluationRequestSHA256(state.Generation, state.Candidates[0])
+		Expect(err).NotTo(HaveOccurred())
+		sent, err := json.Marshal(judge.Requests()[0])
+		Expect(err).NotTo(HaveOccurred())
+		digest := sha256.Sum256(sent)
+		Expect(storedHash).To(Equal(hex.EncodeToString(digest[:])),
+			"the stored hash must identify the request the evaluator actually received")
+		Expect(result.ResultRevision.Snapshot.Name).To(Equal("candidate-session-alpha"))
 	})
 
 	It("persists concurrent artifacts as each task finishes", func() {

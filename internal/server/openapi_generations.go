@@ -110,7 +110,7 @@ func generationSchema() map[string]any {
 		"skillId":                 uuidProp("Stable target skill UUID."),
 		"baseRevisionId":          nullableUUIDProp("Exact accessible same-skill base revision captured at creation."),
 		"status":                  generationStatusSchema(),
-		"input":                   revisionSnapshotSchema(),
+		"input":                   generationInputSchema(),
 		"authorContext":           boundedStringProp("Durable author guidance captured at creation.", maxGenerationAuthorContextCodePoints),
 		"selectedSessionIds":      boundedStringArrayProp("Intended source sessions in caller order.", maxGenerationSelectedSessions),
 		"sourceSessionIds":        boundedStringArrayProp("Sources that produced retained candidates.", maxGenerationSelectedSessions),
@@ -137,10 +137,19 @@ func generationSchema() map[string]any {
 		"startedAt", "completedAt")
 }
 
+// generationInputSchema is the revision snapshot with an optional name. An empty
+// name asks the model to name the skill after its goal.
+func generationInputSchema() map[string]any {
+	schema := revisionSnapshotSchema()
+	schema["properties"].(map[string]any)["name"] = boundedStringProp(
+		"Human display name. Empty lets the model name the skill after its goal.", maxLifecycleMessageCodePoints)
+	return schema
+}
+
 func createGenerationSchema() map[string]any {
 	return closedObjectSchema(map[string]any{
 		"baseRevisionId": nullableUUIDProp("Optional accessible same-skill base revision UUID."),
-		"input":          revisionSnapshotSchema(),
+		"input":          generationInputSchema(),
 		"authorContext":  boundedStringProp("Bounded author guidance.", maxGenerationAuthorContextCodePoints),
 		"selectedSessionIds": map[string]any{
 			"type": "array", "maxItems": maxGenerationSelectedSessions, "uniqueItems": true,

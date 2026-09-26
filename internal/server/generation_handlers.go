@@ -391,10 +391,23 @@ func decodeStrictGenerationJSONBody(w http.ResponseWriter, r *http.Request, out 
 	return decodeLifecycleJSONBody(w, r, out)
 }
 
+// snapshot validates a generation seed with the revision rules, except that
+// an empty name is allowed: it asks the model to name the skill after its goal.
 func (request generationRevisionContentRequest) snapshot() (storage.SkillRevisionSnapshot, string) {
+	unnamed := request.Name != nil && strings.TrimSpace(*request.Name) == ""
+	if unnamed && !validBoundedText(*request.Name, maxLifecycleMessageCodePoints) {
+		return storage.SkillRevisionSnapshot{}, "the revision name is required and must be at most 1024 Unicode code points"
+	}
+	if unnamed {
+		placeholder := "unnamed"
+		request.Name = &placeholder
+	}
 	snapshot, err := (revisionSnapshotRequest(request)).snapshot()
 	if err != nil {
 		return storage.SkillRevisionSnapshot{}, validationMessage(err)
+	}
+	if unnamed {
+		snapshot.Name = ""
 	}
 	return snapshot, ""
 }
