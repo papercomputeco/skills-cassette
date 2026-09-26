@@ -23,7 +23,7 @@ var _ = Describe("unnamed generation seeds", func() {
 		Expect(status).To(Equal(http.StatusOK), "response: %#v", identity)
 		skillID := identity["id"].(string)
 
-		for _, name := range []string{"", "   "} {
+		for _, name := range []string{"", "   ", "\t\n"} {
 			generation, status := doJSON(srv, http.MethodPost, "/api/skills/"+skillID+"/generations",
 				marshalBody(map[string]any{
 					"baseRevisionId": nil,
@@ -52,7 +52,7 @@ var _ = Describe("unnamed generation seeds", func() {
 
 		generations, status := doJSON(srv, http.MethodGet, "/api/skills/"+skillID+"/generations", "", creator)
 		Expect(status).To(Equal(http.StatusOK), "response: %#v", generations)
-		Expect(generations["generations"]).To(HaveLen(2))
+		Expect(generations["generations"]).To(HaveLen(3))
 	})
 })
 
