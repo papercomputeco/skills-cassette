@@ -95,17 +95,31 @@ var _ = Describe("tapes-core HTTP querier", func() {
 	})
 
 	It("stops walking pages once the context is cancelled", func() {
-		ctx, cancel := context.WithCancel(context.Background())
 		requests := 0
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			requests++
-			cancel()
 			_, _ = fmt.Fprintf(w, `{"trace":{"trace_id":"trace-1"},"spans":[],"next_cursor":"c%d"}`, requests)
 		}))
 		defer server.Close()
+		// The context reports cancellation only once the first page has been
+		// served, and never closes Done, so the first request always completes
+		// and only the check between pages can stop the walk.
+		ctx := cancelledAfterFirstPage{Context: context.Background(), requests: &requests}
 		_, err := skill.NewAPIClient(server.URL).Trace(ctx, "trace-1")
 		Expect(errors.Is(err, context.Canceled)).To(BeTrue())
 		Expect(requests).To(Equal(1))
+	})
+
+	It("stops a walk that never ends", func() {
+		requests := 0
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			requests++
+			_, _ = fmt.Fprintf(w, `{"trace":{"trace_id":"trace-1"},"spans":[],"next_cursor":"c%d"}`, requests)
+		}))
+		defer server.Close()
+		_, err := skill.NewAPIClient(server.URL).Trace(context.Background(), "trace-1")
+		Expect(err).To(MatchError(ContainSubstring("more than 100 pages")))
+		Expect(requests).To(Equal(100))
 	})
 
 	It("reports invalid JSON", func() {
@@ -255,3 +269,15 @@ var _ = Describe("tapes-core HTTP querier", func() {
 		}
 	})
 })
+
+type cancelledAfterFirstPage struct {
+	context.Context
+	requests *int
+}
+
+func (c cancelledAfterFirstPage) Err() error {
+	if *c.requests > 0 {
+		return context.Canceled
+	}
+	return nil
+}

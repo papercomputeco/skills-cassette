@@ -251,6 +251,11 @@ func (c *APIClient) TraceSummaries(ctx context.Context, sessionID string) ([]Tra
 	return out, nil
 }
 
+// maxTracePages bounds one turn's page walk. At tapes' default of 200 spans a
+// page that is 20,000 spans, far past the longest turn seen in production
+// (836), so only a server that keeps inventing cursors reaches it.
+const maxTracePages = 100
+
 // Trace implements Querier via GET /v1/traces/{trace_id}.
 //
 // Tapes pages a turn's spans server-side (200 per page by default) and puts
@@ -258,8 +263,8 @@ func (c *APIClient) TraceSummaries(ctx context.Context, sessionID string) ([]Tra
 // the turn whole: reading only the first page would silently drop a long
 // turn's later spans, which usually carry its final assistant text. A tapes
 // that serves the turn whole sends no cursor, so that is one request as
-// before. The walk stops between pages when ctx is cancelled and fails rather
-// than looping if the server repeats a cursor.
+// before. The walk stops between pages when ctx is cancelled, and fails rather
+// than looping if the server repeats a cursor or exceeds maxTracePages.
 func (c *APIClient) Trace(ctx context.Context, traceID string) (*Trace, error) {
 	u := c.apiTarget + "/v1/traces/" + url.PathEscape(traceID)
 	var detail wireTraceDetail
@@ -270,6 +275,9 @@ func (c *APIClient) Trace(ctx context.Context, traceID string) (*Trace, error) {
 	for cursor := detail.NextCursor; cursor != ""; {
 		if seen[cursor] {
 			return nil, fmt.Errorf("get trace %s: cursor repeated", traceID)
+		}
+		if len(seen) >= maxTracePages-1 {
+			return nil, fmt.Errorf("get trace %s: more than %d pages", traceID, maxTracePages)
 		}
 		seen[cursor] = true
 		if err := ctx.Err(); err != nil {

@@ -166,6 +166,12 @@ func writeTurn(ctx context.Context, renderer *transcriptRenderer, query Querier,
 		}
 	}
 	trace, err := query.Trace(ctx, turn.TraceID)
+	// A transient failure, including one on a later page of a paged turn,
+	// fails the transcript so the generation retries the source. Falling back
+	// to the preview would silently drop the turn's late spans and final text.
+	if err != nil && (IsRetryableExternalError(err) || ctx.Err() != nil) {
+		return fmt.Errorf("load turn %s: %w", turn.TraceID, err)
+	}
 	if err != nil || trace == nil {
 		if turn.ResponsePreview != "" {
 			return renderer.writeParts("[assistant] ", turn.ResponsePreview, "\n")
