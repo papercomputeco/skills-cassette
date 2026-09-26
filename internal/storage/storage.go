@@ -210,6 +210,22 @@ func normalizeSkillRevisionSnapshot(snapshot SkillRevisionSnapshot) (SkillRevisi
 	return canonicalSkillRevisionSnapshot(snapshot), nil
 }
 
+// normalizeGenerationSnapshot applies the revision bounds to a generation
+// seed, except that the name may be empty. An unnamed seed asks the model to
+// name the skill after its goal; the result revision always carries a name.
+func normalizeGenerationSnapshot(snapshot SkillRevisionSnapshot) (SkillRevisionSnapshot, error) {
+	if strings.TrimSpace(snapshot.Name) != "" {
+		return normalizeSkillRevisionSnapshot(snapshot)
+	}
+	snapshot.Name = "unnamed"
+	normalized, err := normalizeSkillRevisionSnapshot(snapshot)
+	if err != nil {
+		return SkillRevisionSnapshot{}, err
+	}
+	normalized.Name = ""
+	return normalized, nil
+}
+
 func normalizeAppendRevisionSnapshot(origin RevisionOrigin, snapshot SkillRevisionSnapshot) (SkillRevisionSnapshot, error) {
 	switch origin {
 	case RevisionOriginManual, RevisionOriginGeneration, RevisionOriginDuplicate:

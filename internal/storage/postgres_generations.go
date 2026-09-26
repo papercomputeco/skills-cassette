@@ -53,7 +53,7 @@ func (s *PostgresStore) CreateGeneration(ctx context.Context, input CreateGenera
 		input.SelectedSessionIDs, MaxRevisionSourceSessionIDs, "selected session ids",
 	)
 	var err error
-	input.Snapshot, err = normalizeSkillRevisionSnapshot(input.Snapshot)
+	input.Snapshot, err = normalizeGenerationSnapshot(input.Snapshot)
 	if err != nil {
 		return nil, fmt.Errorf("create generation: %w", err)
 	}

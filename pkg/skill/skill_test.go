@@ -446,6 +446,63 @@ var _ = Describe("skill generation boundary", func() {
 		Expect(markdown).To(ContainSubstring(`sessions: ["session:one"]`))
 	})
 
+	It("lets the model name an unnamed snapshot after the author's goal", func() {
+		snapshot := skill.CandidateInputSnapshot{
+			Description: "Design a consistent output format for tapes CLI commands.",
+			Type:        "workflow", Tags: []string{}, IsAIGenerated: true, SourceSessionIDs: []string{},
+		}
+		var prompt string
+		gen := skill.NewGenerator(fakeQuerier{}, func(_ context.Context, value string) (string, error) {
+			prompt = value
+			return `{"skill":{"name":"Redesign CLI Output","description":"Use when CLI output is hard to scan.","tags":["cli"],"content":"# Redesign"},"insights":[]}`, nil
+		})
+		candidate, err := gen.GenerateCandidate(context.Background(), skill.CandidateRequest{
+			InputSnapshot: snapshot, AuthorContext: "This skill is about CLI UX, not tapes.",
+			Transcript: "[user] make tapes and tapesctl output feel consistent", SourceSessionID: "session",
+		})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(candidate.Skill.Name).To(Equal("Redesign CLI Output"))
+		Expect(prompt).To(ContainSubstring("Name the skill after the goal it accomplishes"))
+		Expect(prompt).To(ContainSubstring("Naming rules:"))
+		Expect(prompt).To(ContainSubstring(`Begin with "Use when"`))
+		Expect(prompt).To(ContainSubstring("Current skill draft"))
+		Expect(prompt).To(ContainSubstring("outranks the draft and the transcript"))
+		Expect(prompt).To(ContainSubstring("This skill is about CLI UX, not tapes."))
+	})
+
+	It("keeps an author-supplied name even when the model proposes another", func() {
+		gen := skill.NewGenerator(fakeQuerier{}, func(_ context.Context, value string) (string, error) {
+			Expect(value).To(ContainSubstring(`The author named the skill "My Name"; keep that name.`))
+			return `{"skill":{"name":"Model Name","description":"Use when testing.","tags":[],"content":"# Body"},"insights":[]}`, nil
+		})
+		candidate, err := gen.GenerateCandidate(context.Background(), skill.CandidateRequest{
+			InputSnapshot: skill.CandidateInputSnapshot{
+				Name: "My Name", Type: "workflow", Tags: []string{}, SourceSessionIDs: []string{},
+			},
+			AuthorContext: "context only",
+		})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(candidate.Skill.Name).To(Equal("My Name"))
+	})
+
+	It("applies the naming rules and author guidance during synthesis", func() {
+		var prompt string
+		gen := skill.NewGenerator(fakeQuerier{}, func(_ context.Context, value string) (string, error) {
+			prompt = value
+			return `{"skill":{"name":"Triage Flaky Tests","description":"Use when tests flake.","tags":[],"content":"# Triage"},"insights":[]}`, nil
+		})
+		candidate, err := gen.SynthesizeCandidate(context.Background(), skill.SynthesisRequest{
+			InputSnapshot: skill.CandidateInputSnapshot{Type: "workflow", Tags: []string{}, SourceSessionIDs: []string{}},
+			Winner: skill.Candidate{Skill: skill.Skill{
+				Name: "winner", Description: "Use when winning.", Type: "workflow", Content: "# Winner",
+			}},
+		})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(candidate.Skill.Name).To(Equal("Triage Flaky Tests"))
+		Expect(prompt).To(ContainSubstring("Naming rules:"))
+		Expect(prompt).To(ContainSubstring("outranks the input snapshot"))
+	})
+
 	It("rejects invalid input", func() {
 		gen := skill.NewGenerator(fakeQuerier{}, func(context.Context, string) (string, error) { return "", nil })
 		_, err := gen.Generate(context.Background(), nil, "x", "workflow", nil)
