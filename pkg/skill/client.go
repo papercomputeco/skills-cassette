@@ -214,8 +214,9 @@ type wireTraceList struct {
 
 // wireTraceDetail mirrors api.TraceDetail.
 type wireTraceDetail struct {
-	Trace wireTrace  `json:"trace"`
-	Spans []wireSpan `json:"spans"`
+	Trace      wireTrace  `json:"trace"`
+	Spans      []wireSpan `json:"spans"`
+	NextCursor string     `json:"next_cursor"`
 }
 
 // TraceSummaries implements Querier via GET /v1/traces?session_id=.
@@ -251,11 +252,35 @@ func (c *APIClient) TraceSummaries(ctx context.Context, sessionID string) ([]Tra
 }
 
 // Trace implements Querier via GET /v1/traces/{trace_id}.
+//
+// Tapes pages a turn's spans server-side (200 per page by default) and puts
+// next_cursor on every page but the last. Trace walks every page and returns
+// the turn whole: reading only the first page would silently drop a long
+// turn's later spans, which usually carry its final assistant text. A tapes
+// that serves the turn whole sends no cursor, so that is one request as
+// before. The walk stops between pages when ctx is cancelled and fails rather
+// than looping if the server repeats a cursor.
 func (c *APIClient) Trace(ctx context.Context, traceID string) (*Trace, error) {
 	u := c.apiTarget + "/v1/traces/" + url.PathEscape(traceID)
 	var detail wireTraceDetail
 	if err := c.getJSON(ctx, u, &detail); err != nil {
 		return nil, fmt.Errorf("get trace %s: %w", traceID, err)
+	}
+	seen := map[string]bool{}
+	for cursor := detail.NextCursor; cursor != ""; {
+		if seen[cursor] {
+			return nil, fmt.Errorf("get trace %s: cursor repeated", traceID)
+		}
+		seen[cursor] = true
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("get trace %s: %w", traceID, err)
+		}
+		var page wireTraceDetail
+		if err := c.getJSON(ctx, u+"?cursor="+url.QueryEscape(cursor), &page); err != nil {
+			return nil, fmt.Errorf("get trace %s page: %w", traceID, err)
+		}
+		detail.Spans = append(detail.Spans, page.Spans...)
+		cursor = page.NextCursor
 	}
 
 	trace := &Trace{TraceID: detail.Trace.TraceID, Spans: make([]Span, 0, len(detail.Spans))}
