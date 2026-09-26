@@ -741,6 +741,17 @@ func GenerationCandidateBundleSHA256(snapshot GenerationCandidateSnapshot, sourc
 	return candidate.BundleSHA256, nil
 }
 
+// EvaluationBaselineSnapshot is the generation seed as the evaluator sees it.
+// An unnamed seed asks the model to name the skill, but the evaluator's
+// baseline still needs a name. The processor and the request digest both use
+// this, so the stored hash identifies the request that was actually sent.
+func EvaluationBaselineSnapshot(snapshot SkillRevisionSnapshot) SkillRevisionSnapshot {
+	if snapshot.Name == "" {
+		snapshot.Name = "Untitled skill"
+	}
+	return snapshot
+}
+
 // GenerationCandidateEvaluationRequestSHA256 returns the exact digest persisted
 // beside a runtime candidate evaluation. Besides making new writes and
 // migration verification share one contract, this lets migration distinguish
@@ -758,7 +769,7 @@ func GenerationCandidateEvaluationRequestSHA256(generation SkillGenerationRecord
 			SourceSessionIDs: append([]string(nil), snapshot.SourceSessionIDs...),
 		}
 	}
-	baseline := bundle(generation.Snapshot)
+	baseline := bundle(EvaluationBaselineSnapshot(generation.Snapshot))
 	candidateBundle := bundle(generationCandidateRevisionSnapshot(candidate))
 	refParts, _ := json.Marshal([]string{generation.ID, "ref", candidate.ID})
 	request := generationCandidateEvaluationHashRequest{

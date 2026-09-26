@@ -472,7 +472,7 @@ var _ = Describe("skill generation boundary", func() {
 
 	It("keeps an author-supplied name even when the model proposes another", func() {
 		gen := skill.NewGenerator(fakeQuerier{}, func(_ context.Context, value string) (string, error) {
-			Expect(value).To(ContainSubstring(`The author named the skill "My Name"; keep that name.`))
+			Expect(value).To(ContainSubstring(`Keep the skill's current name, "My Name".`))
 			return `{"skill":{"name":"Model Name","description":"Use when testing.","tags":[],"content":"# Body"},"insights":[]}`, nil
 		})
 		candidate, err := gen.GenerateCandidate(context.Background(), skill.CandidateRequest{

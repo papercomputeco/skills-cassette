@@ -742,7 +742,7 @@ func evaluationRequest(generation storage.SkillGenerationRecord, candidate stora
 			Code: "invalid_evaluation_criteria", Message: "The generation ranking criteria are invalid.",
 		}
 	}
-	baseline := evaluatorBundle(generation.Snapshot)
+	baseline := evaluatorBundle(storage.EvaluationBaselineSnapshot(generation.Snapshot))
 	return evaluator.CandidateEvaluationRequest{
 		Ref: deterministicID(generation.ID, "ref", candidate.ID), Name: candidate.Snapshot.Name,
 		Candidate: candidateEvaluatorBundle(candidate), Baseline: &baseline,
@@ -753,13 +753,8 @@ func evaluationRequest(generation storage.SkillGenerationRecord, candidate stora
 }
 
 func evaluatorBundle(snapshot storage.SkillRevisionSnapshot) evaluator.CandidateBundle {
-	name := snapshot.Name
-	if name == "" {
-		// An unnamed seed asks the model for a name; the baseline still needs one.
-		name = "Untitled skill"
-	}
 	return evaluator.CandidateBundle{
-		Name: name, Description: snapshot.Description, Type: snapshot.Type,
+		Name: snapshot.Name, Description: snapshot.Description, Type: snapshot.Type,
 		Tags: append([]string(nil), snapshot.Tags...), Content: snapshot.Content,
 		SourceSessionIDs: append([]string(nil), snapshot.SourceSessionIDs...),
 	}

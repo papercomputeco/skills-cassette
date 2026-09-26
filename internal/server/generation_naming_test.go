@@ -3,6 +3,7 @@ package server_test
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -36,6 +37,18 @@ var _ = Describe("unnamed generation seeds", func() {
 			Expect(status).To(Equal(http.StatusAccepted), "name %q response: %#v", name, generation)
 			Expect(generation["input"].(map[string]any)["name"]).To(Equal(""))
 		}
+
+		overlong, status := doJSON(srv, http.MethodPost, "/api/skills/"+skillID+"/generations",
+			marshalBody(map[string]any{
+				"baseRevisionId": nil,
+				"input": map[string]any{
+					"name": strings.Repeat(" ", 1025), "description": "", "type": "workflow", "tags": []string{},
+					"content": "", "isAiGenerated": true, "sourceSessionIds": []string{},
+				},
+				"authorContext":      "",
+				"selectedSessionIds": []string{"01a0de40"},
+			}), creator)
+		Expect(status).To(Equal(http.StatusBadRequest), "an overlong blank name must still hit the bound: %#v", overlong)
 
 		generations, status := doJSON(srv, http.MethodGet, "/api/skills/"+skillID+"/generations", "", creator)
 		Expect(status).To(Equal(http.StatusOK), "response: %#v", generations)

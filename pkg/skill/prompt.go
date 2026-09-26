@@ -7,7 +7,7 @@ import (
 )
 
 func buildCandidatePrompt(request CandidateRequest) string {
-	nameInstruction := fmt.Sprintf("The author named the skill %q; keep that name.", request.Name)
+	nameInstruction := fmt.Sprintf("Keep the skill's current name, %q.", request.Name)
 	if request.Name == "" {
 		nameInstruction = "Name the skill after the goal it accomplishes (see naming rules below)."
 	}

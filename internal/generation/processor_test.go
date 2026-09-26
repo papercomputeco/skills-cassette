@@ -664,6 +664,15 @@ var _ = Describe("generation processor", func() {
 		Expect(generator.Requests()[0].Name).To(BeEmpty(), "an unnamed seed must not pin a name")
 		Expect(judge.Requests()).To(HaveLen(1))
 		Expect(judge.Requests()[0].Baseline.Name).To(Equal("Untitled skill"))
+		state := persistedGeneration(store)
+		Expect(state.Candidates).To(HaveLen(1))
+		storedHash, err := storage.GenerationCandidateEvaluationRequestSHA256(state.Generation, state.Candidates[0])
+		Expect(err).NotTo(HaveOccurred())
+		sent, err := json.Marshal(judge.Requests()[0])
+		Expect(err).NotTo(HaveOccurred())
+		digest := sha256.Sum256(sent)
+		Expect(storedHash).To(Equal(hex.EncodeToString(digest[:])),
+			"the stored hash must identify the request the evaluator actually received")
 		Expect(result.ResultRevision.Snapshot.Name).To(Equal("candidate-session-alpha"))
 	})
 
